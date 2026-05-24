@@ -21,8 +21,18 @@ RTL_DIR    = $(shell pwd)/../src
 INC_DIR    = $(shell pwd)/../include
 
 # ─── Verilog sources ───
-# Hierarchical: npu_systolic needs npu_pe. Standalone modules only need themselves.
-ifeq ($(DUT),npu_systolic)
+# Hierarchical modules need their dependencies included.
+ifeq ($(DUT),npu_top)
+VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v \
+                  $(RTL_DIR)/npu_systolic.v \
+                  $(RTL_DIR)/npu_ppu.v \
+                  $(RTL_DIR)/npu_csr.v \
+                  $(RTL_DIR)/npu_sram.v \
+                  $(RTL_DIR)/npu_dma.v \
+                  $(RTL_DIR)/npu_dw_conv.v \
+                  $(RTL_DIR)/npu_ctrl.v \
+                  $(RTL_DIR)/npu_top.v
+else ifeq ($(DUT),npu_systolic)
 VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v $(RTL_DIR)/npu_systolic.v
 else
 VERILOG_SOURCES = $(RTL_DIR)/$(DUT).v
