@@ -21,7 +21,11 @@ RTL_DIR    = $(shell pwd)/../src
 INC_DIR    = $(shell pwd)/../include
 
 # ─── Verilog sources ───
-VERILOG_SOURCES = $(RTL_DIR)/$(DUT).v
+# For hierarchical modules, include dependencies. npu_pe is always needed.
+VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v
+ifneq ($(DUT),npu_pe)
+VERILOG_SOURCES += $(RTL_DIR)/$(DUT).v
+endif
 
 # ─── Compile flags ───
 COMPILE_ARGS = -g2012 -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB)

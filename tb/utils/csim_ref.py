@@ -32,6 +32,49 @@ def pe_mac_reference(activations, weight, acc_bits=40):
     return acc_masked
 
 
+def matmul_reference(act_matrix, weight_matrix, acc_bits=40):
+    """Compute systolic array matmul reference: C = A × W.
+
+    Models the full N×N systolic array output for a tile.
+    act_matrix[k][row] provides activation for row `row` at timestep `k`.
+    weight_matrix[col][k] is the weight loaded into column `col` for reduction dim `k`.
+
+    Result[row][col] = sum_k(act_matrix[k][row] * weight_matrix[col][k])
+
+    This matches the hardware behavior:
+      - Weights are pre-loaded (weight_matrix[col] = weight for all PEs in that column)
+      - Activations stream in per-row, with column-delay handled by systolic propagation
+      - We compute the "logical" result ignoring systolic timing (which only affects latency)
+
+    Args:
+        act_matrix: shape [K][ROWS] — activation values per timestep per row
+        weight_matrix: shape [COLS][K] — weight per column per reduction step
+        acc_bits: accumulator bit width (default 40)
+
+    Returns:
+        2D list [ROWS][COLS] of signed accumulator values
+    """
+    K = len(act_matrix)
+    rows = len(act_matrix[0]) if K > 0 else 0
+    cols = len(weight_matrix)
+
+    mask = (1 << acc_bits) - 1
+    results = []
+    for r in range(rows):
+        row_results = []
+        for c in range(cols):
+            acc = 0
+            for k in range(K):
+                acc += int(act_matrix[k][r]) * int(weight_matrix[c][k])
+            # Mask and sign-extend
+            acc_masked = acc & mask
+            if acc_masked >= (1 << (acc_bits - 1)):
+                acc_masked -= (1 << acc_bits)
+            row_results.append(acc_masked)
+        results.append(row_results)
+    return results
+
+
 def systolic_row_reference(activations_2d, weights, acc_bits=40):
     """Compute MAC reference for a full systolic row (N PEs).
 
