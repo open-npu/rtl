@@ -57,7 +57,7 @@ module npu_ppu #(
 
     // ─── Pipeline Stage Registers ───
 
-    // Stage 1: Bias addition result
+    // Stage 1: after bias addition
     reg signed [ACC_W-1:0]      s1_biased;
     reg                         s1_valid;
     reg [1:0]                   s1_mode;
@@ -67,7 +67,7 @@ module npu_ppu #(
     reg                         s1_relu_en;
     reg                         s1_zp_en;
 
-    // Stage 2: Multiply result
+    // Stage 2: after multiply
     reg signed [PROD_W-1:0]     s2_product;
     reg                         s2_valid;
     reg [1:0]                   s2_mode;
@@ -76,7 +76,7 @@ module npu_ppu #(
     reg                         s2_relu_en;
     reg                         s2_zp_en;
 
-    // Stage 3: Shift result
+    // Stage 3: after shift
     reg signed [ZP_W:0]         s3_shifted;  // 17-bit
     reg                         s3_valid;
     reg [1:0]                   s3_mode;
@@ -84,43 +84,18 @@ module npu_ppu #(
     reg                         s3_relu_en;
     reg                         s3_zp_en;
 
-    // ─── Combinational intermediate signals ───
-    wire signed [ACC_W-1:0]  biased_val;
-    wire signed [PROD_W-1:0] product_val;
-    wire signed [PROD_W-1:0] rounded_product;
-    wire signed [ZP_W:0]     shifted_val;
-
     // ═══════════════════════════════════════════════════════════════════
-    // Combinational logic between stages (continuous assigns)
-    // ═══════════════════════════════════════════════════════════════════
-
-    // Stage 1 input: Bias addition
-    assign biased_val = (bias_en && mode == MODE_CONV_REQ) ? (acc_in + bias) : acc_in;
-
-    // Stage 2 input: Multiply by M
-    assign product_val = (s1_mode == MODE_CONV_REQ) ?
-                         s1_biased * $signed({1'b0, s1_mult_m}) :
-                         {{MULT_W{s1_biased[ACC_W-1]}}, s1_biased};
-
-    // Stage 3 input: Rounding right shift
-    wire [SHIFT_W-1:0] s2_shift = s2_shift_s;
-    wire signed [PROD_W-1:0] round_bit = (s2_shift > 0) ?
-                                          ($signed({{(PROD_W-1){1'b0}}, 1'b1}) << (s2_shift - 1)) :
-                                          0;
-    assign rounded_product = s2_product + round_bit;
-    wire signed [PROD_W-1:0] arith_shifted_full = rounded_product >>> s2_shift;
-    assign shifted_val = (s2_mode == MODE_CONV_REQ) ?
-                         arith_shifted_full[ZP_W:0] :
-                         s2_product[ZP_W:0];
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Single always block for ALL pipeline registers
-    // All combinational logic computed inline to avoid simulation
-    // timing issues with continuous assignments.
+    // Pipeline — single always block with all computations inline
     // ═══════════════════════════════════════════════════════════════════
     always @(posedge clk or negedge rst_n) begin : pipeline
-        // Local variables for combinational computation
-        reg signed [ZP_W:0] zp_result;
+        // Blocking-assignment intermediates (not registers)
+        reg signed [ACC_W-1:0]  biased_v;
+        reg signed [PROD_W-1:0] product_v;
+        reg signed [PROD_W-1:0] rounded_v;
+        reg signed [PROD_W-1:0] shifted_full;
+        reg signed [ZP_W:0]     shifted_v;
+        reg signed [ZP_W:0]     zp_result;
+        reg [SHIFT_W-1:0]       shift_amt;
 
         if (!rst_n) begin
             s1_biased  <= 0;
@@ -150,66 +125,87 @@ module npu_ppu #(
             out_data   <= 0;
             out_valid  <= 1'b0;
         end else begin
-            // ─── Stage 4 (output): ZP add + Clamp + ReLU ───
-            // MUST come first to read s3 values BEFORE they get NBA-updated
+            // ─── Compute Stage 4 output FIRST (reads current s3 regs) ───
             if (s3_zp_en && s3_mode == MODE_CONV_REQ)
-                zp_result = s3_shifted + {{1{s3_zp[ZP_W-1]}}, s3_zp};
+                zp_result = s3_shifted + $signed({{1{s3_zp[ZP_W-1]}}, s3_zp});
             else
                 zp_result = s3_shifted;
 
-            out_valid  <= s3_valid;
+            out_valid <= s3_valid;
 
             if (s3_mode == MODE_PASSTHROUGH) begin
                 out_data <= zp_result[DATA_W-1:0];
             end else if (s3_mode == MODE_RELU_ONLY) begin
-                if (s3_relu_en && zp_result < 0)
+                if (s3_relu_en && zp_result < $signed(17'sd0))
                     out_data <= 8'sd0;
-                else if (zp_result < -128)
+                else if (zp_result < -$signed(17'sd128))
                     out_data <= -8'sd128;
-                else if (zp_result > 127)
+                else if (zp_result > $signed(17'sd127))
                     out_data <= 8'sd127;
                 else
                     out_data <= zp_result[DATA_W-1:0];
             end else begin
                 // MODE_CONV_REQ: Clamp then ReLU
-                if (zp_result < -128) begin
+                if (zp_result < -$signed(17'sd128)) begin
                     out_data <= (s3_relu_en) ? 8'sd0 : -8'sd128;
-                end else if (zp_result > 127) begin
+                end else if (zp_result > $signed(17'sd127)) begin
                     out_data <= 8'sd127;
                 end else begin
-                    if (s3_relu_en && zp_result < 0)
+                    if (s3_relu_en && zp_result < $signed(17'sd0))
                         out_data <= 8'sd0;
                     else
                         out_data <= zp_result[DATA_W-1:0];
                 end
             end
 
-            // ─── Stage 1: Bias ───
-            s1_valid   <= in_valid;
-            s1_mode    <= mode;
-            s1_biased  <= biased_val;
-            s1_mult_m  <= mult_m;
-            s1_shift_s <= shift_s;
-            s1_zp      <= zero_point;
-            s1_relu_en <= relu_en;
-            s1_zp_en   <= zp_en;
+            // ─── Compute Stage 3: rounding right shift (reads current s2 regs) ───
+            shift_amt = s2_shift_s;
+            if (s2_mode == MODE_CONV_REQ) begin
+                if (shift_amt > 0)
+                    rounded_v = s2_product + ($signed({{(PROD_W-1){1'b0}}, 1'b1}) << (shift_amt - 1));
+                else
+                    rounded_v = s2_product;
+                shifted_full = rounded_v >>> shift_amt;
+                shifted_v = shifted_full[ZP_W:0];
+            end else begin
+                shifted_v = s2_product[ZP_W:0];
+            end
 
-            // ─── Stage 2: Multiply ───
+            s3_valid   <= s2_valid;
+            s3_mode    <= s2_mode;
+            s3_shifted <= shifted_v;
+            s3_zp      <= s2_zp;
+            s3_relu_en <= s2_relu_en;
+            s3_zp_en   <= s2_zp_en;
+
+            // ─── Compute Stage 2: multiply (reads current s1 regs) ───
+            if (s1_mode == MODE_CONV_REQ)
+                product_v = s1_biased * $signed({1'b0, s1_mult_m});
+            else
+                product_v = {{MULT_W{s1_biased[ACC_W-1]}}, s1_biased};
+
             s2_valid   <= s1_valid;
             s2_mode    <= s1_mode;
-            s2_product <= product_val;
+            s2_product <= product_v;
             s2_shift_s <= s1_shift_s;
             s2_zp      <= s1_zp;
             s2_relu_en <= s1_relu_en;
             s2_zp_en   <= s1_zp_en;
 
-            // ─── Stage 3: Shift ───
-            s3_valid   <= s2_valid;
-            s3_mode    <= s2_mode;
-            s3_shifted <= shifted_val;
-            s3_zp      <= s2_zp;
-            s3_relu_en <= s2_relu_en;
-            s3_zp_en   <= s2_zp_en;
+            // ─── Compute Stage 1: bias addition (reads input ports) ───
+            if (bias_en && mode == MODE_CONV_REQ)
+                biased_v = acc_in + bias;
+            else
+                biased_v = acc_in;
+
+            s1_valid   <= in_valid;
+            s1_mode    <= mode;
+            s1_biased  <= biased_v;
+            s1_mult_m  <= mult_m;
+            s1_shift_s <= shift_s;
+            s1_zp      <= zero_point;
+            s1_relu_en <= relu_en;
+            s1_zp_en   <= zp_en;
         end
     end
 
