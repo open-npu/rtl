@@ -143,7 +143,9 @@ module npu_compute #(
         S_DW_COMPUTE  = 5'd20,
         S_DW_DRAIN    = 5'd21,
         S_DW_PARAM    = 5'd22,
-        S_DW_PPU      = 5'd23;
+        S_DW_PPU      = 5'd23,
+        S_DW_ACT_STREAM = 5'd24,
+        S_DW_PPU_WAIT   = 5'd25;
 
     reg [4:0] state;
 
@@ -198,6 +200,11 @@ module npu_compute #(
     reg [15:0] dw_ch_idx;
     reg [5:0]  dw_cnt;
     reg        dw_read_issued;
+    reg [1:0]  dw_init_phase;          // 0=setup, 1=acc_clear, 2=feeding
+    reg [15:0] dw_oh, dw_ow;          // Output pixel coordinates
+    reg [3:0]  dw_fh, dw_fw;          // Filter position (0..6)
+    reg signed [ACC_W-1:0] dw_acc_buf; // Captured DW output accumulator
+    reg [5:0]  dw_kernel_size;         // kh * kw (cached)
 
     // ─── Flush counter (reused) ───
     reg [15:0] flush_cnt;
@@ -252,7 +259,9 @@ module npu_compute #(
             param_word_idx <= 0; param_read_issued <= 0;
             wb_cnt <= 0; wb_pack <= 0; wb_addr <= 0;
             wgt_base <= 0; act_base <= 0; param_base <= 0; out_base <= 0;
-            dw_ch_idx <= 0; dw_cnt <= 0; dw_read_issued <= 0;
+            dw_ch_idx <= 0; dw_cnt <= 0; dw_read_issued <= 0; dw_init_phase <= 0;
+            dw_oh <= 0; dw_ow <= 0; dw_fh <= 0; dw_fw <= 0;
+            dw_acc_buf <= 0; dw_kernel_size <= 0;
             flush_cnt <= 0;
             for (i = 0; i < ARRAY_SIZE; i = i + 1) begin
                 sa_wgt_data[i] <= 0;
@@ -320,10 +329,14 @@ module npu_compute #(
 
                 oc_group <= 0;
 
-                if (cfg_op_type == 8'd1)
+                if (cfg_op_type == 8'd1) begin
+                    dw_cnt <= 0;
+                    dw_read_issued <= 1'b0;
+                    dw_init_phase <= 2'd0;
                     state <= S_DW_WGT_LOAD;
-                else
+                end else begin
                     state <= S_OC_SETUP;
+                end
             end
 
             // ══════════════════════════════════════════════════════════════
@@ -611,7 +624,15 @@ module npu_compute #(
                     state <= S_TILE_NEXT;
                 end else begin
                     oc_group <= oc_group + 1;
-                    state <= S_OC_SETUP;
+                    if (cfg_op_type == 8'd1) begin
+                        // DW Conv: next channel
+                        dw_cnt <= 0;
+                        dw_read_issued <= 1'b0;
+                        dw_init_phase <= 2'd0;
+                        state <= S_DW_WGT_LOAD;
+                    end else begin
+                        state <= S_OC_SETUP;
+                    end
                 end
             end
 
@@ -638,27 +659,268 @@ module npu_compute #(
             end
 
             // ══════════════════════════════════════════════════════════════
-            // DW Conv Path (placeholder — basic structure)
+            // DW Conv Path — Full Implementation
+            // Flow: WGT_LOAD → PARAM → COMPUTE → (ACT_STREAM → PPU_WAIT)* → PPU → OC_NEXT
             // ══════════════════════════════════════════════════════════════
             S_DW_WGT_LOAD: begin
-                dw_wgt_load  <= 1'b1;
-                dw_acc_clear <= 1'b1;
-                dw_ch_idx    <= oc_group[15:0];
-                dw_cnt       <= 0;
-                dw_read_issued <= 1'b0;
-                state <= S_DW_COMPUTE;
+                // Load kh*kw INT8 weights for channel oc_group from Weight SRAM
+                dw_wgt_load <= 1'b1;
+
+                case (dw_init_phase)
+                2'd0: begin
+                    // Phase 0: setup (dw_wgt_load takes effect next cycle via NBA)
+                    dw_kernel_size <= cfg_kernel_h[3:0] * cfg_kernel_w[3:0];
+                    wgt_word_addr <= {6'd0, wgt_base} +
+                        (oc_group * {2'd0, cfg_kernel_h[3:0]} * {2'd0, cfg_kernel_w[3:0]}) / 4;
+                    dw_init_phase <= 2'd1;
+                end
+                2'd1: begin
+                    // Phase 1: now wgt_load=1 is active, send acc_clear to reset wgt_idx
+                    // Also issue the first SRAM read
+                    dw_acc_clear <= 1'b1;
+                    wgt_rd_en   <= 1'b1;
+                    wgt_rd_addr <= wgt_word_addr[WGT_ADDR_W-1:0];
+                    dw_read_issued <= 1'b0;  // track SRAM latency
+                    dw_init_phase <= 2'd2;
+                end
+                2'd2: begin
+                    // Phase 2+: weight feeding loop
+                    if (!dw_read_issued) begin
+                        // Waiting for SRAM data (1 cycle latency)
+                        dw_read_issued <= 1'b1;
+                    end else begin
+                        // SRAM data available — extract byte and feed
+                        begin : dw_wgt_extract
+                            reg [1:0] bsel;
+                            bsel = dw_cnt[1:0];
+                            case (bsel)
+                                2'd0: dw_wgt_data <= $signed(wgt_rd_data[7:0]);
+                                2'd1: dw_wgt_data <= $signed(wgt_rd_data[15:8]);
+                                2'd2: dw_wgt_data <= $signed(wgt_rd_data[23:16]);
+                                2'd3: dw_wgt_data <= $signed(wgt_rd_data[31:24]);
+                            endcase
+                        end
+                        dw_wgt_valid <= 1'b1;
+                        dw_cnt <= dw_cnt + 1;
+
+                        if (dw_cnt + 1 >= dw_kernel_size) begin
+                            // All weights loaded
+                            state <= S_DW_DRAIN;
+                        end else if (dw_cnt[1:0] == 2'd3) begin
+                            // Need next SRAM word
+                            wgt_word_addr <= wgt_word_addr + 1;
+                            wgt_rd_en    <= 1'b1;
+                            wgt_rd_addr  <= wgt_word_addr[WGT_ADDR_W-1:0] + 1;
+                            dw_read_issued <= 1'b0;
+                        end else begin
+                            // Next byte from same word — already have data
+                            // dw_read_issued stays 1
+                        end
+                    end
+                end
+                default: dw_init_phase <= 2'd0;
+                endcase
+            end
+
+            S_DW_DRAIN: begin
+                // Transition state: deassert wgt_load, go to param
+                dw_wgt_load <= 1'b0;
+                dw_cnt <= 0;
+                param_word_idx <= 0;
+                param_read_issued <= 1'b0;
+                state <= S_DW_PARAM;
+            end
+
+            S_DW_PARAM: begin
+                // Load 4 PPU param words for current channel
+                // 3-phase per word: issue → wait → capture
+                if (!param_read_issued) begin
+                    param_rd_en   <= 1'b1;
+                    param_rd_addr <= (oc_group * 4) + param_word_idx;
+                    param_read_issued <= 1'b1;
+                    act_read_issued <= 1'b0;  // reuse as wait flag
+                end else if (!act_read_issued) begin
+                    // Wait for SRAM read latency
+                    act_read_issued <= 1'b1;
+                end else begin
+                    param_buf[param_word_idx] <= param_rd_data;
+                    if (param_word_idx == 3'd3) begin
+                        // Extract params
+                        ppu_mult_m     <= param_buf[0][14:0];
+                        ppu_shift_s    <= param_buf[0][21:16];
+                        ppu_zero_point <= $signed(param_buf[1][15:0]);
+                        ppu_bias       <= $signed({param_buf[3][15:0], param_buf[2],
+                                                   param_buf[1][31:16]});
+                        state <= S_DW_COMPUTE;
+                    end else begin
+                        param_word_idx <= param_word_idx + 1;
+                        param_read_issued <= 1'b0;
+                    end
+                end
             end
 
             S_DW_COMPUTE: begin
-                dw_wgt_load <= 1'b0;
-                // Simplified: just signal done for now (DW path needs more work)
-                // TODO: implement proper DW weight load + compute streaming
-                state <= S_OC_NEXT;
+                // Initialize pixel loop
+                dw_oh <= 0;
+                dw_ow <= 0;
+                dw_fh <= 0;
+                dw_fw <= 0;
+                dw_read_issued <= 1'b0;
+                wb_cnt <= 0;
+                wb_pack <= 0;
+                wb_addr <= out_base + (oc_group[ACT_ADDR_W-1:0]) / 4;
+                state <= S_DW_ACT_STREAM;
             end
 
-            S_DW_DRAIN: state <= S_DW_PARAM;
-            S_DW_PARAM: state <= S_DW_PPU;
-            S_DW_PPU:   state <= S_OC_NEXT;
+            S_DW_ACT_STREAM: begin
+                // Stream window elements for pixel (dw_oh, dw_ow)
+                // Compute input coordinates
+                begin : dw_act_stream_blk
+                    reg signed [15:0] ih_s, iw_s;
+                    reg               is_pad;
+                    ih_s = $signed({1'b0, dw_oh}) * $signed({1'b0, cfg_stride_h[7:0]})
+                         - $signed({1'b0, cfg_pad_top[7:0]}) + $signed({1'b0, dw_fh});
+                    iw_s = $signed({1'b0, dw_ow}) * $signed({1'b0, cfg_stride_w[7:0]})
+                         - $signed({1'b0, cfg_pad_left[7:0]}) + $signed({1'b0, dw_fw});
+                    is_pad = (ih_s < 0) || (ih_s >= $signed({1'b0, cfg_in_h}))
+                          || (iw_s < 0) || (iw_s >= $signed({1'b0, cfg_in_w}));
+
+                    if (is_pad) begin
+                        // Padding: feed zero, no SRAM read needed
+                        dw_in_valid <= 1'b1;
+                        dw_in_data  <= 8'sd0;
+                        // Assert acc_clear on first element of pixel
+                        if (dw_fh == 0 && dw_fw == 0)
+                            dw_acc_clear <= 1'b1;
+
+                        // Advance filter position
+                        if (dw_fw + 1 >= cfg_kernel_w[3:0]) begin
+                            dw_fw <= 0;
+                            if (dw_fh + 1 >= cfg_kernel_h[3:0]) begin
+                                // Pixel complete — wait for dw_out_valid next cycle
+                                state <= S_DW_PPU_WAIT;
+                                ppu_wait_cnt <= 0;
+                            end else begin
+                                dw_fh <= dw_fh + 1;
+                            end
+                        end else begin
+                            dw_fw <= dw_fw + 1;
+                        end
+                        dw_read_issued <= 1'b0;
+                    end else if (!dw_read_issued) begin
+                        // In-bounds: issue SRAM read (phase 1 of 3)
+                        begin : dw_addr_calc
+                            reg [ACT_ADDR_W+15:0] byte_off;
+                            byte_off = (ih_s[15:0] * cfg_in_w * cfg_in_c)
+                                     + (iw_s[15:0] * cfg_in_c)
+                                     + oc_group;
+                            act_rd_en   <= 1'b1;
+                            act_rd_addr <= byte_off[ACT_ADDR_W+1:2];
+                            act_byte_sel <= byte_off[1:0];
+                        end
+                        dw_read_issued <= 1'b1;
+                        act_read_issued <= 1'b0;
+                        // Assert acc_clear on first element of pixel
+                        if (dw_fh == 0 && dw_fw == 0)
+                            dw_acc_clear <= 1'b1;
+                    end else if (!act_read_issued) begin
+                        // Wait for SRAM read latency (phase 2 of 3)
+                        act_read_issued <= 1'b1;
+                    end else begin
+                        // SRAM data available — extract byte and feed (phase 3 of 3)
+                        begin : dw_act_extract
+                            case (act_byte_sel)
+                                2'd0: dw_in_data <= $signed(act_rd_data[7:0]);
+                                2'd1: dw_in_data <= $signed(act_rd_data[15:8]);
+                                2'd2: dw_in_data <= $signed(act_rd_data[23:16]);
+                                2'd3: dw_in_data <= $signed(act_rd_data[31:24]);
+                            endcase
+                        end
+                        dw_in_valid <= 1'b1;
+                        dw_read_issued <= 1'b0;
+
+                        // Advance filter position
+                        if (dw_fw + 1 >= cfg_kernel_w[3:0]) begin
+                            dw_fw <= 0;
+                            if (dw_fh + 1 >= cfg_kernel_h[3:0]) begin
+                                // Pixel complete — wait for dw_out_valid next cycle
+                                state <= S_DW_PPU_WAIT;
+                                ppu_wait_cnt <= 0;
+                            end else begin
+                                dw_fh <= dw_fh + 1;
+                            end
+                        end else begin
+                            dw_fw <= dw_fw + 1;
+                        end
+                    end
+                end
+            end
+
+            S_DW_PPU_WAIT: begin
+                // Wait for dw_out_valid, then feed PPU, wait for PPU output, pack
+                if (ppu_wait_cnt == 0) begin
+                    // Wait for DW output valid (1 cycle after last in_valid)
+                    if (dw_out_valid) begin
+                        // Feed acc to PPU
+                        ppu_acc_in   <= dw_acc_out;
+                        ppu_in_valid <= 1'b1;
+                        ppu_wait_cnt <= 1;
+                    end
+                end else begin
+                    // Wait for PPU output
+                    if (ppu_out_valid) begin
+                        // Pack output byte
+                        case (wb_cnt[1:0])
+                            2'd0: wb_pack[7:0]   <= ppu_out_data;
+                            2'd1: wb_pack[15:8]  <= ppu_out_data;
+                            2'd2: wb_pack[23:16] <= ppu_out_data;
+                            2'd3: begin
+                                // Write full word to output SRAM
+                                act_wr_en   <= 1'b1;
+                                act_wr_addr <= wb_addr;
+                                act_wr_data <= {ppu_out_data, wb_pack[23:0]};
+                                wb_addr     <= wb_addr + 1;
+                            end
+                        endcase
+                        wb_cnt <= wb_cnt + 1;
+
+                        // Advance to next pixel
+                        if (dw_ow + 1 >= out_tile_w) begin
+                            dw_ow <= 0;
+                            if (dw_oh + 1 >= out_tile_h) begin
+                                // All pixels for this channel done
+                                state <= S_DW_PPU;
+                            end else begin
+                                dw_oh <= dw_oh + 1;
+                                dw_fh <= 0;
+                                dw_fw <= 0;
+                                dw_read_issued <= 1'b0;
+                                ppu_wait_cnt <= 0;
+                                state <= S_DW_ACT_STREAM;
+                            end
+                        end else begin
+                            dw_ow <= dw_ow + 1;
+                            dw_fh <= 0;
+                            dw_fw <= 0;
+                            dw_read_issued <= 1'b0;
+                            ppu_wait_cnt <= 0;
+                            state <= S_DW_ACT_STREAM;
+                        end
+                    end else begin
+                        ppu_wait_cnt <= ppu_wait_cnt + 1;
+                    end
+                end
+            end
+
+            S_DW_PPU: begin
+                // Flush remaining partial word
+                if (wb_cnt[1:0] != 2'd0) begin
+                    act_wr_en   <= 1'b1;
+                    act_wr_addr <= wb_addr;
+                    act_wr_data <= wb_pack;
+                end
+                state <= S_OC_NEXT;
+            end
 
             default: state <= S_IDLE;
 
