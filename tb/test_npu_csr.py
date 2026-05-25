@@ -58,9 +58,11 @@ async def test_hw_config_register(dut):
     """Read HW_CONFIG — verify array size, INT16 support, etc."""
     wb = await init_dut(dut)
     val = await wb.read(0x018)
-    # ARRAY_SIZE=16 → [7:0]=16
+    # ARRAY_SIZE is parameterized — read expected from compile-time define
+    expected_array_sz = int(dut.ARRAY_SZ.value)
     array_sz = val & 0xFF
-    assert array_sz == 16, f"ARRAY_SIZE: got {array_sz}, expected 16"
+    assert array_sz == expected_array_sz, \
+        f"ARRAY_SIZE: got {array_sz}, expected {expected_array_sz}"
     # NUM_ARRAYS=1 → [11:8]=1
     num_arr = (val >> 8) & 0xF
     assert num_arr == 1, f"NUM_ARRAYS: got {num_arr}, expected 1"
@@ -88,7 +90,8 @@ async def test_ro_ignore_write(dut):
     # Try to write HW_CONFIG
     await wb.write(0x018, 0xFFFFFFFF)
     val = await wb.read(0x018)
-    assert (val & 0xFF) == 16, "HW_CONFIG changed after write"
+    expected_array_sz = int(dut.ARRAY_SZ.value)
+    assert (val & 0xFF) == expected_array_sz, "HW_CONFIG changed after write"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
