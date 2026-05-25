@@ -278,7 +278,7 @@ module npu_top #(
 
     // --- Activation SRAM ---
     // Port A: DMA access (load input / store output)
-    // Port B: Compute engine read
+    // Port B: Compute engine read + write (output writeback)
     wire                    act_a_en, act_a_we;
     wire [ACT_ADDR_W-1:0]  act_a_addr;
     wire [31:0]             act_a_wdata, act_a_rdata;
@@ -297,9 +297,9 @@ module npu_top #(
         .a_wdata(act_a_wdata),
         .a_rdata(act_a_rdata),
         .b_en   (act_b_en),
-        .b_we   (1'b0),
+        .b_we   (act_b_wr_en),
         .b_addr (act_b_addr),
-        .b_wdata(32'd0),
+        .b_wdata(act_b_wr_data),
         .b_rdata(act_b_rdata)
     );
 
@@ -426,20 +426,17 @@ module npu_top #(
     // Systolic Array
     // ════════════════════════════════════════════════════════════════════
 
-    // Systolic array signals
+    // Systolic array signals (driven by npu_compute)
+    wire [1:0]                    sa_cmd;
+    wire                          sa_cmd_valid;
     wire signed [`DATA_WIDTH-1:0] sa_wgt_data  [0:ARRAY_SIZE-1];
+    wire                          sa_wgt_valid;
     wire signed [`DATA_WIDTH-1:0] sa_act_data  [0:ARRAY_SIZE-1];
+    wire                          sa_act_valid;
+    wire [$clog2(ARRAY_SIZE)-1:0] sa_drain_col_sel;
     wire signed [`ACC_WIDTH-1:0]  sa_acc_out   [0:ARRAY_SIZE-1];
     wire                          sa_acc_out_valid;
     wire                          sa_busy, sa_ready;
-
-    // Systolic array control (directly from compute engine — stub for V1)
-    // In V1 the compute engine is a placeholder; full micro-sequencer TBD
-    reg  [1:0]                    sa_cmd;
-    reg                           sa_cmd_valid;
-    reg                           sa_wgt_valid;
-    reg                           sa_act_valid;
-    reg  [$clog2(ARRAY_SIZE)-1:0] sa_drain_col_sel;
 
     npu_systolic #(
         .ROWS   (ARRAY_SIZE),
@@ -463,19 +460,17 @@ module npu_top #(
     );
 
     // ════════════════════════════════════════════════════════════════════
-    // DW Convolution Engine (single lane — V1)
+    // DW Convolution Engine (single lane)
     // ════════════════════════════════════════════════════════════════════
 
     wire signed [`ACC_WIDTH-1:0]  dw_acc_out;
     wire                          dw_out_valid;
-
-    // DW conv control (stub for V1)
-    reg                           dw_wgt_load;
-    reg                           dw_wgt_valid;
-    reg  signed [`DATA_WIDTH-1:0] dw_wgt_data;
-    reg                           dw_in_valid;
-    reg  signed [`DATA_WIDTH-1:0] dw_in_data;
-    reg                           dw_acc_clear;
+    wire                          dw_wgt_load;
+    wire                          dw_wgt_valid;
+    wire signed [`DATA_WIDTH-1:0] dw_wgt_data;
+    wire                          dw_in_valid;
+    wire signed [`DATA_WIDTH-1:0] dw_in_data;
+    wire                          dw_acc_clear;
 
     npu_dw_conv #(
         .DATA_W  (`DATA_WIDTH),
@@ -497,19 +492,17 @@ module npu_top #(
     );
 
     // ════════════════════════════════════════════════════════════════════
-    // PPU — Post-Processing Unit (single lane — V1)
+    // PPU — Post-Processing Unit (single lane)
     // ════════════════════════════════════════════════════════════════════
 
     wire signed [`DATA_WIDTH-1:0] ppu_out_data;
     wire                          ppu_out_valid;
-
-    // PPU inputs (compute engine provides acc → PPU)
-    reg  signed [`ACC_WIDTH-1:0]  ppu_acc_in;
-    reg                           ppu_in_valid;
-    reg  signed [`ACC_WIDTH-1:0]  ppu_bias;
-    reg  [`PARAM_M_BITS-1:0]      ppu_mult_m;
-    reg  [`PARAM_S_BITS-1:0]      ppu_shift_s;
-    reg  signed [`PARAM_ZP_BITS-1:0] ppu_zero_point;
+    wire signed [`ACC_WIDTH-1:0]  ppu_acc_in;
+    wire                          ppu_in_valid;
+    wire signed [`ACC_WIDTH-1:0]  ppu_bias;
+    wire [`PARAM_M_BITS-1:0]      ppu_mult_m;
+    wire [`PARAM_S_BITS-1:0]      ppu_shift_s;
+    wire signed [`PARAM_ZP_BITS-1:0] ppu_zero_point;
 
     npu_ppu #(
         .ACC_W   (`ACC_WIDTH),
@@ -536,73 +529,102 @@ module npu_top #(
     );
 
     // ════════════════════════════════════════════════════════════════════
-    // Compute Engine Placeholder (V1 — stub)
+    // Compute Micro-Sequencer (V2)
     // ════════════════════════════════════════════════════════════════════
-    //
-    // In V1, the compute engine is a simple state machine that:
-    //   1. Receives compute_start from controller
-    //   2. Feeds data from SRAM to systolic array (or DW conv)
-    //   3. Drains results through PPU
-    //   4. Writes back to activation SRAM
-    //   5. Asserts compute_done + ppu_done
-    //
-    // This requires a micro-sequencer that reads from SRAMs, unpacks
-    // INT8 data, feeds to systolic/DW, and writes back. The full
-    // micro-sequencer is a V2 feature. For V1 top-level integration
-    // testing, we expose the compute_done and ppu_done as directly
-    // controllable signals so the testbench can drive them.
 
-    // V1: compute_done and ppu_done directly tied to stub logic
-    // The testbench drives these via the compute/PPU interfaces
-    assign compute_done = sa_acc_out_valid;  // placeholder: systolic drain = compute done
-    assign ppu_done     = ppu_out_valid;     // placeholder: PPU output = PPU done
+    wire        compute_done_w;
+    wire        act_b_wr_en;
+    wire [ACT_ADDR_W-1:0] act_b_wr_addr;
+    wire [31:0] act_b_wr_data;
+    wire        act_b_rd_en;
+    wire [ACT_ADDR_W-1:0] act_b_rd_addr;
 
-    // SRAM port B: compute engine reads (stub — directly accessible for TB)
-    assign act_b_en   = 1'b0;   // V1: unused (compute micro-sequencer TBD)
-    assign act_b_addr = {ACT_ADDR_W{1'b0}};
-    assign wgt_b_en   = 1'b0;
-    assign wgt_b_addr = {WGT_ADDR_W{1'b0}};
-    assign param_b_en = 1'b0;
-    assign param_b_addr = {PARAM_ADDR_W{1'b0}};
+    // Both compute_done and ppu_done come from the compute engine's done signal
+    // (the V2 compute engine handles the full compute+PPU+writeback pipeline internally)
+    assign compute_done = compute_done_w;
+    assign ppu_done     = compute_done_w;
 
-    // Systolic array data inputs: stub (tied to zero for V1)
-    genvar gi;
-    generate
-        for (gi = 0; gi < ARRAY_SIZE; gi = gi + 1) begin : gen_sa_stub
-            assign sa_wgt_data[gi] = {`DATA_WIDTH{1'b0}};
-            assign sa_act_data[gi] = {`DATA_WIDTH{1'b0}};
-        end
-    endgenerate
+    npu_compute #(
+        .ARRAY_SIZE   (ARRAY_SIZE),
+        .ACT_ADDR_W   (ACT_ADDR_W),
+        .WGT_ADDR_W   (WGT_ADDR_W),
+        .PARAM_ADDR_W (PARAM_ADDR_W),
+        .DATA_W       (`DATA_WIDTH),
+        .ACC_W        (`ACC_WIDTH)
+    ) u_compute (
+        .clk            (clk),
+        .rst_n          (rst_n),
+        .start          (compute_start),
+        .done           (compute_done_w),
+        // Layer config from CSR
+        .cfg_op_type    (reg_layer_mode[7:0]),
+        .cfg_in_c       (reg_in_dim_c[15:0]),
+        .cfg_out_h      (reg_out_dim_hw[31:16]),
+        .cfg_out_w      (reg_out_dim_hw[15:0]),
+        .cfg_out_c      (reg_out_dim_c[15:0]),
+        .cfg_kernel_h   (reg_kernel_size[7:0]),
+        .cfg_kernel_w   (reg_kernel_size[15:8]),
+        .cfg_stride_h   (reg_stride[7:0]),
+        .cfg_stride_w   (reg_stride[15:8]),
+        .cfg_pad_top    (reg_padding[7:0]),
+        .cfg_pad_left   (reg_padding[15:8]),
+        .cfg_tile_h     (reg_tile_cfg[15:0]),
+        .cfg_tile_w     (reg_tile_cfg[31:16]),
+        .cfg_tile_num_h (reg_tile_count[15:0]),
+        .cfg_tile_num_w (reg_tile_count[31:16]),
+        .cfg_in_w       (reg_in_dim_hw[15:0]),
+        .cfg_in_h       (reg_in_dim_hw[31:16]),
+        // Weight SRAM Port B
+        .wgt_rd_en      (wgt_b_en),
+        .wgt_rd_addr    (wgt_b_addr),
+        .wgt_rd_data    (wgt_b_rdata),
+        // Activation SRAM Port B
+        .act_rd_en      (act_b_rd_en),
+        .act_rd_addr    (act_b_rd_addr),
+        .act_rd_data    (act_b_rdata),
+        .act_wr_en      (act_b_wr_en),
+        .act_wr_addr    (act_b_wr_addr),
+        .act_wr_data    (act_b_wr_data),
+        // Param SRAM Port B
+        .param_rd_en    (param_b_en),
+        .param_rd_addr  (param_b_addr),
+        .param_rd_data  (param_b_rdata),
+        // Systolic
+        .sa_cmd         (sa_cmd),
+        .sa_cmd_valid   (sa_cmd_valid),
+        .sa_wgt_data    (sa_wgt_data),
+        .sa_wgt_valid   (sa_wgt_valid),
+        .sa_act_data    (sa_act_data),
+        .sa_act_valid   (sa_act_valid),
+        .sa_drain_col_sel(sa_drain_col_sel),
+        .sa_acc_out     (sa_acc_out),
+        .sa_acc_out_valid(sa_acc_out_valid),
+        .sa_busy        (sa_busy),
+        .sa_ready       (sa_ready),
+        // DW Conv
+        .dw_wgt_load    (dw_wgt_load),
+        .dw_wgt_valid   (dw_wgt_valid),
+        .dw_wgt_data    (dw_wgt_data),
+        .dw_in_valid    (dw_in_valid),
+        .dw_in_data     (dw_in_data),
+        .dw_acc_clear   (dw_acc_clear),
+        .dw_acc_out     (dw_acc_out),
+        .dw_out_valid   (dw_out_valid),
+        // PPU
+        .ppu_acc_in     (ppu_acc_in),
+        .ppu_in_valid   (ppu_in_valid),
+        .ppu_bias       (ppu_bias),
+        .ppu_mult_m     (ppu_mult_m),
+        .ppu_shift_s    (ppu_shift_s),
+        .ppu_zero_point (ppu_zero_point),
+        .ppu_out_data   (ppu_out_data),
+        .ppu_out_valid  (ppu_out_valid)
+    );
 
-    // Systolic control: idle for V1 integration test
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            sa_cmd          <= 2'b00;
-            sa_cmd_valid    <= 1'b0;
-            sa_wgt_valid    <= 1'b0;
-            sa_act_valid    <= 1'b0;
-            sa_drain_col_sel<= 0;
-            dw_wgt_load     <= 1'b0;
-            dw_wgt_valid    <= 1'b0;
-            dw_wgt_data     <= 0;
-            dw_in_valid     <= 1'b0;
-            dw_in_data      <= 0;
-            dw_acc_clear    <= 1'b0;
-            ppu_acc_in      <= 0;
-            ppu_in_valid    <= 1'b0;
-            ppu_bias        <= 0;
-            ppu_mult_m      <= 0;
-            ppu_shift_s     <= 0;
-            ppu_zero_point  <= 0;
-        end else begin
-            // V1: these remain idle until compute micro-sequencer is implemented
-            sa_cmd_valid <= 1'b0;
-            sa_wgt_valid <= 1'b0;
-            sa_act_valid <= 1'b0;
-            dw_wgt_valid <= 1'b0;
-            dw_in_valid  <= 1'b0;
-            ppu_in_valid <= 1'b0;
-        end
-    end
+    // ─── SRAM Port B connections (compute engine) ───
+    // Activation SRAM Port B: needs both read and write for compute
+    assign act_b_en   = act_b_rd_en | act_b_wr_en;
+    assign act_b_addr = act_b_wr_en ? act_b_wr_addr : act_b_rd_addr;
 
 endmodule
+

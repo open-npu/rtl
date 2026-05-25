@@ -31,7 +31,23 @@ VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v \
                   $(RTL_DIR)/npu_dma.v \
                   $(RTL_DIR)/npu_dw_conv.v \
                   $(RTL_DIR)/npu_ctrl.v \
+                  $(RTL_DIR)/npu_compute.v \
                   $(RTL_DIR)/npu_top.v
+else ifeq ($(DUT),npu_compute_tb)
+VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v \
+                  $(RTL_DIR)/npu_systolic.v \
+                  $(RTL_DIR)/npu_ppu.v \
+                  $(RTL_DIR)/npu_sram.v \
+                  $(RTL_DIR)/npu_dw_conv.v \
+                  $(RTL_DIR)/npu_compute.v \
+                  $(shell pwd)/npu_compute_tb.v
+else ifeq ($(DUT),npu_compute)
+VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v \
+                  $(RTL_DIR)/npu_systolic.v \
+                  $(RTL_DIR)/npu_ppu.v \
+                  $(RTL_DIR)/npu_sram.v \
+                  $(RTL_DIR)/npu_dw_conv.v \
+                  $(RTL_DIR)/npu_compute.v
 else ifeq ($(DUT),npu_systolic)
 VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v $(RTL_DIR)/npu_systolic.v
 else
