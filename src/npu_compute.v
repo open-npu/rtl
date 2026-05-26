@@ -145,7 +145,11 @@ module npu_compute #(
         S_DW_PARAM    = 5'd22,
         S_DW_PPU      = 5'd23,
         S_DW_ACT_STREAM = 5'd24,
-        S_DW_PPU_WAIT   = 5'd25;
+        S_DW_PPU_WAIT   = 5'd25,
+        S_DW_WB         = 5'd26,
+        S_SPATIAL_SETUP = 5'd27,
+        S_REDUCE        = 5'd28,
+        S_PIXEL_NEXT    = 5'd29;
 
     reg [4:0] state;
 
@@ -164,11 +168,13 @@ module npu_compute #(
     reg [$clog2(ARRAY_SIZE):0]   wgt_byte_idx;    // byte index within column (0..ARRAY_SIZE-1)
     reg [15:0]                   wgt_word_addr;    // current SRAM address
     reg                          wgt_read_issued;  // 1-cycle read latency tracker
+    reg                          wgt_data_ready;   // 2nd cycle: SRAM data available
 
     // ─── Activation stream state ───
     reg [15:0] act_cnt;         // activation byte counter (0..k_depth-1)
     reg [15:0] act_word_addr;   // current SRAM address
     reg        act_read_issued;
+    reg        act_data_ready;  // 2nd cycle: SRAM data available
     reg [31:0] act_buf;         // buffered SRAM word
     reg [1:0]  act_byte_sel;    // byte position within word
 
@@ -184,6 +190,7 @@ module npu_compute #(
     reg [2:0]  param_word_idx;
     reg [31:0] param_buf [0:3];
     reg        param_read_issued;
+    reg        param_data_ready;   // 2nd cycle: SRAM data available
 
     // ─── Writeback state ───
     reg [$clog2(ARRAY_SIZE):0] wb_cnt;   // output bytes collected
@@ -205,6 +212,18 @@ module npu_compute #(
     reg [3:0]  dw_fh, dw_fw;          // Filter position (0..6)
     reg signed [ACC_W-1:0] dw_acc_buf; // Captured DW output accumulator
     reg [5:0]  dw_kernel_size;         // kh * kw (cached)
+    reg [1:0]  dw_wb_phase;            // 0=issue read, 1=wait, 2=merge+write
+    reg [7:0]  dw_wb_byte;             // PPU output byte to write
+    reg [1:0]  dw_wb_bytesel;          // byte position within word
+    reg [ACT_ADDR_W-1:0] dw_wb_addr;  // target word address
+    reg [1:0]  dw_wgt_bsel_base;       // starting byte offset for weight reads
+
+    // ─── Spatial pixel loop (Conv2D Plan A) ───
+    reg [15:0] sp_oh, sp_ow;                  // Current output pixel coordinates
+    reg signed [ACC_W-1:0] dot_acc;           // Reduction accumulator
+    reg [$clog2(ARRAY_SIZE):0] reduce_cnt;    // Reduction counter
+    reg [ACT_ADDR_W-1:0] pixel_act_base;     // Per-pixel activation base address
+    reg signed [ACC_W-1:0] dot_buf [0:ARRAY_SIZE-1]; // Reduced dot products per column
 
     // ─── Flush counter (reused) ───
     reg [15:0] flush_cnt;
@@ -251,22 +270,27 @@ module npu_compute #(
             oc_groups_total <= 1; k_depth <= 1;
             out_tile_h <= 1; out_tile_w <= 1;
             wgt_col_idx <= 0; wgt_byte_idx <= 0;
-            wgt_word_addr <= 0; wgt_read_issued <= 0;
+            wgt_word_addr <= 0; wgt_read_issued <= 0; wgt_data_ready <= 0;
             act_cnt <= 0; act_word_addr <= 0;
-            act_read_issued <= 0; act_buf <= 0; act_byte_sel <= 0;
+            act_read_issued <= 0; act_data_ready <= 0; act_buf <= 0; act_byte_sel <= 0;
             drain_col <= 0;
             ppu_feed_cnt <= 0; ppu_wait_cnt <= 0;
-            param_word_idx <= 0; param_read_issued <= 0;
+            param_word_idx <= 0; param_read_issued <= 0; param_data_ready <= 0;
             wb_cnt <= 0; wb_pack <= 0; wb_addr <= 0;
             wgt_base <= 0; act_base <= 0; param_base <= 0; out_base <= 0;
             dw_ch_idx <= 0; dw_cnt <= 0; dw_read_issued <= 0; dw_init_phase <= 0;
             dw_oh <= 0; dw_ow <= 0; dw_fh <= 0; dw_fw <= 0;
             dw_acc_buf <= 0; dw_kernel_size <= 0;
+            dw_wb_phase <= 0; dw_wb_byte <= 0; dw_wb_bytesel <= 0; dw_wb_addr <= 0;
+            dw_wgt_bsel_base <= 0;
             flush_cnt <= 0;
+            sp_oh <= 0; sp_ow <= 0;
+            dot_acc <= 0; reduce_cnt <= 0; pixel_act_base <= 0;
             for (i = 0; i < ARRAY_SIZE; i = i + 1) begin
                 sa_wgt_data[i] <= 0;
                 sa_act_data[i] <= 0;
                 acc_buf[i] <= 0;
+                dot_buf[i] <= 0;
             end
             for (i = 0; i < 4; i = i + 1)
                 param_buf[i] <= 0;
@@ -318,14 +342,14 @@ module npu_compute #(
                 param_base <= 0;
                 // Input activation base = tile_y * tile_h * stride_h * in_w * in_c / 4
                 //                        + tile_x * tile_w * stride_w * in_c / 4
-                act_base <= (tile_y * out_tile_h * cfg_stride_h[ACT_ADDR_W-1:0]
-                            * cfg_in_w[ACT_ADDR_W-1:0] * cfg_in_c[ACT_ADDR_W-1:0]
-                           + tile_x * out_tile_w * cfg_stride_w[ACT_ADDR_W-1:0]
-                            * cfg_in_c[ACT_ADDR_W-1:0]) >> 2;
+                act_base <= (tile_y * out_tile_h * {8'd0, cfg_stride_h}
+                            * cfg_in_w * cfg_in_c
+                           + tile_x * out_tile_w * {8'd0, cfg_stride_w}
+                            * cfg_in_c) >> 2;
                 // Output base
-                out_base <= (tile_y * out_tile_h * cfg_out_w[ACT_ADDR_W-1:0]
-                            * cfg_out_c[ACT_ADDR_W-1:0]
-                           + tile_x * out_tile_w * cfg_out_c[ACT_ADDR_W-1:0]) >> 2;
+                out_base <= (tile_y * out_tile_h * cfg_out_w
+                            * cfg_out_c
+                           + tile_x * out_tile_w * cfg_out_c) >> 2;
 
                 oc_group <= 0;
 
@@ -360,6 +384,7 @@ module npu_compute #(
                 // Begin loading column 0
                 wgt_byte_idx    <= 0;
                 wgt_read_issued <= 1'b0;
+                wgt_data_ready  <= 1'b0;
                 // Address for column wgt_col_idx, byte 0:
                 //   wgt_base + wgt_col_idx * ceil(k_depth/4)
                 // But actually weights are in OHWI order contiguously:
@@ -370,37 +395,45 @@ module npu_compute #(
             end
 
             S_WGT_LOAD: begin
-                // Fill sa_wgt_data[0..ARRAY_SIZE-1] for current column
+                // Fill sa_wgt_data[0..k_depth-1] for current column, zero-pad rest
                 // Read SRAM words (4 bytes each) and unpack
+                // 3-phase: issue read → wait for SRAM latency → unpack
                 if (!wgt_read_issued) begin
-                    // Issue SRAM read
+                    // Phase 0: Issue SRAM read
                     wgt_rd_en   <= 1'b1;
                     wgt_rd_addr <= wgt_word_addr[WGT_ADDR_W-1:0];
                     wgt_read_issued <= 1'b1;
+                    wgt_data_ready  <= 1'b0;
+                end else if (!wgt_data_ready) begin
+                    // Phase 1: Wait for SRAM read latency
+                    wgt_data_ready <= 1'b1;
                 end else begin
-                    // Data available from wgt_rd_data (1-cycle latency)
-                    // Unpack up to 4 bytes
-                    if (wgt_byte_idx < ARRAY_SIZE) begin
+                    // Phase 2: Data available from wgt_rd_data
+                    // Unpack up to 4 bytes (only k_depth rows get real weights)
+                    if (wgt_byte_idx < k_depth) begin
                         sa_wgt_data[wgt_byte_idx[COL_W-1:0]] <=
                             $signed(wgt_rd_data[7:0]);
                     end
-                    if (wgt_byte_idx + 1 < ARRAY_SIZE) begin
+                    if (wgt_byte_idx + 1 < k_depth) begin
                         sa_wgt_data[wgt_byte_idx[COL_W-1:0] + 1] <=
                             $signed(wgt_rd_data[15:8]);
                     end
-                    if (wgt_byte_idx + 2 < ARRAY_SIZE) begin
+                    if (wgt_byte_idx + 2 < k_depth) begin
                         sa_wgt_data[wgt_byte_idx[COL_W-1:0] + 2] <=
                             $signed(wgt_rd_data[23:16]);
                     end
-                    if (wgt_byte_idx + 3 < ARRAY_SIZE) begin
+                    if (wgt_byte_idx + 3 < k_depth) begin
                         sa_wgt_data[wgt_byte_idx[COL_W-1:0] + 3] <=
                             $signed(wgt_rd_data[31:24]);
                     end
 
                     wgt_byte_idx <= wgt_byte_idx + 4;
 
-                    if (wgt_byte_idx + 4 >= ARRAY_SIZE) begin
-                        // All bytes for this column loaded → emit
+                    if (wgt_byte_idx + 4 >= k_depth) begin
+                        // All k_depth bytes loaded; zero-pad remaining rows
+                        for (i = k_depth[COL_W-1:0]; i < ARRAY_SIZE; i = i + 1)
+                            sa_wgt_data[i[COL_W-1:0]] <= 0;
+                        // Emit
                         state <= S_WGT_EMIT;
                     end else begin
                         // Need more words
@@ -415,13 +448,16 @@ module npu_compute #(
                 sa_wgt_valid <= 1'b1;
 
                 if (wgt_col_idx == COL_MAX) begin
-                    // All columns loaded → activate streaming
-                    state <= S_ACT_CMD;
+                    // All columns loaded → start spatial pixel loop
+                    sp_oh <= 0;
+                    sp_ow <= 0;
+                    state <= S_SPATIAL_SETUP;
                 end else begin
                     // Next column
                     wgt_col_idx <= wgt_col_idx + 1;
                     wgt_byte_idx <= 0;
                     wgt_read_issued <= 1'b0;
+                    wgt_data_ready  <= 1'b0;
                     wgt_word_addr <= wgt_base +
                         ((wgt_col_idx + 1) * k_depth[WGT_ADDR_W-1:0]) / 4;
                     state <= S_WGT_LOAD;
@@ -429,7 +465,7 @@ module npu_compute #(
             end
 
             // ══════════════════════════════════════════════════════════════
-            // ACTIVATION STREAM: broadcast k_depth values to all rows
+            // ACTIVATION STREAM: send k_depth values, one per target row
             // ══════════════════════════════════════════════════════════════
             S_ACT_CMD: begin
                 // Wait for systolic to be ready before issuing COMPUTE
@@ -439,17 +475,23 @@ module npu_compute #(
                     act_cnt      <= 0;
                     act_byte_sel <= 2'd0;
                     act_read_issued <= 1'b0;
-                    act_word_addr <= act_base[15:0];
+                    act_data_ready  <= 1'b0;
+                    act_word_addr <= {{(16-ACT_ADDR_W){1'b0}}, pixel_act_base};
                     state <= S_ACT_LOAD;
                 end
             end
 
             S_ACT_LOAD: begin
                 // Read one SRAM word (4 activation bytes)
+                // 3-phase: issue read → wait for SRAM latency → buffer
                 if (!act_read_issued) begin
                     act_rd_en   <= 1'b1;
                     act_rd_addr <= act_word_addr[ACT_ADDR_W-1:0];
                     act_read_issued <= 1'b1;
+                    act_data_ready  <= 1'b0;
+                end else if (!act_data_ready) begin
+                    // Wait for SRAM read latency
+                    act_data_ready <= 1'b1;
                 end else begin
                     // Data available
                     act_buf <= act_rd_data;
@@ -459,7 +501,7 @@ module npu_compute #(
             end
 
             S_ACT_EMIT: begin
-                // Broadcast one byte to all rows
+                // Send activation to row act_cnt ONLY (per-row targeting)
                 begin : act_emit_blk
                     reg signed [DATA_W-1:0] abyte;
                     case (act_byte_sel)
@@ -469,8 +511,12 @@ module npu_compute #(
                         2'd3: abyte = $signed(act_buf[31:24]);
                         default: abyte = 0;
                     endcase
-                    for (i = 0; i < ARRAY_SIZE; i = i + 1)
-                        sa_act_data[i] <= abyte;
+                    for (i = 0; i < ARRAY_SIZE; i = i + 1) begin
+                        if (i[COL_W-1:0] == act_cnt[COL_W-1:0])
+                            sa_act_data[i] <= abyte;
+                        else
+                            sa_act_data[i] <= 0;
+                    end
                 end
                 sa_act_valid <= 1'b1;
                 act_cnt <= act_cnt + 1;
@@ -512,41 +558,62 @@ module npu_compute #(
 
             S_DRAIN_WAIT: begin
                 if (sa_acc_out_valid) begin
-                    // Capture results
+                    // Capture per-row results for this column
                     for (i = 0; i < ARRAY_SIZE; i = i + 1)
                         acc_buf[i] <= sa_acc_out[i];
-                    // Read params for this channel
-                    param_word_idx <= 0;
-                    param_read_issued <= 1'b0;
-                    state <= S_PARAM_LOAD;
+                    // Reduce: sum rows 0..k_depth-1 into dot product
+                    reduce_cnt <= 0;
+                    dot_acc <= 0;
+                    state <= S_REDUCE;
                 end
             end
 
             // ══════════════════════════════════════════════════════════════
-            // PARAM READ: 4 words per channel (14 bytes padded to 16)
+            // REDUCE: sum k_depth partial products into one dot product
+            // Store result in acc_buf[drain_col] for later PPU feeding
+            // ══════════════════════════════════════════════════════════════
+            S_REDUCE: begin
+                dot_acc <= dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
+                reduce_cnt <= reduce_cnt + 1;
+                if (reduce_cnt + 1 >= k_depth) begin
+                    // Store reduced dot product in dot_buf[drain_col]
+                    dot_buf[drain_col] <= dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
+                    // Next column or move to PPU
+                    if (drain_col == COL_MAX) begin
+                        // All columns drained and reduced → read params & feed PPU
+                        param_word_idx <= 0;
+                        param_read_issued <= 1'b0;
+                        param_data_ready  <= 1'b0;
+                        drain_col <= 0;
+                        state <= S_PARAM_LOAD;
+                    end else begin
+                        drain_col <= drain_col + 1;
+                        state <= S_DRAIN_CMD;
+                    end
+                end
+            end
+
+            // ══════════════════════════════════════════════════════════════
+            // PARAM READ: 4 words per channel — now iterates drain_col
+            // as the output channel index (0..ARRAY_SIZE-1)
             // ══════════════════════════════════════════════════════════════
             S_PARAM_LOAD: begin
                 if (!param_read_issued) begin
                     param_rd_en   <= 1'b1;
                     param_rd_addr <= param_base + drain_col * 4 + param_word_idx;
                     param_read_issued <= 1'b1;
+                    param_data_ready  <= 1'b0;
+                end else if (!param_data_ready) begin
+                    // Wait for SRAM read latency
+                    param_data_ready <= 1'b1;
                 end else begin
                     param_buf[param_word_idx] <= param_rd_data;
                     if (param_word_idx == 3'd3) begin
-                        // Extract params and setup PPU
-                        // Word 0: [M_lo(8), M_hi(7+1pad), S(6+2pad), pad(8)]
-                        //   M = param_buf[0][14:0], S = param_buf[0][21:16]
-                        // Word 1: [zp_lo(8), zp_hi(8), bias_0(8), bias_1(8)]
-                        //   zp = param_buf[1][15:0]
-                        // Word 2: [bias_2..bias_5]
-                        // Word 3: [bias_6, bias_7, pad, pad]
-                        //   bias = {word3[15:0], word2, word1[31:16]} = 48 bits (lower of 64-bit)
                         ppu_mult_m     <= param_buf[0][14:0];
                         ppu_shift_s    <= param_buf[0][21:16];
                         ppu_zero_point <= $signed(param_buf[1][15:0]);
                         ppu_bias       <= $signed({param_buf[3][15:0], param_buf[2],
                                                    param_buf[1][31:16]});
-                        ppu_feed_cnt <= 0;
                         state <= S_PPU_FEED;
                     end else begin
                         param_word_idx <= param_word_idx + 1;
@@ -556,65 +623,99 @@ module npu_compute #(
             end
 
             // ══════════════════════════════════════════════════════════════
-            // PPU FEED: send ARRAY_SIZE acc values one per cycle
+            // PPU FEED: send ONE dot product (dot_buf[drain_col]) to PPU
             // ══════════════════════════════════════════════════════════════
             S_PPU_FEED: begin
-                ppu_acc_in   <= acc_buf[ppu_feed_cnt[$clog2(ARRAY_SIZE)-1:0]];
+                ppu_acc_in   <= dot_buf[drain_col];
                 ppu_in_valid <= 1'b1;
-                ppu_feed_cnt <= ppu_feed_cnt + 1;
+                state        <= S_PPU_WAIT;
+            end
 
-                if (ppu_feed_cnt + 1 >= ARRAY_SIZE) begin
-                    wb_cnt  <= 0;
-                    wb_pack <= 0;
-                    // Compute writeback address
-                    wb_addr <= out_base + (oc_group * ARRAY_SIZE_16 +
-                               drain_col) / 4;
-                    // Go directly to writeback — outputs arrive after 4-cycle PPU latency
+            S_PPU_WAIT: begin
+                // Wait for PPU output (4-cycle pipeline)
+                if (ppu_out_valid) begin
                     state <= S_WRITEBACK;
                 end
             end
 
-            S_PPU_WAIT: begin
-                // Unused — kept for state encoding compatibility
-                state <= S_WRITEBACK;
+            // ══════════════════════════════════════════════════════════════
+            // WRITEBACK: pack output bytes and write SRAM words
+            // Output NHWC layout: byte at (sp_oh*out_tile_w + sp_ow)*out_c + oc
+            // Since oc_group*ARRAY_SIZE and ARRAY_SIZE are multiples of 4,
+            // drain_col[1:0] directly gives byte position within SRAM word.
+            // ══════════════════════════════════════════════════════════════
+            S_WRITEBACK: begin
+                // Pack output byte into wb_pack
+                case (drain_col[1:0])
+                    2'd0: wb_pack[7:0]   <= ppu_out_data;
+                    2'd1: wb_pack[15:8]  <= ppu_out_data;
+                    2'd2: wb_pack[23:16] <= ppu_out_data;
+                    2'd3: begin
+                        // Write full word (4 output channels)
+                        act_wr_en   <= 1'b1;
+                        act_wr_addr <= out_base +
+                            ((sp_oh * out_tile_w + sp_ow) * cfg_out_c
+                             + oc_group * ARRAY_SIZE_16
+                             + {12'd0, drain_col[COL_W-1:2], 2'b00}) >> 2;
+                        act_wr_data <= {ppu_out_data, wb_pack[23:0]};
+                    end
+                endcase
+
+                // Advance to next channel or finish pixel
+                if (drain_col == COL_MAX) begin
+                    // Flush remaining partial word if ARRAY_SIZE not multiple of 4
+                    // (ARRAY_SIZE is always >=4 and power of 2, so this won't trigger)
+                    if (drain_col[1:0] != 2'd3) begin
+                        act_wr_en   <= 1'b1;
+                        act_wr_addr <= out_base +
+                            ((sp_oh * out_tile_w + sp_ow) * cfg_out_c
+                             + oc_group * ARRAY_SIZE_16
+                             + {12'd0, drain_col[COL_W-1:2], 2'b00}) >> 2;
+                        act_wr_data <= wb_pack;
+                    end
+                    state <= S_PIXEL_NEXT;
+                end else begin
+                    drain_col <= drain_col + 1;
+                    param_word_idx <= 0;
+                    param_read_issued <= 1'b0;
+                    param_data_ready  <= 1'b0;
+                    state <= S_PARAM_LOAD;
+                end
             end
 
             // ══════════════════════════════════════════════════════════════
-            // WRITEBACK: collect PPU INT8 outputs as they arrive
+            // SPATIAL SETUP: compute per-pixel activation address
             // ══════════════════════════════════════════════════════════════
-            S_WRITEBACK: begin
-                if (ppu_out_valid) begin
-                    case (wb_cnt[1:0])
-                        2'd0: wb_pack[7:0]   <= ppu_out_data;
-                        2'd1: wb_pack[15:8]  <= ppu_out_data;
-                        2'd2: wb_pack[23:16] <= ppu_out_data;
-                        2'd3: begin
-                            // Write full word
-                            act_wr_en   <= 1'b1;
-                            act_wr_addr <= wb_addr;
-                            act_wr_data <= {ppu_out_data, wb_pack[23:0]};
-                            wb_addr     <= wb_addr + 1;
-                        end
-                    endcase
-                    wb_cnt <= wb_cnt + 1;
-                end
+            S_SPATIAL_SETUP: begin
+                // For 1x1 conv (kh=1,kw=1): activation byte offset =
+                //   (sp_oh * in_w + sp_ow) * in_c
+                // For general conv: input window origin =
+                //   (sp_oh * stride_h - pad_top) * in_w * in_c
+                //   + (sp_ow * stride_w - pad_left) * in_c
+                // V1: support 1x1 only (no padding needed)
+                pixel_act_base <= act_base +
+                    ((sp_oh * cfg_in_w + sp_ow) * cfg_in_c) >> 2;
+                drain_col <= 0;
+                wb_pack <= 0;
+                state <= S_ACT_CMD;
+            end
 
-                // All outputs collected?
-                if (wb_cnt >= ARRAY_SIZE) begin
-                    // Flush remaining partial word if needed
-                    if (wb_cnt[1:0] != 2'd0) begin
-                        act_wr_en   <= 1'b1;
-                        act_wr_addr <= wb_addr;
-                        act_wr_data <= wb_pack;
-                    end
-
-                    // Next drain column or next OC group
-                    if (drain_col == COL_MAX) begin
+            // ══════════════════════════════════════════════════════════════
+            // PIXEL NEXT: advance spatial pixel or go to OC_NEXT
+            // ══════════════════════════════════════════════════════════════
+            S_PIXEL_NEXT: begin
+                if (sp_ow + 1 >= out_tile_w) begin
+                    if (sp_oh + 1 >= out_tile_h) begin
+                        // All pixels done for this OC group
                         state <= S_OC_NEXT;
                     end else begin
-                        drain_col <= drain_col + 1;
-                        state <= S_DRAIN_CMD;
+                        sp_ow <= 0;
+                        sp_oh <= sp_oh + 1;
+                        state <= S_SPATIAL_SETUP;
                     end
+                end else begin
+                    sp_ow <= sp_ow + 1;
+                    state <= S_SPATIAL_SETUP;
                 end
             end
 
@@ -670,8 +771,13 @@ module npu_compute #(
                 2'd0: begin
                     // Phase 0: setup (dw_wgt_load takes effect next cycle via NBA)
                     dw_kernel_size <= cfg_kernel_h[3:0] * cfg_kernel_w[3:0];
-                    wgt_word_addr <= {6'd0, wgt_base} +
-                        (oc_group * {2'd0, cfg_kernel_h[3:0]} * {2'd0, cfg_kernel_w[3:0]}) / 4;
+                    begin : dw_wgt_addr_setup
+                        reg [15:0] wgt_byte_start;
+                        wgt_byte_start = oc_group * {2'd0, cfg_kernel_h[3:0]}
+                                       * {2'd0, cfg_kernel_w[3:0]};
+                        wgt_word_addr <= {6'd0, wgt_base} + wgt_byte_start[15:2];
+                        dw_wgt_bsel_base <= wgt_byte_start[1:0];
+                    end
                     dw_init_phase <= 2'd1;
                 end
                 2'd1: begin
@@ -692,7 +798,7 @@ module npu_compute #(
                         // SRAM data available — extract byte and feed
                         begin : dw_wgt_extract
                             reg [1:0] bsel;
-                            bsel = dw_cnt[1:0];
+                            bsel = dw_cnt[1:0] + dw_wgt_bsel_base;
                             case (bsel)
                                 2'd0: dw_wgt_data <= $signed(wgt_rd_data[7:0]);
                                 2'd1: dw_wgt_data <= $signed(wgt_rd_data[15:8]);
@@ -706,7 +812,7 @@ module npu_compute #(
                         if (dw_cnt + 1 >= dw_kernel_size) begin
                             // All weights loaded
                             state <= S_DW_DRAIN;
-                        end else if (dw_cnt[1:0] == 2'd3) begin
+                        end else if ((dw_cnt[1:0] + dw_wgt_bsel_base) == 2'd3) begin
                             // Need next SRAM word
                             wgt_word_addr <= wgt_word_addr + 1;
                             wgt_rd_en    <= 1'b1;
@@ -766,9 +872,6 @@ module npu_compute #(
                 dw_fh <= 0;
                 dw_fw <= 0;
                 dw_read_issued <= 1'b0;
-                wb_cnt <= 0;
-                wb_pack <= 0;
-                wb_addr <= out_base + (oc_group[ACT_ADDR_W-1:0]) / 4;
                 state <= S_DW_ACT_STREAM;
             end
 
@@ -857,7 +960,7 @@ module npu_compute #(
             end
 
             S_DW_PPU_WAIT: begin
-                // Wait for dw_out_valid, then feed PPU, wait for PPU output, pack
+                // Wait for dw_out_valid, then feed PPU, wait for PPU output
                 if (ppu_wait_cnt == 0) begin
                     // Wait for DW output valid (1 cycle after last in_valid)
                     if (dw_out_valid) begin
@@ -869,37 +972,60 @@ module npu_compute #(
                 end else begin
                     // Wait for PPU output
                     if (ppu_out_valid) begin
-                        // Pack output byte
-                        case (wb_cnt[1:0])
-                            2'd0: wb_pack[7:0]   <= ppu_out_data;
-                            2'd1: wb_pack[15:8]  <= ppu_out_data;
-                            2'd2: wb_pack[23:16] <= ppu_out_data;
-                            2'd3: begin
-                                // Write full word to output SRAM
-                                act_wr_en   <= 1'b1;
-                                act_wr_addr <= wb_addr;
-                                act_wr_data <= {ppu_out_data, wb_pack[23:0]};
-                                wb_addr     <= wb_addr + 1;
-                            end
-                        endcase
-                        wb_cnt <= wb_cnt + 1;
+                        // Compute NHWC byte offset for this pixel/channel
+                        begin : dw_wb_addr_calc
+                            reg [31:0] byte_off;
+                            byte_off = (dw_oh * out_tile_w + dw_ow)
+                                     * cfg_out_c + oc_group;
+                            dw_wb_addr    <= out_base + byte_off[ACT_ADDR_W+1:2];
+                            dw_wb_bytesel <= byte_off[1:0];
+                        end
+                        dw_wb_byte  <= ppu_out_data;
+                        dw_wb_phase <= 2'd0;
+                        state <= S_DW_WB;
+                    end else begin
+                        ppu_wait_cnt <= ppu_wait_cnt + 1;
+                    end
+                end
+            end
 
-                        // Advance to next pixel
-                        if (dw_ow + 1 >= out_tile_w) begin
-                            dw_ow <= 0;
-                            if (dw_oh + 1 >= out_tile_h) begin
-                                // All pixels for this channel done
-                                state <= S_DW_PPU;
-                            end else begin
-                                dw_oh <= dw_oh + 1;
-                                dw_fh <= 0;
-                                dw_fw <= 0;
-                                dw_read_issued <= 1'b0;
-                                ppu_wait_cnt <= 0;
-                                state <= S_DW_ACT_STREAM;
-                            end
+            S_DW_WB: begin
+                // Read-modify-write: place output byte at correct NHWC position
+                case (dw_wb_phase)
+                2'd0: begin
+                    // Issue SRAM read at target word address
+                    act_rd_en   <= 1'b1;
+                    act_rd_addr <= dw_wb_addr;
+                    dw_wb_phase <= 2'd1;
+                end
+                2'd1: begin
+                    // Wait for SRAM read latency
+                    dw_wb_phase <= 2'd2;
+                end
+                2'd2: begin
+                    // Merge byte into read word and write back
+                    begin : dw_wb_merge
+                        reg [31:0] merged;
+                        merged = act_rd_data;
+                        case (dw_wb_bytesel)
+                            2'd0: merged[7:0]   = dw_wb_byte;
+                            2'd1: merged[15:8]  = dw_wb_byte;
+                            2'd2: merged[23:16] = dw_wb_byte;
+                            2'd3: merged[31:24] = dw_wb_byte;
+                        endcase
+                        act_wr_en   <= 1'b1;
+                        act_wr_addr <= dw_wb_addr;
+                        act_wr_data <= merged;
+                    end
+
+                    // Advance to next pixel
+                    if (dw_ow + 1 >= out_tile_w) begin
+                        dw_ow <= 0;
+                        if (dw_oh + 1 >= out_tile_h) begin
+                            // All pixels for this channel done
+                            state <= S_OC_NEXT;
                         end else begin
-                            dw_ow <= dw_ow + 1;
+                            dw_oh <= dw_oh + 1;
                             dw_fh <= 0;
                             dw_fw <= 0;
                             dw_read_issued <= 1'b0;
@@ -907,18 +1033,20 @@ module npu_compute #(
                             state <= S_DW_ACT_STREAM;
                         end
                     end else begin
-                        ppu_wait_cnt <= ppu_wait_cnt + 1;
+                        dw_ow <= dw_ow + 1;
+                        dw_fh <= 0;
+                        dw_fw <= 0;
+                        dw_read_issued <= 1'b0;
+                        ppu_wait_cnt <= 0;
+                        state <= S_DW_ACT_STREAM;
                     end
                 end
+                default: dw_wb_phase <= 2'd0;
+                endcase
             end
 
             S_DW_PPU: begin
-                // Flush remaining partial word
-                if (wb_cnt[1:0] != 2'd0) begin
-                    act_wr_en   <= 1'b1;
-                    act_wr_addr <= wb_addr;
-                    act_wr_data <= wb_pack;
-                end
+                // No longer used (writeback handled in S_DW_WB)
                 state <= S_OC_NEXT;
             end
 

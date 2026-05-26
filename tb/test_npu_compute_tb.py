@@ -91,6 +91,11 @@ async def wait_done(dut, timeout=5000):
     return False
 
 
+def get_array_size(dut):
+    """Get ARRAY_SIZE from the RTL parameter."""
+    return int(dut.u_compute.ARRAY_SIZE.value)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # TESTS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -108,28 +113,21 @@ async def test_idle_after_reset(dut):
 
 @cocotb.test()
 async def test_weight_load_4x4(dut):
-    """Load 4x4 weights and verify systolic wgt_valid timing."""
+    """Load weights and verify systolic wgt_valid timing."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
-    ARRAY_SIZE = 4
-    # 1x1 conv, 4 IC, 4 OC → k_depth=4, 4 columns of 4 weights each
+    ARRAY_SIZE = get_array_size(dut)
+    # 1x1 conv, 4 IC, 4 OC → k_depth=4, ARRAY_SIZE columns of 4 weights each
     # Weight SRAM: column-major in OHWI order
     # Col 0 (OC0): weights[0..3] at word 0 = pack_i8x4(w00,w01,w02,w03)
     # Col 1 (OC1): weights[4..7] at word 1
-    # Col 2 (OC2): weights[8..11] at word 2
-    # Col 3 (OC3): weights[12..15] at word 3
-    weights = [
-        [1, 2, 3, 4],     # OC0 weights for IC0..IC3
-        [5, 6, 7, 8],     # OC1
-        [9, 10, 11, 12],  # OC2
-        [13, 14, 15, 16], # OC3
-    ]
-    for oc in range(4):
-        w = weights[oc]
+    # etc.
+    for oc in range(ARRAY_SIZE):
+        w = [(oc * 4 + i + 1) & 0xFF for i in range(4)]
         write_sram_word(dut, 'wgt', oc, pack_i8x4(w[0], w[1], w[2], w[3]))
 
-    set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1)
+    set_cfg(dut, in_c=4, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
     # Pulse start
     dut.start.value = 1
@@ -138,7 +136,7 @@ async def test_weight_load_4x4(dut):
 
     # Count wgt_valid pulses until COMPUTE cmd
     wgt_valid_count = 0
-    for _ in range(200):
+    for _ in range(500):
         await RisingEdge(dut.clk)
         await ReadOnly()
         sv = int(dut.u_compute.sa_wgt_valid.value)
@@ -161,16 +159,16 @@ async def test_act_stream_4x4(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
-    ARRAY_SIZE = 4
+    ARRAY_SIZE = get_array_size(dut)
     k_depth = 4  # 1*1*4
 
     # Load weights (any values)
-    for i in range(4):
+    for i in range(ARRAY_SIZE):
         write_sram_word(dut, 'wgt', i, pack_i8x4(1, 1, 1, 1))
     # Load activations: 4 bytes = 1 word
     write_sram_word(dut, 'act', 0, pack_i8x4(10, 20, 30, 40))
 
-    set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1)
+    set_cfg(dut, in_c=4, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)
@@ -203,14 +201,14 @@ async def test_drain_sequence(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
-    ARRAY_SIZE = 4
+    ARRAY_SIZE = get_array_size(dut)
 
     # Load weights and activations
-    for i in range(4):
+    for i in range(ARRAY_SIZE):
         write_sram_word(dut, 'wgt', i, pack_i8x4(1, 0, 0, 0))
     write_sram_word(dut, 'act', 0, pack_i8x4(1, 0, 0, 0))
     # Load params (zero params — passthrough mode)
-    for ch in range(4):
+    for ch in range(ARRAY_SIZE):
         base = ch * 4
         write_sram_word(dut, 'param', base + 0, 0x00010000)  # M=1, S=0
         write_sram_word(dut, 'param', base + 1, 0x00000000)  # zp=0, bias_lo=0
@@ -222,7 +220,7 @@ async def test_drain_sequence(dut):
     dut.ppu_bias_en.value = 0
     dut.ppu_zp_en.value = 0
 
-    set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1)
+    set_cfg(dut, in_c=4, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)
@@ -231,7 +229,7 @@ async def test_drain_sequence(dut):
     # Count drain commands
     drain_count = 0
     drain_cols = set()
-    for _ in range(2000):
+    for _ in range(20000):
         await RisingEdge(dut.clk)
         await ReadOnly()
         cmd_v = int(dut.u_compute.sa_cmd_valid.value)
@@ -255,11 +253,12 @@ async def test_done_pulse(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
+    ARRAY_SIZE = get_array_size(dut)
     # Minimal setup
-    for i in range(4):
+    for i in range(ARRAY_SIZE):
         write_sram_word(dut, 'wgt', i, pack_i8x4(1, 0, 0, 0))
     write_sram_word(dut, 'act', 0, pack_i8x4(1, 0, 0, 0))
-    for ch in range(4):
+    for ch in range(ARRAY_SIZE):
         base = ch * 4
         write_sram_word(dut, 'param', base + 0, 0x00010000)  # M=1, S=0
         write_sram_word(dut, 'param', base + 1, 0)
@@ -270,39 +269,37 @@ async def test_done_pulse(dut):
     dut.ppu_bias_en.value = 0
     dut.ppu_zp_en.value = 0
 
-    set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1)
+    set_cfg(dut, in_c=4, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    assert await wait_done(dut, timeout=3000), "done never asserted within 3000 cycles"
+    assert await wait_done(dut, timeout=20000), "done never asserted within 20000 cycles"
 
 
 @cocotb.test()
 async def test_conv1x1_golden(dut):
-    """1x1 conv 4IC→4OC: verify accumulator values match golden."""
+    """1x1 conv IC=4→OC=ARRAY_SIZE: verify completion with identity weights."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
-    ARRAY_SIZE = 4
+    ARRAY_SIZE = get_array_size(dut)
     # Weights: identity-like (OC_i gets weight 1 at IC_i, 0 elsewhere)
-    # This means output[oc] = input[oc] (for matching IC/OC indices)
-    weights = [
-        [1, 0, 0, 0],  # OC0: IC0=1, rest=0
-        [0, 1, 0, 0],  # OC1: IC1=1
-        [0, 0, 1, 0],  # OC2: IC2=1
-        [0, 0, 0, 1],  # OC3: IC3=1
-    ]
-    for oc in range(4):
-        w = weights[oc]
+    # Only first 4 OCs meaningful since IC=4
+    for oc in range(ARRAY_SIZE):
+        if oc < 4:
+            w = [0]*4
+            w[oc] = 1
+        else:
+            w = [0]*4
         write_sram_word(dut, 'wgt', oc, pack_i8x4(w[0], w[1], w[2], w[3]))
 
     # Activations: [10, 20, 30, 40]
     write_sram_word(dut, 'act', 0, pack_i8x4(10, 20, 30, 40))
 
     # Params: M=1, S=0, zp=0, bias=0 (passthrough quantization)
-    for ch in range(4):
+    for ch in range(ARRAY_SIZE):
         base = ch * 4
         write_sram_word(dut, 'param', base + 0, 0x00000001)  # M=1, S=0
         write_sram_word(dut, 'param', base + 1, 0)
@@ -313,39 +310,29 @@ async def test_conv1x1_golden(dut):
     dut.ppu_bias_en.value = 0
     dut.ppu_zp_en.value = 0
 
-    set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1)
+    set_cfg(dut, in_c=4, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    assert await wait_done(dut, timeout=3000), "done never asserted"
-
-    # Expected outputs: [10, 20, 30, 40] (identity conv)
-    # These get written to act SRAM output area
-    # With passthrough PPU: out = acc[7:0]
-    # Since we're writing to out_base=0 (same as input — overwrite)
-    # Check: the output should be at address out_base
-    # For a 1x1 spatial with 4OC, outputs are packed 4 per word
-    # After drain col 0: output[0] = acc_buf[0] = weight_col0 · act = 1*10+0+0+0 = 10
-    # But drain reads ALL rows for a given column. Each row is a spatial output.
-    # For 1x1 spatial: only row 0 has valid data (rows 1-3 are garbage from zero weights×zero acts)
-
-    # Actually the output write depends on the writeback logic.
-    # Let's just verify done was asserted for now — golden verification is complex.
+    assert await wait_done(dut, timeout=10000), "done never asserted"
 
 
 @cocotb.test()
 async def test_oc_tiling_2groups(dut):
-    """8 output channels with ARRAY_SIZE=4 → 2 OC groups, 2 WGT_LOAD cmds."""
+    """OC = 2*ARRAY_SIZE → 2 OC groups, 2 WGT_LOAD cmds."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
-    # Load weights for 8 OC channels
-    for oc in range(8):
+    ARRAY_SIZE = get_array_size(dut)
+    out_c = ARRAY_SIZE * 2  # 2 OC groups
+
+    # Load weights for out_c OC channels
+    for oc in range(out_c):
         write_sram_word(dut, 'wgt', oc, pack_i8x4(1, 0, 0, 0))
     write_sram_word(dut, 'act', 0, pack_i8x4(1, 0, 0, 0))
-    for ch in range(8):
+    for ch in range(out_c):
         base = ch * 4
         write_sram_word(dut, 'param', base + 0, 0x00000001)
         write_sram_word(dut, 'param', base + 1, 0)
@@ -356,14 +343,14 @@ async def test_oc_tiling_2groups(dut):
     dut.ppu_bias_en.value = 0
     dut.ppu_zp_en.value = 0
 
-    set_cfg(dut, in_c=4, out_c=8, kh=1, kw=1, out_h=1, out_w=1)
+    set_cfg(dut, in_c=4, out_c=out_c, kh=1, kw=1, out_h=1, out_w=1)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
     wgt_load_cmds = 0
-    for _ in range(5000):
+    for _ in range(20000):
         await RisingEdge(dut.clk)
         await ReadOnly()
         cmd_v = int(dut.u_compute.sa_cmd_valid.value)
@@ -384,11 +371,13 @@ async def test_spatial_tiling_2x2(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
+    ARRAY_SIZE = get_array_size(dut)
+
     # Fill SRAMs with dummy data
     for i in range(64):
         write_sram_word(dut, 'wgt', i, pack_i8x4(1, 0, 0, 0))
         write_sram_word(dut, 'act', i, pack_i8x4(1, 0, 0, 0))
-    for ch in range(4):
+    for ch in range(ARRAY_SIZE):
         base = ch * 4
         write_sram_word(dut, 'param', base + 0, 0x00000001)
         write_sram_word(dut, 'param', base + 1, 0)
@@ -399,7 +388,7 @@ async def test_spatial_tiling_2x2(dut):
     dut.ppu_bias_en.value = 0
     dut.ppu_zp_en.value = 0
 
-    set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1,
+    set_cfg(dut, in_c=4, out_c=ARRAY_SIZE, kh=1, kw=1,
             out_h=4, out_w=4, in_h=4, in_w=4,
             tile_h=2, tile_w=2, tile_num_h=2, tile_num_w=2)
 
@@ -408,7 +397,7 @@ async def test_spatial_tiling_2x2(dut):
     dut.start.value = 0
 
     wgt_load_cmds = 0
-    for _ in range(10000):
+    for _ in range(200000):
         await RisingEdge(dut.clk)
         await ReadOnly()
         cmd_v = int(dut.u_compute.sa_cmd_valid.value)
@@ -425,53 +414,123 @@ async def test_spatial_tiling_2x2(dut):
 
 @cocotb.test()
 async def test_conv1x1_verify_output(dut):
-    """Verify actual output values for simple 1x1 conv with passthrough PPU."""
+    """Verify actual output values for 1x1 conv with all-ones weights.
+
+    With per-row activation + reduction:
+      PE[k][col].acc = w[col][k] * act[k] (single product)
+      dot_product[col] = sum_k(w[col][k] * act[k])
+    With all weights=1: dot_product[col] = sum(acts) = 2+3+4+5 = 14.
+    After passthrough PPU, all output bytes = 14.
+    """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
-    # Simple: all weights = 1, input = [2, 3, 4, 5]
-    # Each OC channel sums all IC: out[oc] = 2+3+4+5 = 14
-    for oc in range(4):
+    ARRAY_SIZE = get_array_size(dut)
+
+    # Use all-ones weights so dot product = sum of activations.
+    for oc in range(ARRAY_SIZE):
         write_sram_word(dut, 'wgt', oc, pack_i8x4(1, 1, 1, 1))
+
+    # Pre-zero output area (output will be at same location for 1-pixel case)
+    for i in range(64):
+        write_sram_word(dut, 'act', i, 0)
     write_sram_word(dut, 'act', 0, pack_i8x4(2, 3, 4, 5))
 
     # Passthrough params
-    for ch in range(4):
+    for ch in range(ARRAY_SIZE):
         base = ch * 4
-        write_sram_word(dut, 'param', base + 0, 0x00000001)  # M=1
+        write_sram_word(dut, 'param', base + 0, 0x00000001)
         write_sram_word(dut, 'param', base + 1, 0)
         write_sram_word(dut, 'param', base + 2, 0)
         write_sram_word(dut, 'param', base + 3, 0)
 
-    dut.ppu_mode.value = 3  # PASSTHROUGH
+    dut.ppu_mode.value = 3
     dut.ppu_bias_en.value = 0
     dut.ppu_zp_en.value = 0
 
-    set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1)
+    set_cfg(dut, in_c=4, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    assert await wait_done(dut, timeout=3000), "done never asserted"
+    assert await wait_done(dut, timeout=20000), "done never asserted"
 
-    # Check output SRAM — result should be packed at out_base (address 0)
-    # Expected: each OC output = 14 (signed int8)
-    # But writeback logic writes outputs from drain... let's trace:
-    # Drain col 0: acc_buf[row] = row0's accumulator for col 0
-    #   PE(0,0) acc = act[0]*wgt[0] (streamed over k_depth cycles)
-    #   With broadcast: all rows get same input, but each row has same weight (1,1,1,1)
-    #   So each PE(row,col) acc = sum of all k_depth activations × weight for that position
-    #   With weight-stationary and broadcast act: PE(r,c) acc = sum_{k=0..K-1} act[k] * w_stored
-    #   where w_stored was loaded during weight phase
-    #   For 1x1 conv K=4: PE(r,c) stores weight for (output_channel c, input_channel r)
-    #   During compute: act[k] is broadcast to all rows at cycle k
-    #   PE(r,c) computes: acc = sum_{k} act_in[k] * stored_weight
-    #   But act_in arrives at column c with c-cycle delay (systolic)
-    #   For column c, PE(r,c) sees: act[0-c], act[1-c], ... shifted by c cycles
-    #   Wait, the activation propagates horizontally: col 0 gets act first, col 1 gets it 1 cycle later
+    # dot_product[col] = 1*2 + 1*3 + 1*4 + 1*5 = 14 for all columns
+    # Output at word 0 (pixel 0, channels 0-3)
+    out_word = read_sram_word(dut, 'act', 0)
+    dut._log.info(f"Output word 0 = 0x{out_word:08X}")
 
-    # This is getting complex — just verify done for now, detailed golden in later test
+    # All bytes should be 14
+    for i in range(4):
+        byte_val = (out_word >> (i*8)) & 0xFF
+        assert byte_val == 14, \
+            f"Output byte {i} = {byte_val}, expected 14 (all weights=1, sum acts=14)"
+
+
+@cocotb.test()
+async def test_conv1x1_dotproduct(dut):
+    """Verify correct dot product with non-uniform weights.
+
+    This test would FAIL with the old broadcast approach (w*sum) and
+    only PASSES with correct per-row activation + reduction.
+
+    weights[col=0] = [1, 2, 3, 4] (different per row/k)
+    activations = [10, 20, 30, 40]
+    dot_product[col=0] = 1*10 + 2*20 + 3*30 + 4*40 = 10+40+90+160 = 300
+    Clipped to int8: 300 > 127, so with passthrough truncation = 300 & 0xFF = 44 (0x2C)
+
+    Use small values to stay in int8: w=[1,2,3,4], act=[1,2,3,4]
+    dot = 1*1 + 2*2 + 3*3 + 4*4 = 1+4+9+16 = 30
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+
+    ARRAY_SIZE = get_array_size(dut)
+
+    # Non-uniform weights: col 0 = [1,2,3,4], cols 1..N-1 = [1,1,1,1]
+    # Weight SRAM layout: col c at word address c (for k_depth=4)
+    write_sram_word(dut, 'wgt', 0, pack_i8x4(1, 2, 3, 4))  # col 0: w[0][k] = k+1
+    for oc in range(1, ARRAY_SIZE):
+        write_sram_word(dut, 'wgt', oc, pack_i8x4(1, 1, 1, 1))  # cols 1+: all ones
+
+    # Pre-zero and set activations at word 0
+    for i in range(64):
+        write_sram_word(dut, 'act', i, 0)
+    write_sram_word(dut, 'act', 0, pack_i8x4(1, 2, 3, 4))
+
+    # Passthrough params
+    for ch in range(ARRAY_SIZE):
+        base = ch * 4
+        write_sram_word(dut, 'param', base + 0, 0x00000001)
+        write_sram_word(dut, 'param', base + 1, 0)
+        write_sram_word(dut, 'param', base + 2, 0)
+        write_sram_word(dut, 'param', base + 3, 0)
+
+    dut.ppu_mode.value = 3
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    set_cfg(dut, in_c=4, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=20000), "done never asserted"
+
+    out_word = read_sram_word(dut, 'act', 0)
+    dut._log.info(f"Output word 0 = 0x{out_word:08X}")
+
+    # Channel 0 (byte 0): dot = 1*1 + 2*2 + 3*3 + 4*4 = 30
+    byte0 = out_word & 0xFF
+    assert byte0 == 30, f"Channel 0: expected 30, got {byte0}"
+
+    # Channels 1-3 (bytes 1-3): dot = 1*1 + 1*2 + 1*3 + 1*4 = 10
+    for i in range(1, 4):
+        byte_val = (out_word >> (i*8)) & 0xFF
+        assert byte_val == 10, \
+            f"Channel {i}: expected 10, got {byte_val}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -581,6 +640,10 @@ async def test_dw_conv_multichannel(dut):
     # ch0=10, ch1=20, ch2=30, ch3=40
     write_sram_word(dut, 'act', 0, pack_i8x4(10, 20, 30, 40))
 
+    # Pre-zero output area beyond input (output shares addr 0 with input for this test)
+    for i in range(1, 8):
+        write_sram_word(dut, 'act', i, 0)
+
     # Params for 4 channels
     for ch in range(4):
         base = ch * 4
@@ -604,28 +667,19 @@ async def test_dw_conv_multichannel(dut):
     assert await wait_done(dut, timeout=2000), "DW multichannel done never asserted"
 
     # Expected: ch0=2*10=20, ch1=3*20=60, ch2=4*30=120, ch3=5*40=200
-    # Output NHWC: pixel(0,0) ch0-3 at bytes 0-3 → word at out_base
-    # DW processes channels sequentially; each channel writes 1 byte.
-    # The writeback address for channel c, pixel(0,0):
-    #   byte_offset = (0*1+0)*4 + c = c
-    #   word addr = c/4 = 0 for all, byte sel = c%4
-    # But channels write independently with partial flush each time.
-    # Channel 0 writes byte 0 → partial flush to word 0
-    # Channel 1 writes byte 0 of its own wb_pack → overwrites word 0!
-    # This means the current wb logic needs fixing for multichannel...
-    # Actually each channel resets wb_cnt=0 and wb_addr=out_base + oc_group/4
-    # For out_c=4: ch0→wb_addr=0, ch1→wb_addr=0, ch2→wb_addr=0, ch3→wb_addr=0
-    # Each writes 1 pixel (1 byte), flushes partial → word0 gets overwritten 4 times
-    # Last channel (ch3) writes its single byte to byte[0] position of word0
-    # This is INCORRECT for NHWC layout!
-    #
-    # The fix: for DW conv output, the byte position within the word depends on
-    # the channel index, not a sequential counter.
-    # Expected fix: wb_addr = out_base + (pixel_offset * out_c + ch) / 4
-    # and the byte goes to position (pixel_offset * out_c + ch) % 4
-    #
-    # For now, just verify the module completes without hanging.
-    # Detailed output verification will be done after fixing writeback addressing.
+    # Output NHWC: pixel(0,0) ch0-3 packed in word at out_base
+    # out_base = (0*1*4 + 0*4) >> 2 = 0 for tile(0,0)
+    # byte_offset for ch c = (0*1+0)*4 + c = c
+    # So all 4 bytes in word 0: [ch0, ch1, ch2, ch3] = [20, 60, 120, 200]
+    out_word = read_sram_word(dut, 'act', 0)
+    ch0 = out_word & 0xFF
+    ch1 = (out_word >> 8) & 0xFF
+    ch2 = (out_word >> 16) & 0xFF
+    ch3 = (out_word >> 24) & 0xFF
+    assert ch0 == 20, f"ch0: expected 20, got {ch0}"
+    assert ch1 == 60, f"ch1: expected 60, got {ch1}"
+    assert ch2 == 120, f"ch2: expected 120, got {ch2}"
+    assert ch3 == 200, f"ch3: expected 200, got {ch3}"
 
 
 @cocotb.test()
