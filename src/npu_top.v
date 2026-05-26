@@ -78,6 +78,7 @@ module npu_top #(
     wire [31:0] reg_dma_ctrl, reg_dma_add_b_addr;
     wire [31:0] reg_dma_add_param_addr;
     wire [31:0] reg_dma_in_size, reg_dma_wgt_size;
+    wire [31:0] reg_dma_out_size;
 
     // --- CSR Post-Processing Config outputs ---
     wire [31:0] reg_post_ctrl, reg_post_param_addr;
@@ -93,9 +94,6 @@ module npu_top #(
 
     // --- Controller ↔ Compute ---
     wire        compute_start, compute_done;
-
-    // --- Controller ↔ PPU ---
-    wire        ppu_start, ppu_done;
 
     // --- DMA ↔ SRAM MUX ---
     wire        dma_sram_en, dma_sram_we;
@@ -175,6 +173,7 @@ module npu_top #(
         .reg_dma_add_param_addr(reg_dma_add_param_addr),
         .reg_dma_in_size    (reg_dma_in_size),
         .reg_dma_wgt_size   (reg_dma_wgt_size),
+        .reg_dma_out_size   (reg_dma_out_size),
         // Post-processing config
         .reg_post_ctrl          (reg_post_ctrl),
         .reg_post_param_addr    (reg_post_param_addr),
@@ -213,9 +212,6 @@ module npu_top #(
         // Compute control
         .compute_start  (compute_start),
         .compute_done   (compute_done),
-        // PPU control
-        .ppu_start      (ppu_start),
-        .ppu_done       (ppu_done),
         // Layer configuration from CSR
         .cfg_dma_in_addr    (reg_dma_in_addr),
         .cfg_dma_out_addr   (reg_dma_out_addr),
@@ -223,7 +219,9 @@ module npu_top #(
         .cfg_dma_param_addr (reg_dma_param_addr),
         .cfg_dma_in_size    (reg_dma_in_size),
         .cfg_dma_wgt_size   (reg_dma_wgt_size),
+        .cfg_dma_out_size   (reg_dma_out_size),
         .cfg_param_count    (reg_post_param_count[15:0]),
+        .cfg_dma_ctrl       (reg_dma_ctrl),
         .cfg_layer_mode     (reg_layer_mode)
     );
 
@@ -539,10 +537,8 @@ module npu_top #(
     wire        act_b_rd_en;
     wire [ACT_ADDR_W-1:0] act_b_rd_addr;
 
-    // Both compute_done and ppu_done come from the compute engine's done signal
-    // (the V2 compute engine handles the full compute+PPU+writeback pipeline internally)
+    // Compute engine handles full pipeline (compute + PPU + writeback) internally
     assign compute_done = compute_done_w;
-    assign ppu_done     = compute_done_w;
 
     npu_compute #(
         .ARRAY_SIZE   (ARRAY_SIZE),

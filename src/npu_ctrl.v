@@ -4,15 +4,15 @@
 // Main FSM that orchestrates a single layer computation:
 //   1. Receive START from CSR
 //   2. Load weights via DMA (ext → weight SRAM)
-//   3. Load input activations via DMA (ext → act SRAM)
+//   3. Load input activations via DMA (ext → act SRAM) [skip if fused mid/end]
 //   4. Load per-channel params via DMA (ext → param SRAM)
-//   5. Trigger compute engine (systolic array or DW conv)
-//   6. Trigger post-processing (PPU)
-//   7. Store output via DMA (act SRAM → ext)
-//   8. Signal DONE
+//   5. Trigger compute engine (handles systolic/DW + PPU + writeback internally)
+//   6. Store output via DMA (act SRAM → ext) [skip if fused start/mid]
+//   7. Signal DONE
 //
-// Simplified V1: single-tile, no ping-pong, no tiling loop.
-// Tiling and ping-pong will be added in V2.
+// V2: Fusion-aware — respects sched_ctrl bits to skip DMA phases.
+// The compute engine (npu_compute) handles PPU internally, so no
+// separate PPU phase is needed in this controller.
 
 `include "npu_defines.vh"
 
@@ -43,10 +43,6 @@ module npu_ctrl (
     output reg          compute_start,   // Start compute engine
     input  wire         compute_done,    // Compute done
 
-    // ─── PPU Control ───
-    output reg          ppu_start,       // Start post-processing
-    input  wire         ppu_done,        // PPU done
-
     // ─── Layer Configuration (from CSR register file) ───
     input  wire [31:0]  cfg_dma_in_addr,
     input  wire [31:0]  cfg_dma_out_addr,
@@ -54,7 +50,9 @@ module npu_ctrl (
     input  wire [31:0]  cfg_dma_param_addr,
     input  wire [31:0]  cfg_dma_in_size,     // in bytes
     input  wire [31:0]  cfg_dma_wgt_size,    // in bytes
+    input  wire [31:0]  cfg_dma_out_size,    // in bytes
     input  wire [15:0]  cfg_param_count,     // number of output channels
+    input  wire [31:0]  cfg_dma_ctrl,        // sched_ctrl: [0]=DB_EN, [1]=FUSE_START, [2]=FUSE_MID, [3]=FUSE_END
     input  wire [31:0]  cfg_layer_mode       // OP type + data type
 );
 
@@ -68,17 +66,15 @@ module npu_ctrl (
     localparam S_WAIT_PARAM = 4'd6;
     localparam S_COMPUTE    = 4'd7;   // Run compute engine
     localparam S_WAIT_COMP  = 4'd8;
-    localparam S_PPU        = 4'd9;   // Post-processing
-    localparam S_WAIT_PPU   = 4'd10;
-    localparam S_STORE_OUT  = 4'd11;  // DMA: store output
-    localparam S_WAIT_STORE = 4'd12;
-    localparam S_DONE       = 4'd13;
-    localparam S_ERROR      = 4'd14;
+    localparam S_STORE_OUT  = 4'd9;   // DMA: store output
+    localparam S_WAIT_STORE = 4'd10;
+    localparam S_DONE       = 4'd11;
+    localparam S_ERROR      = 4'd12;
 
     reg [3:0] state;
 
-    // Per-channel param size: 14 bytes/channel → (count * 14 + 3) / 4 words
-    wire [15:0] param_words = (cfg_param_count * 14 + 3) >> 2;
+    // Per-channel param size: 4 words (16 bytes) per channel
+    wire [15:0] param_words = cfg_param_count * 4;
 
     // Weight words = wgt_size / 4
     wire [15:0] wgt_words = cfg_dma_wgt_size[17:2];
@@ -86,9 +82,15 @@ module npu_ctrl (
     // Input words = in_size / 4
     wire [15:0] in_words = cfg_dma_in_size[17:2];
 
-    // Output size = same as input for simplicity (V1)
-    // In V2, compute from out_h * out_w * out_c * bytes_per_elem
-    wire [15:0] out_words = in_words;
+    // Output words = out_size / 4
+    wire [15:0] out_words = cfg_dma_out_size[17:2];
+
+    // ─── Fusion control bits ───
+    wire fuse_start = cfg_dma_ctrl[1];
+    wire fuse_mid   = cfg_dma_ctrl[2];
+    wire fuse_end   = cfg_dma_ctrl[3];
+    wire skip_act_load = fuse_mid | fuse_end;   // Input already in SRAM
+    wire skip_store    = fuse_start | fuse_mid;  // Output stays in SRAM
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -104,7 +106,6 @@ module npu_ctrl (
             dma_sram_addr <= 16'd0;
             dma_xfer_len  <= 16'd0;
             compute_start <= 1'b0;
-            ppu_start     <= 1'b0;
         end else if (ctrl_soft_rst) begin
             state         <= S_IDLE;
             hw_busy       <= 1'b0;
@@ -113,14 +114,12 @@ module npu_ctrl (
             hw_error_code <= 4'd0;
             dma_start     <= 1'b0;
             compute_start <= 1'b0;
-            ppu_start     <= 1'b0;
         end else begin
             // Default: clear single-cycle pulses
             hw_done       <= 1'b0;
             hw_error      <= 1'b0;
             dma_start     <= 1'b0;
             compute_start <= 1'b0;
-            ppu_start     <= 1'b0;
 
             case (state)
                 S_IDLE: begin
@@ -158,15 +157,16 @@ module npu_ctrl (
                 S_LOAD_ACT: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;
-                    end else if (in_words != 0) begin
+                    end else if (skip_act_load || in_words == 0) begin
+                        // Fused mid/end: input already in SRAM, skip load
+                        state <= S_LOAD_PARAM;
+                    end else begin
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;
                         dma_ext_addr  <= cfg_dma_in_addr;
                         dma_sram_addr <= 16'd0;
                         dma_xfer_len  <= in_words;
                         state         <= S_WAIT_ACT;
-                    end else begin
-                        state <= S_LOAD_PARAM;
                     end
                 end
 
@@ -202,7 +202,7 @@ module npu_ctrl (
                     end
                 end
 
-                // ─── Phase 4: Compute ───
+                // ─── Phase 4: Compute (includes PPU + writeback) ───
                 S_COMPUTE: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;
@@ -216,29 +216,14 @@ module npu_ctrl (
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else if (compute_done) begin
-                        state <= S_PPU;
+                        if (skip_store)
+                            state <= S_DONE;  // Fused: output stays in SRAM
+                        else
+                            state <= S_STORE_OUT;
                     end
                 end
 
-                // ─── Phase 5: Post-Processing ───
-                S_PPU: begin
-                    if (ctrl_abort) begin
-                        state <= S_DONE;
-                    end else begin
-                        ppu_start <= 1'b1;
-                        state     <= S_WAIT_PPU;
-                    end
-                end
-
-                S_WAIT_PPU: begin
-                    if (ctrl_abort) begin
-                        state <= S_DONE;
-                    end else if (ppu_done) begin
-                        state <= S_STORE_OUT;
-                    end
-                end
-
-                // ─── Phase 6: Store Output ───
+                // ─── Phase 5: Store Output ───
                 S_STORE_OUT: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;

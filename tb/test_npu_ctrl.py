@@ -17,26 +17,21 @@ async def init_dut(dut):
     dut.dma_busy.value = 0
     dut.dma_done.value = 0
     dut.compute_done.value = 0
-    dut.ppu_done.value = 0
     dut.cfg_dma_in_addr.value = 0x1000_0000
     dut.cfg_dma_out_addr.value = 0x2000_0000
     dut.cfg_dma_wgt_addr.value = 0x3000_0000
     dut.cfg_dma_param_addr.value = 0x4000_0000
     dut.cfg_dma_in_size.value = 256      # 256 bytes = 64 words
     dut.cfg_dma_wgt_size.value = 512     # 512 bytes = 128 words
+    dut.cfg_dma_out_size.value = 256     # 256 bytes = 64 words
     dut.cfg_param_count.value = 16       # 16 channels × 14 = 224 bytes = 56 words
+    dut.cfg_dma_ctrl.value = 0           # no fusion
     dut.cfg_layer_mode.value = 0
 
     for _ in range(5):
         await RisingEdge(dut.clk)
     dut.rst_n.value = 1
     await RisingEdge(dut.clk)
-
-
-async def pulse(sig):
-    """Assert signal for 1 cycle."""
-    sig.value = 1
-    await RisingEdge(sig._path.split('.')[0] if hasattr(sig, '_path') else sig)
 
 
 async def wait_for_dma_start(dut, timeout=50):
@@ -63,13 +58,6 @@ async def complete_compute(dut):
     dut.compute_done.value = 1
     await RisingEdge(dut.clk)
     dut.compute_done.value = 0
-
-
-async def complete_ppu(dut):
-    """Simulate PPU completion."""
-    dut.ppu_done.value = 1
-    await RisingEdge(dut.clk)
-    dut.ppu_done.value = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,7 +96,7 @@ async def test_start_busy(dut):
 # ─────────────────────────────────────────────────────────────────────────────
 @cocotb.test()
 async def test_full_layer_sequence(dut):
-    """Complete layer: DMA loads → compute → PPU → DMA store → DONE."""
+    """Complete layer: DMA loads → compute → DMA store → DONE."""
     await init_dut(dut)
 
     # START
@@ -144,17 +132,7 @@ async def test_full_layer_sequence(dut):
     await Timer(1, unit="step")
     await complete_compute(dut)
 
-    # Phase 5: Wait for PPU start
-    for _ in range(10):
-        await RisingEdge(dut.clk)
-        await ReadOnly()
-        if int(dut.ppu_start.value):
-            break
-        await Timer(1, unit="step")
-    await Timer(1, unit="step")
-    await complete_ppu(dut)
-
-    # Phase 6: Wait for output DMA start
+    # Phase 5: Wait for output DMA start (no PPU phase — compute handles it)
     found = await wait_for_dma_start(dut)
     assert found, "Output DMA start not issued"
     await ReadOnly()
@@ -274,16 +252,6 @@ async def test_layer_counter(dut):
         await Timer(1, unit="step")
         await complete_compute(dut)
 
-        # ppu
-        for _ in range(5):
-            await RisingEdge(dut.clk)
-            await ReadOnly()
-            if int(dut.ppu_start.value):
-                break
-            await Timer(1, unit="step")
-        await Timer(1, unit="step")
-        await complete_ppu(dut)
-
         # store
         await wait_for_dma_start(dut)
         await complete_dma(dut)
@@ -338,7 +306,7 @@ async def test_dma_addresses(dut):
     await Timer(1, unit="step")
     await complete_dma(dut)
 
-    # Skip compute+ppu
+    # Compute
     for _ in range(5):
         await RisingEdge(dut.clk)
         await ReadOnly()
@@ -347,14 +315,6 @@ async def test_dma_addresses(dut):
         await Timer(1, unit="step")
     await Timer(1, unit="step")
     await complete_compute(dut)
-    for _ in range(5):
-        await RisingEdge(dut.clk)
-        await ReadOnly()
-        if int(dut.ppu_start.value):
-            break
-        await Timer(1, unit="step")
-    await Timer(1, unit="step")
-    await complete_ppu(dut)
 
     # Output DMA
     await wait_for_dma_start(dut)
@@ -383,4 +343,160 @@ async def test_zero_weight_skip(dut):
     # The address should be the input address, not weight
     addr = int(dut.dma_ext_addr.value)
     assert addr == 0x1000_0000, f"Expected input addr, got {addr:#010x}"
+    await Timer(1, unit="step")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 9: Fusion — FUSE_START skips output store
+# ─────────────────────────────────────────────────────────────────────────────
+@cocotb.test()
+async def test_fusion_skip_store(dut):
+    """With FUSE_START, output stays in SRAM (no store DMA)."""
+    await init_dut(dut)
+    dut.cfg_dma_ctrl.value = 0x02  # bit[1] = FUSE_START
+
+    dut.ctrl_start.value = 1
+    await RisingEdge(dut.clk)
+    dut.ctrl_start.value = 0
+
+    # Weight DMA
+    await wait_for_dma_start(dut)
+    await complete_dma(dut)
+    # Activation DMA (still loaded for FUSE_START)
+    await wait_for_dma_start(dut)
+    await complete_dma(dut)
+    # Param DMA
+    await wait_for_dma_start(dut)
+    await complete_dma(dut)
+
+    # Compute
+    for _ in range(10):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.compute_start.value):
+            break
+        await Timer(1, unit="step")
+    await Timer(1, unit="step")
+    await complete_compute(dut)
+
+    # Should go directly to DONE (no store DMA)
+    for _ in range(5):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.hw_done.value):
+            break
+        await Timer(1, unit="step")
+
+    assert int(dut.hw_done.value) == 1, "hw_done not pulsed (skip store)"
+    await Timer(1, unit="step")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 10: Fusion — FUSE_MID skips activation load AND output store
+# ─────────────────────────────────────────────────────────────────────────────
+@cocotb.test()
+async def test_fusion_skip_act_and_store(dut):
+    """With FUSE_MID, skip activation DMA (already in SRAM) and store DMA."""
+    await init_dut(dut)
+    dut.cfg_dma_ctrl.value = 0x04  # bit[2] = FUSE_MID
+
+    dut.ctrl_start.value = 1
+    await RisingEdge(dut.clk)
+    dut.ctrl_start.value = 0
+
+    # Weight DMA (still needed)
+    found = await wait_for_dma_start(dut)
+    assert found, "Weight DMA should still be issued for FUSE_MID"
+    await ReadOnly()
+    assert int(dut.dma_ext_addr.value) == 0x3000_0000, "Should be weight addr"
+    await Timer(1, unit="step")
+    await complete_dma(dut)
+
+    # Should skip activation DMA and go to param DMA
+    found = await wait_for_dma_start(dut)
+    assert found, "Param DMA should be issued"
+    await ReadOnly()
+    assert int(dut.dma_ext_addr.value) == 0x4000_0000, "Should be param addr (skipped act)"
+    await Timer(1, unit="step")
+    await complete_dma(dut)
+
+    # Compute
+    for _ in range(10):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.compute_start.value):
+            break
+        await Timer(1, unit="step")
+    await Timer(1, unit="step")
+    await complete_compute(dut)
+
+    # Should go directly to DONE (skip store)
+    for _ in range(5):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.hw_done.value):
+            break
+        await Timer(1, unit="step")
+
+    assert int(dut.hw_done.value) == 1, "hw_done not pulsed (FUSE_MID skip store)"
+    await Timer(1, unit="step")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 11: Fusion — FUSE_END skips activation load but DOES store
+# ─────────────────────────────────────────────────────────────────────────────
+@cocotb.test()
+async def test_fusion_end_does_store(dut):
+    """With FUSE_END, skip activation DMA but DO output store."""
+    await init_dut(dut)
+    dut.cfg_dma_ctrl.value = 0x08  # bit[3] = FUSE_END
+
+    dut.ctrl_start.value = 1
+    await RisingEdge(dut.clk)
+    dut.ctrl_start.value = 0
+
+    # Weight DMA
+    found = await wait_for_dma_start(dut)
+    assert found
+    await ReadOnly()
+    assert int(dut.dma_ext_addr.value) == 0x3000_0000
+    await Timer(1, unit="step")
+    await complete_dma(dut)
+
+    # Should skip activation DMA → param DMA
+    found = await wait_for_dma_start(dut)
+    assert found
+    await ReadOnly()
+    assert int(dut.dma_ext_addr.value) == 0x4000_0000, "Should be param (skipped act)"
+    await Timer(1, unit="step")
+    await complete_dma(dut)
+
+    # Compute
+    for _ in range(10):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.compute_start.value):
+            break
+        await Timer(1, unit="step")
+    await Timer(1, unit="step")
+    await complete_compute(dut)
+
+    # FUSE_END DOES store output
+    found = await wait_for_dma_start(dut)
+    assert found, "FUSE_END should store output"
+    await ReadOnly()
+    assert int(dut.dma_ext_addr.value) == 0x2000_0000, "Output addr"
+    assert int(dut.dma_dir.value) == 1, "Should be store"
+    await Timer(1, unit="step")
+    await complete_dma(dut)
+
+    # Done
+    for _ in range(5):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.hw_done.value):
+            break
+        await Timer(1, unit="step")
+
+    assert int(dut.hw_done.value) == 1, "hw_done not pulsed"
     await Timer(1, unit="step")
