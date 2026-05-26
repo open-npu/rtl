@@ -1,7 +1,7 @@
 # Open-NPU RTL — cocotb Tests for npu_systolic
 # SPDX-License-Identifier: Apache-2.0
 #
-# Tests use ARRAY_SIZE=4 for fast simulation.
+# ARRAY_SIZE is read dynamically from the RTL parameter.
 
 import sys
 import os
@@ -21,8 +21,9 @@ MODE_WGT_LOAD = 0b01
 MODE_COMPUTE  = 0b10
 MODE_DRAIN    = 0b11
 
-# Array size (must match -DARRAY_SIZE compile flag)
-N = 4
+def get_array_size(dut):
+    """Get array size from RTL parameter."""
+    return int(dut.ROWS.value)
 
 
 def int8_to_unsigned(val):
@@ -38,6 +39,7 @@ def signed_acc(val, bits=40):
 
 async def reset_dut(dut):
     """Initialize and reset the DUT."""
+    N = get_array_size(dut)
     await clock_reset(dut)
     dut.cmd.value = MODE_IDLE
     dut.cmd_valid.value = 0
@@ -56,6 +58,8 @@ async def load_weights(dut, weight_matrix):
     weight_matrix[col][row] = weight for PE[row][col].
     Loading is column-by-column: each cycle loads one column.
     """
+    N = get_array_size(dut)
+
     # Issue WGT_LOAD command
     dut.cmd.value = MODE_WGT_LOAD
     dut.cmd_valid.value = 1
@@ -91,6 +95,7 @@ async def stream_activations(dut, act_matrix):
     act_matrix[k][row] = activation for row `row` at timestep k.
     After K values, wait COLS-1 cycles for pipeline completion.
     """
+    N = get_array_size(dut)
     K = len(act_matrix)
 
     # Stream K activation vectors
@@ -116,6 +121,8 @@ async def drain_column(dut, col):
       Cycle 2: S_DRAIN_OUT — acc_out_valid=1, read results here
       Cycle 3: S_READY — done
     """
+    N = get_array_size(dut)
+
     dut.drain_col_sel.value = col
     dut.cmd.value = MODE_DRAIN
     dut.cmd_valid.value = 1
@@ -135,6 +142,7 @@ async def drain_column(dut, col):
 
 async def drain_all_columns(dut):
     """Drain all columns, return results[row][col]."""
+    N = get_array_size(dut)
     results = [[0] * N for _ in range(N)]
     for col in range(N):
         col_results = await drain_column(dut, col)
@@ -147,6 +155,7 @@ async def drain_all_columns(dut):
 async def test_weight_load_basic(dut):
     """Test: Load weights and verify via single-activation compute."""
     await reset_dut(dut)
+    N = get_array_size(dut)
 
     # weights[col][row] = col + 1 (same for all rows in a column)
     weights = [[col + 1] * N for col in range(N)]
@@ -176,22 +185,29 @@ async def test_weight_load_basic(dut):
 async def test_single_mac_per_pe(dut):
     """Test: Each PE computes one act*weight product with unique values."""
     await reset_dut(dut)
+    N = get_array_size(dut)
 
-    # Unique weight per PE: weight[col][row] = (row+1) * (col+1)
-    weights = [[(row + 1) * (col + 1) for row in range(N)] for col in range(N)]
+    # Unique weight per PE: weight[col][row] — keep values within int8 range
+    # Use modular values to avoid overflow for large N
+    weights = [[((row + 1) * (col + 1)) % 120 + 1 for row in range(N)] for col in range(N)]
     await load_weights(dut, weights)
 
-    # Single activation: act[row] = row + 1
+    # Single activation: act[row] = (row % 8) + 1 (bounded to avoid overflow)
+    acts = [(row % 8) + 1 for row in range(N)]
     await start_compute(dut)
-    act_matrix = [[row + 1 for row in range(N)]]  # K=1
+    act_matrix = [acts]  # K=1
     await stream_activations(dut, act_matrix)
 
     results = await drain_all_columns(dut)
 
     for row in range(N):
         for col in range(N):
-            # PE[r][c].acc = act[r] * weight[c][r] = (r+1) * (r+1)*(c+1)
-            expected = (row + 1) * (row + 1) * (col + 1)
+            w = weights[col][row]
+            a = acts[row]
+            # int8 interpretation of weight
+            w_s = w if w < 128 else w - 256
+            a_s = a if a < 128 else a - 256
+            expected = a_s * w_s
             assert results[row][col] == expected, \
                 f"PE[{row}][{col}]: expected {expected}, got {results[row][col]}"
 
@@ -202,6 +218,7 @@ async def test_single_mac_per_pe(dut):
 async def test_dot_product_k8(dut):
     """Test: K=8 dot product, verify accumulation over multiple cycles."""
     await reset_dut(dut)
+    N = get_array_size(dut)
 
     # All PEs have weight = 3
     weights = [[3] * N for _ in range(N)]
@@ -229,6 +246,7 @@ async def test_dot_product_k8(dut):
 async def test_full_matmul(dut):
     """Test: Full random data, compare RTL vs golden."""
     await reset_dut(dut)
+    N = get_array_size(dut)
 
     random.seed(123)
     K = 6
@@ -255,13 +273,14 @@ async def test_full_matmul(dut):
             assert results[row][col] == exp_masked, \
                 f"PE[{row}][{col}]: expected {exp_masked}, got {results[row][col]}"
 
-    dut._log.info("PASS: full_matmul — all 4×4 results match golden")
+    dut._log.info(f"PASS: full_matmul — all {N}x{N} results match golden")
 
 
 @cocotb.test()
 async def test_drain_clears_and_reload(dut):
     """Test: After drain, accumulators clear. Reload and compute again."""
     await reset_dut(dut)
+    N = get_array_size(dut)
 
     # First pass: weight=2, act=5, K=1
     weights = [[2] * N for _ in range(N)]
@@ -293,13 +312,14 @@ async def test_drain_clears_and_reload(dut):
 async def test_systolic_delay(dut):
     """Test: All columns eventually see all activations (systolic propagation)."""
     await reset_dut(dut)
+    N = get_array_size(dut)
 
     # All weights = 1
     weights = [[1] * N for _ in range(N)]
     await load_weights(dut, weights)
 
-    # Feed K=4 unique activations, wait for full pipeline drain (K + N - 1)
-    K = 4
+    # Feed K=N unique activations, wait for full pipeline drain (K + N - 1)
+    K = N
     await start_compute(dut)
     act_matrix = [[k + 1] * N for k in range(K)]
     # stream_activations waits N-1 extra cycles for pipeline completion
@@ -308,14 +328,9 @@ async def test_systolic_delay(dut):
     results = await drain_all_columns(dut)
 
     # With weight=1: PE[r][c].acc = sum of all K activations that arrived at col c.
-    # Due to systolic propagation, col c receives activations from col c-1 (1 cycle delay).
-    # col 0 receives all K acts directly (valid for K cycles).
-    # col 1 receives K acts starting 1 cycle later (also K acts, from act_valid_out).
-    # col 2 receives K acts starting 2 cycles later.
-    # col 3 receives K acts starting 3 cycles later.
-    # All columns receive ALL K activations (just delayed).
-    # So all PEs should have sum(1..K) = 10.
-    expected = sum(range(1, K + 1))  # 1+2+3+4 = 10
+    # Due to systolic propagation, all columns receive ALL K activations (just delayed).
+    # So all PEs should have sum(1..K).
+    expected = sum(range(1, K + 1))
 
     for r in range(N):
         for c in range(N):

@@ -2,7 +2,7 @@
 Cocotb testbench for npu_compute — Compute Micro-Sequencer.
 
 Tests the full compute path: weight load → activation stream → drain → PPU → writeback.
-Uses ARRAY_SIZE=4 for fast simulation.
+ARRAY_SIZE is read dynamically from the RTL parameter.
 """
 
 import cocotb
@@ -12,14 +12,80 @@ from cocotb.triggers import RisingEdge, Timer, ReadOnly
 import numpy as np
 
 
+def get_array_size(dut):
+    """Get ARRAY_SIZE from the RTL parameter."""
+    return int(dut.ARRAY_SIZE.value)
+
+
 async def reset_dut(dut):
     """Apply reset for 5 cycles."""
     dut.rst_n.value = 0
     dut.start.value = 0
+    # Drive feedback inputs that would normally come from systolic/PPU
+    dut.sa_ready.value = 1
+    dut.sa_busy.value = 0
+    dut.sa_acc_out_valid.value = 0
+    dut.ppu_out_valid.value = 0
+    dut.ppu_out_data.value = 0
+    dut.dw_out_valid.value = 0
+    dut.dw_acc_out.value = 0
     for _ in range(5):
         await RisingEdge(dut.clk)
     dut.rst_n.value = 1
     await RisingEdge(dut.clk)
+
+
+async def systolic_ppu_stub(dut):
+    """Stub coroutine that mimics systolic drain + PPU pipeline responses.
+
+    Monitors sa_cmd_valid/sa_cmd and responds:
+    - On MODE_DRAIN (3): after 2 cycles, pulse sa_acc_out_valid with zero accumulators
+    - On ppu_in_valid: after 4-cycle pipeline delay, pulse ppu_out_valid with ppu_out_data=0
+    """
+    ARRAY_SIZE = get_array_size(dut)
+    ppu_pipeline = []  # Queue of (cycle_due, data) for PPU outputs
+
+    cycle = 0
+    while True:
+        await RisingEdge(dut.clk)
+        cycle += 1
+
+        # Check for drain command
+        try:
+            cmd_valid = int(dut.sa_cmd_valid.value)
+            cmd = int(dut.sa_cmd.value)
+        except Exception:
+            cmd_valid = 0
+            cmd = 0
+
+        if cmd_valid == 1 and cmd == 3:  # MODE_DRAIN
+            # Wait 2 cycles then pulse acc_out_valid (simulating drain timing)
+            await RisingEdge(dut.clk)
+            await RisingEdge(dut.clk)
+            dut.sa_acc_out_valid.value = 1
+            for i in range(ARRAY_SIZE):
+                dut.sa_acc_out[i].value = 0
+            await RisingEdge(dut.clk)
+            dut.sa_acc_out_valid.value = 0
+            cycle += 3
+            continue
+
+        # Check for PPU input
+        try:
+            ppu_in = int(dut.ppu_in_valid.value)
+        except Exception:
+            ppu_in = 0
+
+        if ppu_in == 1:
+            ppu_pipeline.append(cycle + 4)  # 4-cycle PPU pipeline
+
+        # Check if any PPU outputs are due
+        if ppu_pipeline and cycle >= ppu_pipeline[0]:
+            ppu_pipeline.pop(0)
+            dut.ppu_out_valid.value = 1
+            dut.ppu_out_data.value = 0
+        else:
+            dut.ppu_out_valid.value = 0
 
 
 def set_cfg_conv2d(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1,
@@ -67,7 +133,8 @@ async def test_start_pulse(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
-    set_cfg_conv2d(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1)
+    ARRAY_SIZE = get_array_size(dut)
+    set_cfg_conv2d(dut, in_c=ARRAY_SIZE, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
     # Pulse start
     dut.start.value = 1
@@ -93,20 +160,10 @@ async def test_weight_load_timing(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
-    ARRAY_SIZE = 4
-    in_c = 4
-    out_c = 4
+    ARRAY_SIZE = get_array_size(dut)
+    in_c = ARRAY_SIZE
+    out_c = ARRAY_SIZE
     set_cfg_conv2d(dut, in_c=in_c, out_c=out_c, kh=1, kw=1, out_h=1, out_w=1)
-
-    # Pre-load weight SRAM with known data
-    # For 1x1 conv: k_depth = 1*1*4 = 4 bytes per column
-    # 4 columns (ARRAY_SIZE=4), 4 bytes each = 16 bytes = 4 SRAM words
-    # Weight layout (OHWI): [oc][kh][kw][ic]
-    # OC0: bytes 0-3, OC1: bytes 4-7, OC2: bytes 8-11, OC3: bytes 12-15
-    # Word 0: OC0 weights [w00,w01,w02,w03]
-    # Word 1: OC1 weights [w10,w11,w12,w13]
-    # Word 2: OC2 weights [w20,w21,w22,w23]
-    # Word 3: OC3 weights [w30,w31,w32,w33]
 
     # Pulse start
     dut.start.value = 1
@@ -115,7 +172,7 @@ async def test_weight_load_timing(dut):
 
     # Count wgt_valid pulses
     wgt_valid_count = 0
-    for _ in range(200):
+    for _ in range(500):
         await RisingEdge(dut.clk)
         await ReadOnly()
         if int(dut.sa_wgt_valid.value) == 1:
@@ -135,10 +192,10 @@ async def test_act_stream_timing(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
-    ARRAY_SIZE = 4
-    in_c = 4
-    k_depth = 4  # 1*1*4
-    set_cfg_conv2d(dut, in_c=in_c, out_c=4, kh=1, kw=1, out_h=1, out_w=1)
+    ARRAY_SIZE = get_array_size(dut)
+    in_c = ARRAY_SIZE
+    k_depth = in_c  # 1*1*in_c
+    set_cfg_conv2d(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
     # Pulse start
     dut.start.value = 1
@@ -169,9 +226,10 @@ async def test_drain_sequence(dut):
     """Verify drain issues ARRAY_SIZE DRAIN commands (one per column)."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
+    cocotb.start_soon(systolic_ppu_stub(dut))
 
-    ARRAY_SIZE = 4
-    set_cfg_conv2d(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1)
+    ARRAY_SIZE = get_array_size(dut)
+    set_cfg_conv2d(dut, in_c=ARRAY_SIZE, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
     # Pulse start
     dut.start.value = 1
@@ -181,7 +239,7 @@ async def test_drain_sequence(dut):
     # Count drain commands
     drain_count = 0
     drain_cols_seen = set()
-    for _ in range(1000):
+    for _ in range(10000):
         await RisingEdge(dut.clk)
         await ReadOnly()
         if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 3:  # MODE_DRAIN
@@ -202,8 +260,10 @@ async def test_done_pulse(dut):
     """Verify done pulse is asserted at the end of computation."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
+    cocotb.start_soon(systolic_ppu_stub(dut))
 
-    set_cfg_conv2d(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1)
+    ARRAY_SIZE = get_array_size(dut)
+    set_cfg_conv2d(dut, in_c=ARRAY_SIZE, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
     # Pulse start
     dut.start.value = 1
@@ -212,7 +272,7 @@ async def test_done_pulse(dut):
 
     # Wait for done
     done_seen = False
-    for _ in range(2000):
+    for _ in range(10000):
         await RisingEdge(dut.clk)
         await ReadOnly()
         if int(dut.done.value) == 1:
@@ -220,19 +280,20 @@ async def test_done_pulse(dut):
             break
         await Timer(1, unit="step")
 
-    assert done_seen, "done pulse never asserted within 2000 cycles"
+    assert done_seen, "done pulse never asserted within 10000 cycles"
 
 
 @cocotb.test()
 async def test_oc_tiling(dut):
-    """With 8 output channels and ARRAY_SIZE=4, should process 2 OC groups."""
+    """With 2*ARRAY_SIZE output channels, should process 2 OC groups."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
+    cocotb.start_soon(systolic_ppu_stub(dut))
 
-    ARRAY_SIZE = 4
-    out_c = 8  # 2 OC groups
+    ARRAY_SIZE = get_array_size(dut)
+    out_c = ARRAY_SIZE * 2  # 2 OC groups
 
-    set_cfg_conv2d(dut, in_c=4, out_c=out_c, kh=1, kw=1, out_h=1, out_w=1)
+    set_cfg_conv2d(dut, in_c=ARRAY_SIZE, out_c=out_c, kh=1, kw=1, out_h=1, out_w=1)
 
     # Pulse start
     dut.start.value = 1
@@ -241,7 +302,7 @@ async def test_oc_tiling(dut):
 
     # Count how many WGT_LOAD commands are issued (should be 2: one per OC group)
     wgt_load_cmds = 0
-    for _ in range(3000):
+    for _ in range(20000):
         await RisingEdge(dut.clk)
         await ReadOnly()
         if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 1:  # MODE_WGT_LOAD
@@ -259,10 +320,11 @@ async def test_spatial_tiling(dut):
     """With tile_num_h=2, tile_num_w=2, should process 4 tiles."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
+    cocotb.start_soon(systolic_ppu_stub(dut))
 
-    ARRAY_SIZE = 4
+    ARRAY_SIZE = get_array_size(dut)
 
-    set_cfg_conv2d(dut, in_c=4, out_c=4, kh=1, kw=1,
+    set_cfg_conv2d(dut, in_c=ARRAY_SIZE, out_c=ARRAY_SIZE, kh=1, kw=1,
                    out_h=4, out_w=4, in_h=4, in_w=4,
                    tile_h=2, tile_w=2,
                    tile_num_h=2, tile_num_w=2)
@@ -274,7 +336,7 @@ async def test_spatial_tiling(dut):
 
     # Count WGT_LOAD commands: should be 4 tiles × 1 OC group = 4
     wgt_load_cmds = 0
-    for _ in range(5000):
+    for _ in range(50000):
         await RisingEdge(dut.clk)
         await ReadOnly()
         if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 1:

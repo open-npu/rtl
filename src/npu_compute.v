@@ -431,8 +431,11 @@ module npu_compute #(
 
                     if (wgt_byte_idx + 4 >= k_depth) begin
                         // All k_depth bytes loaded; zero-pad remaining rows
-                        for (i = k_depth[COL_W-1:0]; i < ARRAY_SIZE; i = i + 1)
-                            sa_wgt_data[i[COL_W-1:0]] <= 0;
+                        // Only pad if k_depth < ARRAY_SIZE (truncated index != 0)
+                        if (k_depth < ARRAY_SIZE_16) begin
+                            for (i = k_depth[COL_W-1:0]; i < ARRAY_SIZE; i = i + 1)
+                                sa_wgt_data[i[COL_W-1:0]] <= 0;
+                        end
                         // Emit
                         state <= S_WGT_EMIT;
                     end else begin
@@ -656,7 +659,7 @@ module npu_compute #(
                         act_wr_addr <= out_base +
                             ((sp_oh * out_tile_w + sp_ow) * cfg_out_c
                              + oc_group * ARRAY_SIZE_16
-                             + {12'd0, drain_col[COL_W-1:2], 2'b00}) >> 2;
+                             + ({12'd0, drain_col} & ~16'd3)) >> 2;
                         act_wr_data <= {ppu_out_data, wb_pack[23:0]};
                     end
                 endcase
@@ -670,7 +673,7 @@ module npu_compute #(
                         act_wr_addr <= out_base +
                             ((sp_oh * out_tile_w + sp_ow) * cfg_out_c
                              + oc_group * ARRAY_SIZE_16
-                             + {12'd0, drain_col[COL_W-1:2], 2'b00}) >> 2;
+                             + ({12'd0, drain_col} & ~16'd3)) >> 2;
                         act_wr_data <= wb_pack;
                     end
                     state <= S_PIXEL_NEXT;

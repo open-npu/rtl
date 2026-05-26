@@ -534,6 +534,155 @@ async def test_conv1x1_dotproduct(dut):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ===================================================================
+# Spatial Tiling Tests (Conv2D datapath, output verification)
+# ===================================================================
+
+@cocotb.test()
+async def test_conv_spatial_2x2(dut):
+    """Conv 2x2 spatial output: k_depth=ARRAY_SIZE, 4 pixels, verify dot products.
+
+    Uses k_depth=ARRAY_SIZE (full row utilization). Each pixel has constant
+    activation value, kernel is w[k]=k+1. Ensures spatial loop iterates
+    correctly and reduction produces correct dot products.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+
+    ARRAY_SIZE = get_array_size(dut)
+
+    # Kernel: w[k] = k+1 for k=0..ARRAY_SIZE-1 (same for all OC columns)
+    wgt_words_per_col = ARRAY_SIZE // 4
+    for oc in range(ARRAY_SIZE):
+        base_addr = oc * wgt_words_per_col
+        for w in range(wgt_words_per_col):
+            b0 = w * 4 + 1
+            b1 = w * 4 + 2
+            b2 = w * 4 + 3
+            b3 = w * 4 + 4
+            write_sram_word(dut, 'wgt', base_addr + w, pack_i8x4(b0, b1, b2, b3))
+
+    # 4 pixels, constant activation per pixel: pval = 1, 2, 3, 4
+    pixel_vals = [1, 2, 3, 4]
+    act_words_per_pixel = ARRAY_SIZE // 4
+
+    for i in range(256):
+        write_sram_word(dut, 'act', i, 0)
+
+    for pix_idx, pval in enumerate(pixel_vals):
+        base_addr = pix_idx * act_words_per_pixel
+        for w in range(act_words_per_pixel):
+            write_sram_word(dut, 'act', base_addr + w,
+                            pack_i8x4(pval, pval, pval, pval))
+
+    for ch in range(ARRAY_SIZE):
+        base = ch * 4
+        write_sram_word(dut, 'param', base + 0, 0x00000001)
+        write_sram_word(dut, 'param', base + 1, 0)
+        write_sram_word(dut, 'param', base + 2, 0)
+        write_sram_word(dut, 'param', base + 3, 0)
+
+    dut.ppu_mode.value = 3
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    # in_c=ARRAY_SIZE, kh=1, kw=1 -> k_depth=ARRAY_SIZE
+    # pixel_act_base = (sp_oh*2+sp_ow)*ARRAY_SIZE/4 = pix_idx * act_words_per_pixel
+    set_cfg(dut, in_c=ARRAY_SIZE, out_c=ARRAY_SIZE, kh=1, kw=1,
+            out_h=2, out_w=2, in_h=2, in_w=2)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=200000), "2x2 spatial done never asserted"
+
+    # dot[pix] = pval * sum(1..ARRAY_SIZE) = pval * ARRAY_SIZE*(ARRAY_SIZE+1)/2
+    sum_weights = ARRAY_SIZE * (ARRAY_SIZE + 1) // 2
+    expected = [(pval * sum_weights) & 0xFF for pval in pixel_vals]
+    dut._log.info(f"ARRAY_SIZE={ARRAY_SIZE}, sum_w={sum_weights}, expected={expected}")
+
+    for pix_idx, (oh, ow) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
+        byte_off = pix_idx * ARRAY_SIZE
+        word_addr = byte_off >> 2
+        out_word = read_sram_word(dut, 'act', word_addr)
+        byte_pos = byte_off & 3
+        out_byte = (out_word >> (byte_pos * 8)) & 0xFF
+        dut._log.info(f"Pixel({oh},{ow}): ch0={out_byte}, exp={expected[pix_idx]}")
+        assert out_byte == expected[pix_idx], \
+            f"Pixel({oh},{ow}) ch0: expected {expected[pix_idx]}, got {out_byte}"
+
+
+@cocotb.test()
+async def test_conv_spatial_3x3(dut):
+    """Conv 3x3 spatial output: 9 pixels with distinct values, all-ones kernel.
+
+    dot[pix] = pval * ARRAY_SIZE (since all weights=1).
+    Verifies the full spatial loop iterates all 9 pixels correctly.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+
+    ARRAY_SIZE = get_array_size(dut)
+
+    # All-ones kernel for all columns
+    wgt_words_per_col = ARRAY_SIZE // 4
+    for oc in range(ARRAY_SIZE):
+        base_addr = oc * wgt_words_per_col
+        for w in range(wgt_words_per_col):
+            write_sram_word(dut, 'wgt', base_addr + w, pack_i8x4(1, 1, 1, 1))
+
+    # 9 pixels with distinct values: pval = 1..9
+    pixel_vals = list(range(1, 10))
+    act_words_per_pixel = ARRAY_SIZE // 4
+
+    for i in range(512):
+        write_sram_word(dut, 'act', i, 0)
+
+    for pix_idx, pval in enumerate(pixel_vals):
+        base_addr = pix_idx * act_words_per_pixel
+        for w in range(act_words_per_pixel):
+            write_sram_word(dut, 'act', base_addr + w,
+                            pack_i8x4(pval, pval, pval, pval))
+
+    for ch in range(ARRAY_SIZE):
+        base = ch * 4
+        write_sram_word(dut, 'param', base + 0, 0x00000001)
+        write_sram_word(dut, 'param', base + 1, 0)
+        write_sram_word(dut, 'param', base + 2, 0)
+        write_sram_word(dut, 'param', base + 3, 0)
+
+    dut.ppu_mode.value = 3
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    # pixel_act_base = (sp_oh*3+sp_ow)*ARRAY_SIZE/4
+    set_cfg(dut, in_c=ARRAY_SIZE, out_c=ARRAY_SIZE, kh=1, kw=1,
+            out_h=3, out_w=3, in_h=3, in_w=3)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=500000), "3x3 spatial done never asserted"
+
+    # dot[pix] = pval * ARRAY_SIZE
+    expected = [(pval * ARRAY_SIZE) & 0xFF for pval in pixel_vals]
+    dut._log.info(f"Expected outputs: {expected}")
+
+    for pix_idx in range(9):
+        oh, ow = pix_idx // 3, pix_idx % 3
+        byte_off = pix_idx * ARRAY_SIZE
+        word_addr = byte_off >> 2
+        out_word = read_sram_word(dut, 'act', word_addr)
+        byte_pos = byte_off & 3
+        out_byte = (out_word >> (byte_pos * 8)) & 0xFF
+        dut._log.info(f"Pixel({oh},{ow}): ch0={out_byte}, exp={expected[pix_idx]}")
+        assert out_byte == expected[pix_idx], \
+            f"Pixel({oh},{ow}) ch0: expected {expected[pix_idx]}, got {out_byte}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # DW Conv Tests
 # ═══════════════════════════════════════════════════════════════════════════
 
