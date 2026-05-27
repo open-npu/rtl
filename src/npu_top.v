@@ -69,7 +69,7 @@ module npu_top #(
     wire [31:0] reg_out_dim_hw, reg_out_dim_c, reg_kernel_size;
     wire [31:0] reg_stride, reg_padding, reg_pool_cfg;
     wire [31:0] reg_resize_cfg, reg_deconv_cfg, reg_concat_cfg;
-    wire [31:0] reg_tile_cfg, reg_tile_count;
+    wire [31:0] reg_tile_cfg, reg_tile_count, reg_sram_base;
 
     // --- CSR DMA Config outputs ---
     wire [31:0] reg_dma_in_addr, reg_dma_out_addr;
@@ -161,6 +161,7 @@ module npu_top #(
         .reg_concat_cfg (reg_concat_cfg),
         .reg_tile_cfg   (reg_tile_cfg),
         .reg_tile_count (reg_tile_count),
+        .reg_sram_base  (reg_sram_base),
         // DMA config
         .reg_dma_in_addr    (reg_dma_in_addr),
         .reg_dma_out_addr   (reg_dma_out_addr),
@@ -570,8 +571,8 @@ module npu_top #(
         .cfg_tile_num_w (reg_tile_count[31:16]),
         .cfg_in_w       (reg_in_dim_hw[15:0]),
         .cfg_in_h       (reg_in_dim_hw[31:16]),
-        .cfg_act_base   ({ACT_ADDR_W{1'b0}}),
-        .cfg_out_base   ({ACT_ADDR_W{1'b0}}),
+        .cfg_act_base   (reg_sram_base[ACT_ADDR_W-1:0]),
+        .cfg_out_base   (reg_sram_base[ACT_ADDR_W+16-1:16]),
         // Weight SRAM Port B
         .wgt_rd_en      (wgt_b_en),
         .wgt_rd_addr    (wgt_b_addr),

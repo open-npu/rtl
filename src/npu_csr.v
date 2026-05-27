@@ -74,6 +74,7 @@ module npu_csr #(
     output wire [DATA_W-1:0]   reg_concat_cfg,
     output wire [DATA_W-1:0]   reg_tile_cfg,
     output wire [DATA_W-1:0]   reg_tile_count,
+    output wire [DATA_W-1:0]   reg_sram_base,
 
     // ─── DMA Config Outputs ───
     output wire [DATA_W-1:0]   reg_dma_in_addr,
@@ -124,6 +125,7 @@ module npu_csr #(
     reg [DATA_W-1:0] r_concat_cfg;    // 0x06C
     reg [DATA_W-1:0] r_tile_cfg;      // 0x070
     reg [DATA_W-1:0] r_tile_count;    // 0x074
+    reg [DATA_W-1:0] r_sram_base;    // 0x078 — act_base[12:0], out_base[28:16]
 
     // ─── Group 2: DMA Configuration ───
     reg [DATA_W-1:0] r_dma_in_addr;   // 0x100
@@ -219,6 +221,7 @@ module npu_csr #(
     assign reg_concat_cfg       = r_concat_cfg;
     assign reg_tile_cfg         = r_tile_cfg;
     assign reg_tile_count       = r_tile_count;
+    assign reg_sram_base        = r_sram_base;
     assign reg_dma_in_addr      = r_dma_in_addr;
     assign reg_dma_out_addr     = r_dma_out_addr;
     assign reg_dma_wgt_addr     = r_dma_wgt_addr;
@@ -269,6 +272,7 @@ module npu_csr #(
             r_concat_cfg <= 32'd0;
             r_tile_cfg   <= 32'd0;
             r_tile_count <= 32'd0;
+            r_sram_base  <= 32'd0;
             r_dma_in_addr   <= 32'd0;
             r_dma_out_addr  <= 32'd0;
             r_dma_wgt_addr  <= 32'd0;
@@ -326,6 +330,7 @@ module npu_csr #(
                         12'h06C: r_concat_cfg <= wb_dat_i;
                         12'h070: r_tile_cfg   <= wb_dat_i;
                         12'h074: r_tile_count <= wb_dat_i;
+                        12'h078: r_sram_base  <= wb_dat_i;
 
                         // Group 2: DMA Configuration
                         12'h100: r_dma_in_addr   <= wb_dat_i;
@@ -389,6 +394,7 @@ module npu_csr #(
                         12'h06C: wb_dat_o <= r_concat_cfg;
                         12'h070: wb_dat_o <= r_tile_cfg;
                         12'h074: wb_dat_o <= r_tile_count;
+                        12'h078: wb_dat_o <= r_sram_base;
 
                         // Group 2: DMA Configuration
                         12'h100: wb_dat_o <= r_dma_in_addr;
