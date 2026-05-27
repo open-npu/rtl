@@ -34,6 +34,8 @@ module npu_compute_tb #(
     input  wire [15:0] cfg_tile_num_w,
     input  wire [15:0] cfg_in_w,
     input  wire [15:0] cfg_in_h,
+    input  wire [$clog2(ACT_DEPTH)-1:0] cfg_act_base,
+    input  wire [$clog2(ACT_DEPTH)-1:0] cfg_out_base,
 
     // PPU configuration (directly from post_ctrl register)
     input  wire [1:0]  ppu_mode,
@@ -144,6 +146,7 @@ module npu_compute_tb #(
         .cfg_tile_h(cfg_tile_h), .cfg_tile_w(cfg_tile_w),
         .cfg_tile_num_h(cfg_tile_num_h), .cfg_tile_num_w(cfg_tile_num_w),
         .cfg_in_w(cfg_in_w), .cfg_in_h(cfg_in_h),
+        .cfg_act_base(cfg_act_base), .cfg_out_base(cfg_out_base),
         // SRAM
         .wgt_rd_en(wgt_rd_en), .wgt_rd_addr(wgt_rd_addr), .wgt_rd_data(wgt_rd_data),
         .act_rd_en(act_rd_en), .act_rd_addr(act_rd_addr), .act_rd_data(act_rd_data),

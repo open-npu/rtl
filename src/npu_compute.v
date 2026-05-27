@@ -13,9 +13,9 @@
 //   tile_y → tile_x → oc_group
 //
 // Key simplification for V2 first-pass:
-//   - k_depth <= ARRAY_SIZE (single weight-load + stream pass)
+//   - k_depth > ARRAY_SIZE supported via multi-pass partial sum accumulation
 //   - Spatial output count is handled by repeated compute passes
-//   - No partial-sum external accumulation yet
+//   - Weights reloaded per-pixel per-pass (correctness over efficiency)
 //
 // Op types: 0=Conv2D, 1=DWConv, 2=FC
 
@@ -54,6 +54,8 @@ module npu_compute #(
     input  wire [15:0]                  cfg_tile_num_w,
     input  wire [15:0]                  cfg_in_w,
     input  wire [15:0]                  cfg_in_h,
+    input  wire [ACT_ADDR_W-1:0]        cfg_act_base,   // Input activation base (word addr)
+    input  wire [ACT_ADDR_W-1:0]        cfg_out_base,   // Output base (word addr in act SRAM)
 
     // ─── Weight SRAM Port B (read-only) ───
     output reg                          wgt_rd_en,
@@ -163,12 +165,13 @@ module npu_compute #(
     reg [15:0] out_tile_h, out_tile_w;
 
     // ─── Weight load state ───
-    // Load one column at a time: read ceil(ARRAY_SIZE/4) words, fill sa_wgt_data
+    // Load one column at a time: read ceil(k_pass_remain/4) words, fill sa_wgt_data
     reg [$clog2(ARRAY_SIZE)-1:0] wgt_col_idx;     // current column (0..ARRAY_SIZE-1)
     reg [$clog2(ARRAY_SIZE):0]   wgt_byte_idx;    // byte index within column (0..ARRAY_SIZE-1)
     reg [15:0]                   wgt_word_addr;    // current SRAM address
     reg                          wgt_read_issued;  // 1-cycle read latency tracker
     reg                          wgt_data_ready;   // 2nd cycle: SRAM data available
+    reg [1:0]                    wgt_bsel;         // byte offset within first word
 
     // ─── Activation stream state ───
     reg [15:0] act_cnt;         // activation byte counter (0..k_depth-1)
@@ -224,6 +227,19 @@ module npu_compute #(
     reg [$clog2(ARRAY_SIZE):0] reduce_cnt;    // Reduction counter
     reg [ACT_ADDR_W-1:0] pixel_act_base;     // Per-pixel activation base address
     reg signed [ACC_W-1:0] dot_buf [0:ARRAY_SIZE-1]; // Reduced dot products per column
+
+    // ─── Multi-pass (k_depth > ARRAY_SIZE) ───
+    reg [15:0] k_pass;           // Current pass index (0-based)
+    reg [15:0] k_pass_max;       // Total passes - 1
+    reg [15:0] k_pass_remain;    // Elements in current pass
+
+    // ─── Conv2D kernel window iteration ───
+    reg [7:0]  conv_fh, conv_fw;             // Current filter position
+    reg [15:0] conv_ch_cnt;                  // Channel counter within (fh, fw)
+    reg signed [15:0] conv_ih_base;          // Input row origin: sp_oh*stride_h - pad_top
+    reg signed [15:0] conv_iw_base;          // Input col origin: sp_ow*stride_w - pad_left
+    reg        conv_is_pad;                  // Current (fh, fw) is padding
+    reg [15:0] conv_elem_cnt;                // Total elements emitted in this pass
 
     // ─── Flush counter (reused) ───
     reg [15:0] flush_cnt;
@@ -286,6 +302,10 @@ module npu_compute #(
             flush_cnt <= 0;
             sp_oh <= 0; sp_ow <= 0;
             dot_acc <= 0; reduce_cnt <= 0; pixel_act_base <= 0;
+            k_pass <= 0; k_pass_max <= 0; k_pass_remain <= 0;
+            conv_fh <= 0; conv_fw <= 0; conv_ch_cnt <= 0;
+            conv_ih_base <= 0; conv_iw_base <= 0; conv_is_pad <= 0;
+            conv_elem_cnt <= 0;
             for (i = 0; i < ARRAY_SIZE; i = i + 1) begin
                 sa_wgt_data[i] <= 0;
                 sa_act_data[i] <= 0;
@@ -340,16 +360,17 @@ module npu_compute #(
                 // Compute base addresses
                 wgt_base <= 0;  // Weight base fixed (all OC weights from start)
                 param_base <= 0;
-                // Input activation base = tile_y * tile_h * stride_h * in_w * in_c / 4
-                //                        + tile_x * tile_w * stride_w * in_c / 4
-                act_base <= (tile_y * out_tile_h * {8'd0, cfg_stride_h}
-                            * cfg_in_w * cfg_in_c
-                           + tile_x * out_tile_w * {8'd0, cfg_stride_w}
-                            * cfg_in_c) >> 2;
-                // Output base
-                out_base <= (tile_y * out_tile_h * cfg_out_w
-                            * cfg_out_c
-                           + tile_x * out_tile_w * cfg_out_c) >> 2;
+                // Input activation base = cfg_act_base + tile offset
+                act_base <= cfg_act_base
+                           + ((tile_y * out_tile_h * {8'd0, cfg_stride_h}
+                              * cfg_in_w * cfg_in_c
+                             + tile_x * out_tile_w * {8'd0, cfg_stride_w}
+                              * cfg_in_c) >> 2);
+                // Output base = cfg_out_base + tile offset
+                out_base <= cfg_out_base
+                           + ((tile_y * out_tile_h * cfg_out_w
+                              * cfg_out_c
+                             + tile_x * out_tile_w * cfg_out_c) >> 2);
 
                 oc_group <= 0;
 
@@ -371,6 +392,14 @@ module npu_compute #(
                 // Param base: 4 words per channel, ARRAY_SIZE channels per group
                 param_base <= oc_group * ARRAY_SIZE_16 * 4;
 
+                // Multi-pass setup
+                k_pass <= 0;
+                k_pass_max <= (k_depth - 1) / ARRAY_SIZE_16;
+
+                // Reset spatial coords for first pixel
+                sp_oh <= 0;
+                sp_ow <= 0;
+
                 wgt_col_idx <= 0;
                 state <= S_WGT_CMD;
             end
@@ -385,19 +414,26 @@ module npu_compute #(
                 wgt_byte_idx    <= 0;
                 wgt_read_issued <= 1'b0;
                 wgt_data_ready  <= 1'b0;
-                // Address for column wgt_col_idx, byte 0:
-                //   wgt_base + wgt_col_idx * ceil(k_depth/4)
-                // But actually weights are in OHWI order contiguously:
-                //   column c -> channel (oc_group*ARRAY_SIZE + c) weights at
-                //   offset c * k_depth bytes from wgt_base
-                wgt_word_addr <= wgt_base + (wgt_col_idx * k_depth[WGT_ADDR_W-1:0]) / 4;
+                // Compute k_pass_remain for this pass
+                k_pass_remain <= (k_pass == k_pass_max)
+                    ? (k_depth - k_pass * ARRAY_SIZE_16)
+                    : ARRAY_SIZE_16;
+                // Address for column wgt_col_idx, starting at k_pass offset:
+                //   byte_offset = col * k_depth + k_pass * ARRAY_SIZE
+                //   word_addr = wgt_base + byte_offset / 4
+                //   byte_sel = byte_offset % 4
+                begin : wgt_cmd_blk
+                    reg [15:0] byte_off;
+                    byte_off = wgt_col_idx * k_depth[15:0] + k_pass * ARRAY_SIZE_16;
+                    wgt_word_addr <= wgt_base + byte_off[15:2];
+                    wgt_bsel <= byte_off[1:0];
+                end
                 state <= S_WGT_LOAD;
             end
 
             S_WGT_LOAD: begin
-                // Fill sa_wgt_data[0..k_depth-1] for current column, zero-pad rest
-                // Read SRAM words (4 bytes each) and unpack
-                // 3-phase: issue read → wait for SRAM latency → unpack
+                // Fill sa_wgt_data[0..k_pass_remain-1] for current column, zero-pad rest
+                // Read SRAM words (4 bytes each) and unpack with byte offset (wgt_bsel)
                 if (!wgt_read_issued) begin
                     // Phase 0: Issue SRAM read
                     wgt_rd_en   <= 1'b1;
@@ -409,39 +445,40 @@ module npu_compute #(
                     wgt_data_ready <= 1'b1;
                 end else begin
                     // Phase 2: Data available from wgt_rd_data
-                    // Unpack up to 4 bytes (only k_depth rows get real weights)
-                    if (wgt_byte_idx < k_depth) begin
-                        sa_wgt_data[wgt_byte_idx[COL_W-1:0]] <=
-                            $signed(wgt_rd_data[7:0]);
-                    end
-                    if (wgt_byte_idx + 1 < k_depth) begin
-                        sa_wgt_data[wgt_byte_idx[COL_W-1:0] + 1] <=
-                            $signed(wgt_rd_data[15:8]);
-                    end
-                    if (wgt_byte_idx + 2 < k_depth) begin
-                        sa_wgt_data[wgt_byte_idx[COL_W-1:0] + 2] <=
-                            $signed(wgt_rd_data[23:16]);
-                    end
-                    if (wgt_byte_idx + 3 < k_depth) begin
-                        sa_wgt_data[wgt_byte_idx[COL_W-1:0] + 3] <=
-                            $signed(wgt_rd_data[31:24]);
+                    // Extract bytes starting at wgt_bsel offset
+                    begin : wgt_unpack_blk
+                        reg [31:0] shifted;
+                        shifted = wgt_rd_data >> (wgt_bsel * 8);
+                        // Unpack available bytes (4 - wgt_bsel bytes from this word)
+                        if (wgt_byte_idx < k_pass_remain)
+                            sa_wgt_data[wgt_byte_idx[COL_W-1:0]] <= $signed(shifted[7:0]);
+                        if (wgt_byte_idx + 1 < k_pass_remain && wgt_bsel < 2'd3)
+                            sa_wgt_data[wgt_byte_idx[COL_W-1:0] + 1] <= $signed(shifted[15:8]);
+                        if (wgt_byte_idx + 2 < k_pass_remain && wgt_bsel < 2'd2)
+                            sa_wgt_data[wgt_byte_idx[COL_W-1:0] + 2] <= $signed(shifted[23:16]);
+                        if (wgt_byte_idx + 3 < k_pass_remain && wgt_bsel < 2'd1)
+                            sa_wgt_data[wgt_byte_idx[COL_W-1:0] + 3] <= $signed(shifted[31:24]);
                     end
 
-                    wgt_byte_idx <= wgt_byte_idx + 4;
+                    begin : wgt_advance_blk
+                        reg [COL_W:0] bytes_this_word;
+                        bytes_this_word = {2'd0, 3'd4 - {1'b0, wgt_bsel}};
+                        wgt_byte_idx <= wgt_byte_idx + bytes_this_word;
 
-                    if (wgt_byte_idx + 4 >= k_depth) begin
-                        // All k_depth bytes loaded; zero-pad remaining rows
-                        // Only pad if k_depth < ARRAY_SIZE (truncated index != 0)
-                        if (k_depth < ARRAY_SIZE_16) begin
-                            for (i = k_depth[COL_W-1:0]; i < ARRAY_SIZE; i = i + 1)
-                                sa_wgt_data[i[COL_W-1:0]] <= 0;
+                        if (wgt_byte_idx + bytes_this_word >= k_pass_remain) begin
+                            // All k_pass_remain bytes loaded; zero-pad remaining rows
+                            if (k_pass_remain < ARRAY_SIZE_16) begin
+                                for (i = k_pass_remain[COL_W-1:0]; i < ARRAY_SIZE; i = i + 1)
+                                    sa_wgt_data[i[COL_W-1:0]] <= 0;
+                            end
+                            // Emit
+                            state <= S_WGT_EMIT;
+                        end else begin
+                            // Need more words (next word starts at byte 0)
+                            wgt_word_addr <= wgt_word_addr + 1;
+                            wgt_bsel <= 2'd0;
+                            wgt_read_issued <= 1'b0;
                         end
-                        // Emit
-                        state <= S_WGT_EMIT;
-                    end else begin
-                        // Need more words
-                        wgt_word_addr <= wgt_word_addr + 1;
-                        wgt_read_issued <= 1'b0;
                     end
                 end
             end
@@ -451,9 +488,7 @@ module npu_compute #(
                 sa_wgt_valid <= 1'b1;
 
                 if (wgt_col_idx == COL_MAX) begin
-                    // All columns loaded → start spatial pixel loop
-                    sp_oh <= 0;
-                    sp_ow <= 0;
+                    // All columns loaded → go to spatial setup (compute act addr)
                     state <= S_SPATIAL_SETUP;
                 end else begin
                     // Next column
@@ -461,8 +496,13 @@ module npu_compute #(
                     wgt_byte_idx <= 0;
                     wgt_read_issued <= 1'b0;
                     wgt_data_ready  <= 1'b0;
-                    wgt_word_addr <= wgt_base +
-                        ((wgt_col_idx + 1) * k_depth[WGT_ADDR_W-1:0]) / 4;
+                    begin : wgt_emit_next_blk
+                        reg [15:0] byte_off;
+                        byte_off = (wgt_col_idx + 1) * k_depth[15:0]
+                                 + k_pass * ARRAY_SIZE_16;
+                        wgt_word_addr <= wgt_base + byte_off[15:2];
+                        wgt_bsel <= byte_off[1:0];
+                    end
                     state <= S_WGT_LOAD;
                 end
             end
@@ -479,15 +519,32 @@ module npu_compute #(
                     act_byte_sel <= 2'd0;
                     act_read_issued <= 1'b0;
                     act_data_ready  <= 1'b0;
-                    act_word_addr <= {{(16-ACT_ADDR_W){1'b0}}, pixel_act_base};
+
+                    // Compute activation address for current (conv_fh, conv_fw)
+                    begin : act_addr_blk
+                        reg signed [15:0] ih, iw;
+                        reg [15:0] byte_off;
+                        ih = conv_ih_base + $signed({8'd0, conv_fh});
+                        iw = conv_iw_base + $signed({8'd0, conv_fw});
+                        conv_is_pad <= (ih < 0) || (ih >= $signed({1'b0, cfg_in_h}))
+                                    || (iw < 0) || (iw >= $signed({1'b0, cfg_in_w}));
+                        // Byte offset within activation SRAM (act_base is already word addr)
+                        byte_off = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c
+                                 + conv_ch_cnt;
+                        act_word_addr <= {2'd0, act_base} + byte_off[15:2];
+                        act_byte_sel <= byte_off[1:0];
+                    end
                     state <= S_ACT_LOAD;
                 end
             end
 
             S_ACT_LOAD: begin
                 // Read one SRAM word (4 activation bytes)
-                // 3-phase: issue read → wait for SRAM latency → buffer
-                if (!act_read_issued) begin
+                // If padding, skip read and go directly to emit zeros
+                if (conv_is_pad) begin
+                    act_buf <= 32'd0;
+                    state <= S_ACT_EMIT;
+                end else if (!act_read_issued) begin
                     act_rd_en   <= 1'b1;
                     act_rd_addr <= act_word_addr[ACT_ADDR_W-1:0];
                     act_read_issued <= 1'b1;
@@ -498,7 +555,6 @@ module npu_compute #(
                 end else begin
                     // Data available
                     act_buf <= act_rd_data;
-                    act_byte_sel <= 2'd0;
                     state <= S_ACT_EMIT;
                 end
             end
@@ -523,13 +579,50 @@ module npu_compute #(
                 end
                 sa_act_valid <= 1'b1;
                 act_cnt <= act_cnt + 1;
+                conv_ch_cnt <= conv_ch_cnt + 1;
 
-                if (act_cnt + 1 >= k_depth) begin
-                    // All K elements streamed → flush
+                if (act_cnt + 1 >= k_pass_remain) begin
+                    // All K elements for this pass streamed → flush
                     flush_cnt <= 0;
                     state <= S_ACT_FLUSH;
+                end else if (conv_ch_cnt + 1 >= cfg_in_c) begin
+                    // Reached end of channels for current (fh, fw)
+                    // Advance to next filter position
+                    conv_ch_cnt <= 0;
+                    if (conv_fw + 1 >= {8'd0, cfg_kernel_w}) begin
+                        conv_fw <= 0;
+                        conv_fh <= conv_fh + 1;
+                    end else begin
+                        conv_fw <= conv_fw + 1;
+                    end
+                    // Need to recompute address for new (fh, fw)
+                    act_read_issued <= 1'b0;
+                    act_data_ready  <= 1'b0;
+                    state <= S_ACT_LOAD;
+                    // Recompute conv_is_pad and address in S_ACT_LOAD?
+                    // Actually need to go through addr computation again.
+                    // Use a helper state or inline it here.
+                    begin : next_pos_blk
+                        reg signed [15:0] nih, niw;
+                        reg [15:0] byte_off_n;
+                        reg [7:0] next_fw, next_fh;
+                        if (conv_fw + 1 >= {8'd0, cfg_kernel_w}) begin
+                            next_fw = 0;
+                            next_fh = conv_fh + 1;
+                        end else begin
+                            next_fw = conv_fw + 1;
+                            next_fh = conv_fh;
+                        end
+                        nih = conv_ih_base + $signed({8'd0, next_fh});
+                        niw = conv_iw_base + $signed({8'd0, next_fw});
+                        conv_is_pad <= (nih < 0) || (nih >= $signed({1'b0, cfg_in_h}))
+                                    || (niw < 0) || (niw >= $signed({1'b0, cfg_in_w}));
+                        byte_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c;
+                        act_word_addr <= {2'd0, act_base} + byte_off_n[15:2];
+                        act_byte_sel <= byte_off_n[1:0];
+                    end
                 end else if (act_byte_sel == 2'd3) begin
-                    // Need next SRAM word
+                    // Need next SRAM word (still within same (fh, fw) position)
                     act_byte_sel <= 2'd0;
                     act_word_addr <= act_word_addr + 1;
                     act_read_issued <= 1'b0;
@@ -572,23 +665,32 @@ module npu_compute #(
             end
 
             // ══════════════════════════════════════════════════════════════
-            // REDUCE: sum k_depth partial products into one dot product
-            // Store result in acc_buf[drain_col] for later PPU feeding
+            // REDUCE: sum k_pass_remain partial products into one dot product
+            // Accumulate across passes in dot_buf[drain_col]
             // ══════════════════════════════════════════════════════════════
             S_REDUCE: begin
                 dot_acc <= dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
                 reduce_cnt <= reduce_cnt + 1;
-                if (reduce_cnt + 1 >= k_depth) begin
-                    // Store reduced dot product in dot_buf[drain_col]
-                    dot_buf[drain_col] <= dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
-                    // Next column or move to PPU
+                if (reduce_cnt + 1 >= k_pass_remain) begin
+                    // Accumulate reduced dot product into dot_buf[drain_col]
+                    dot_buf[drain_col] <= dot_buf[drain_col]
+                        + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
+                    // Next column or decide next step
                     if (drain_col == COL_MAX) begin
-                        // All columns drained and reduced → read params & feed PPU
-                        param_word_idx <= 0;
-                        param_read_issued <= 1'b0;
-                        param_data_ready  <= 1'b0;
-                        drain_col <= 0;
-                        state <= S_PARAM_LOAD;
+                        // All columns drained for this pass
+                        if (k_pass >= k_pass_max) begin
+                            // Final pass — proceed to PPU
+                            param_word_idx <= 0;
+                            param_read_issued <= 1'b0;
+                            param_data_ready  <= 1'b0;
+                            drain_col <= 0;
+                            state <= S_PARAM_LOAD;
+                        end else begin
+                            // More passes needed — reload weights for next slice
+                            k_pass <= k_pass + 1;
+                            wgt_col_idx <= 0;
+                            state <= S_WGT_CMD;
+                        end
                     end else begin
                         drain_col <= drain_col + 1;
                         state <= S_DRAIN_CMD;
@@ -690,16 +792,43 @@ module npu_compute #(
             // SPATIAL SETUP: compute per-pixel activation address
             // ══════════════════════════════════════════════════════════════
             S_SPATIAL_SETUP: begin
-                // For 1x1 conv (kh=1,kw=1): activation byte offset =
-                //   (sp_oh * in_w + sp_ow) * in_c
-                // For general conv: input window origin =
-                //   (sp_oh * stride_h - pad_top) * in_w * in_c
-                //   + (sp_ow * stride_w - pad_left) * in_c
-                // V1: support 1x1 only (no padding needed)
-                pixel_act_base <= act_base +
-                    ((sp_oh * cfg_in_w + sp_ow) * cfg_in_c) >> 2;
+                // Compute input window origin for output pixel (sp_oh, sp_ow)
+                conv_ih_base <= $signed({1'b0, sp_oh}) * $signed({1'b0, cfg_stride_h[7:0]})
+                              - $signed({1'b0, cfg_pad_top[7:0]});
+                conv_iw_base <= $signed({1'b0, sp_ow}) * $signed({1'b0, cfg_stride_w[7:0]})
+                              - $signed({1'b0, cfg_pad_left[7:0]});
+
+                // Compute starting (fh, fw, ch) from k_pass offset
+                // flat_start = k_pass * ARRAY_SIZE
+                // fh = flat_start / (kw * in_c)
+                // fw = (flat_start / in_c) % kw
+                // ch = flat_start % in_c
+                begin : spatial_setup_blk
+                    reg [15:0] flat_start;
+                    reg [15:0] kw_x_inc;
+                    flat_start = k_pass * ARRAY_SIZE_16;
+                    kw_x_inc = {8'd0, cfg_kernel_w} * cfg_in_c;
+                    if (cfg_kernel_h == 8'd1 && cfg_kernel_w == 8'd1) begin
+                        // 1×1 conv: simple contiguous addressing
+                        conv_fh <= 0;
+                        conv_fw <= 0;
+                        conv_ch_cnt <= flat_start;
+                    end else begin
+                        // General conv: decompose flat_start into (fh, fw, ch)
+                        conv_fh <= flat_start / kw_x_inc;
+                        conv_fw <= (flat_start % kw_x_inc) / cfg_in_c;
+                        conv_ch_cnt <= flat_start % cfg_in_c;
+                    end
+                end
+
+                conv_elem_cnt <= 0;
                 drain_col <= 0;
                 wb_pack <= 0;
+                // Clear partial_sum on first pass of new pixel
+                if (k_pass == 0) begin
+                    for (i = 0; i < ARRAY_SIZE; i = i + 1)
+                        dot_buf[i] <= 0;
+                end
                 state <= S_ACT_CMD;
             end
 
@@ -707,6 +836,8 @@ module npu_compute #(
             // PIXEL NEXT: advance spatial pixel or go to OC_NEXT
             // ══════════════════════════════════════════════════════════════
             S_PIXEL_NEXT: begin
+                // Reset k_pass for next pixel
+                k_pass <= 0;
                 if (sp_ow + 1 >= out_tile_w) begin
                     if (sp_oh + 1 >= out_tile_h) begin
                         // All pixels done for this OC group
@@ -714,11 +845,19 @@ module npu_compute #(
                     end else begin
                         sp_ow <= 0;
                         sp_oh <= sp_oh + 1;
-                        state <= S_SPATIAL_SETUP;
+                        if (k_pass_max > 0) begin
+                            wgt_col_idx <= 0;
+                            state <= S_WGT_CMD;
+                        end else
+                            state <= S_SPATIAL_SETUP;
                     end
                 end else begin
                     sp_ow <= sp_ow + 1;
-                    state <= S_SPATIAL_SETUP;
+                    if (k_pass_max > 0) begin
+                        wgt_col_idx <= 0;
+                        state <= S_WGT_CMD;
+                    end else
+                        state <= S_SPATIAL_SETUP;
                 end
             end
 

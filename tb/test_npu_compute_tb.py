@@ -29,7 +29,7 @@ async def reset_dut(dut):
 def set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1,
             stride_h=1, stride_w=1, pad_top=0, pad_left=0,
             tile_h=0, tile_w=0, tile_num_h=1, tile_num_w=1,
-            in_h=1, in_w=1, op_type=0):
+            in_h=1, in_w=1, op_type=0, act_base=0, out_base=0):
     """Set layer configuration."""
     dut.cfg_op_type.value = op_type
     dut.cfg_in_c.value = in_c
@@ -48,6 +48,8 @@ def set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1,
     dut.cfg_tile_num_w.value = tile_num_w
     dut.cfg_in_w.value = in_w
     dut.cfg_in_h.value = in_h
+    dut.cfg_act_base.value = act_base
+    dut.cfg_out_base.value = out_base
 
 
 def write_sram_word(dut, bank, addr, data):
@@ -871,3 +873,390 @@ async def test_dw_conv_3x3_with_padding(dut):
     # 9 output pixels. Center pixel (1,1) sums all 9 inputs = 45
     # Output byte offset for (1,1) ch0 = (1*3+1)*1 + 0 = 4 → word 1, byte 0
     # Note: output overwrites input SRAM in this test, so only verify completion.
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Multi-pass tests (k_depth > ARRAY_SIZE)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@cocotb.test()
+async def test_conv1x1_kdepth_32(dut):
+    """Conv 1x1 with k_depth=32 (2 passes). 1 pixel, verify dot product.
+
+    ARRAY_SIZE=16, in_c=32, kh=1, kw=1 → k_depth=32, k_pass_max=1.
+    All weights=1, activations=[1..32].
+    Expected dot product = sum(1..32) = 528.
+    With passthrough PPU: 528 & 0xFF = 16 (0x10).
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+
+    ARRAY_SIZE = get_array_size(dut)
+    in_c = 32  # 2x ARRAY_SIZE
+    assert ARRAY_SIZE == 16, f"Test assumes ARRAY_SIZE=16, got {ARRAY_SIZE}"
+
+    # Weights: all ones. Layout: col c at words [c*32/4 .. c*32/4 + 7]
+    # Each column has 32 weights (k_depth=32), packed 4 per word = 8 words/col
+    for col in range(ARRAY_SIZE):
+        for w in range(in_c // 4):
+            write_sram_word(dut, 'wgt', col * (in_c // 4) + w, pack_i8x4(1, 1, 1, 1))
+
+    # Activations: values 1..32. Packed 4 per word at addresses 0..7
+    # Separate from output: put acts starting at word 0, output at word 64+
+    act_base_word = 0
+    for w in range(in_c // 4):
+        b0 = w * 4 + 1
+        write_sram_word(dut, 'act', act_base_word + w,
+                        pack_i8x4(b0, b0+1, b0+2, b0+3))
+
+    # Pre-zero output area (output at word offset for pixel 0)
+    # Output NHWC: pixel 0, 16 channels → words at offset determined by out_c
+    # With in_c=32, in_w=1: pixel 0 input at byte 0. Output also at byte 0 of out area.
+    # To avoid collision, use separate input/output regions.
+    # Input at words 0..7 (32 bytes). Output at words 0..3 (16 bytes for out_c=16).
+    # Collision! Let's offset activations. Actually in the compute module,
+    # act_base = tile_y * out_tile_h * stride_h * in_w * in_c / 4 = 0 for single pixel.
+    # out_base = 0 as well. So they WILL collide if in_c > out_c.
+    # 
+    # Fix: put activations at a different region. Use cfg layout:
+    # The compute module uses act_base for reading input and out_base for writing output.
+    # With tile_y=0, tile_x=0, stride=1, these are both 0. Input reads from act SRAM
+    # words 0..7 (32 bytes of activation). Output writes to act SRAM starting at out_base=0.
+    # This DOES collide (first 4 output words overwrite first 4 input words).
+    #
+    # For this test: we only have 1 pixel, and once input is consumed it's fine
+    # to overwrite. The compute reads all activations before writing any output.
+    # So collision is OK here.
+
+    # Params: passthrough (M=1, S=0, bias=0, zp=0)
+    for ch in range(ARRAY_SIZE):
+        base = ch * 4
+        write_sram_word(dut, 'param', base + 0, 0x00000001)  # M=1, S=0
+        write_sram_word(dut, 'param', base + 1, 0)           # zp=0
+        write_sram_word(dut, 'param', base + 2, 0)           # bias low
+        write_sram_word(dut, 'param', base + 3, 0)           # bias high
+
+    dut.ppu_mode.value = 3      # PASSTHROUGH
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    set_cfg(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=1, kw=1,
+            out_h=1, out_w=1, in_h=1, in_w=1)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=50000), "done never asserted (k_depth=32)"
+
+    # Expected: dot = sum(1..32) = 528. Passthrough truncates to 528 & 0xFF = 16
+    # All 16 output channels should have the same value (all weights=1)
+    expected = 528 & 0xFF  # = 16
+    for word_idx in range(ARRAY_SIZE // 4):
+        out_word = read_sram_word(dut, 'act', word_idx)
+        for b in range(4):
+            ch = word_idx * 4 + b
+            byte_val = (out_word >> (b * 8)) & 0xFF
+            assert byte_val == expected, \
+                f"Channel {ch}: got {byte_val}, expected {expected} (sum=528, trunc to u8)"
+    dut._log.info(f"PASS: k_depth=32, all channels = {expected}")
+
+
+@cocotb.test()
+async def test_conv1x1_kdepth_32_nonuniform(dut):
+    """Conv 1x1 with k_depth=32, non-uniform weights. Verifies accumulation accuracy.
+
+    weights[col=0] = [1,2,3,...,32], other cols = all-ones.
+    activations = all-ones (value=1).
+    dot_product[col=0] = sum(1..32) = 528.
+    dot_product[col>0] = 32 (sum of 32 ones).
+    Passthrough: 528&0xFF=16, 32&0xFF=32.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+
+    ARRAY_SIZE = get_array_size(dut)
+    in_c = 32
+
+    # Col 0: weights = [1, 2, 3, ..., 32]
+    for w in range(in_c // 4):
+        b0 = w * 4 + 1
+        write_sram_word(dut, 'wgt', w, pack_i8x4(b0, b0+1, b0+2, b0+3))
+
+    # Cols 1..15: weights = all ones
+    for col in range(1, ARRAY_SIZE):
+        for w in range(in_c // 4):
+            write_sram_word(dut, 'wgt', col * (in_c // 4) + w, pack_i8x4(1, 1, 1, 1))
+
+    # Activations: all ones (32 bytes)
+    for w in range(in_c // 4):
+        write_sram_word(dut, 'act', w, pack_i8x4(1, 1, 1, 1))
+
+    # Params: passthrough
+    for ch in range(ARRAY_SIZE):
+        base = ch * 4
+        write_sram_word(dut, 'param', base + 0, 0x00000001)
+        write_sram_word(dut, 'param', base + 1, 0)
+        write_sram_word(dut, 'param', base + 2, 0)
+        write_sram_word(dut, 'param', base + 3, 0)
+
+    dut.ppu_mode.value = 3
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    set_cfg(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=1, kw=1,
+            out_h=1, out_w=1, in_h=1, in_w=1)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=50000), "done never asserted"
+
+    # Check col 0: sum(1..32) = 528, 528 & 0xFF = 16
+    out_word0 = read_sram_word(dut, 'act', 0)
+    ch0_val = out_word0 & 0xFF
+    assert ch0_val == 16, f"Col 0: got {ch0_val}, expected 16 (528 & 0xFF)"
+
+    # Check cols 1-3: sum = 32
+    for b in range(1, 4):
+        val = (out_word0 >> (b * 8)) & 0xFF
+        assert val == 32, f"Col {b}: got {val}, expected 32"
+
+    dut._log.info(f"PASS: k_depth=32 non-uniform, col0={ch0_val}, col1-3=32")
+
+
+@cocotb.test()
+async def test_conv1x1_kdepth_24_spatial_2x2(dut):
+    """Conv 1x1 with k_depth=24 (2 passes, last partial=8), 2x2 spatial output.
+
+    ARRAY_SIZE=16, in_c=24 → k_pass_max=1, pass0=16 elements, pass1=8 elements.
+    All weights=1, activations=all-ones.
+    dot per pixel = 24 (sum of 24 ones with w=1).
+    Output should be 24 for all channels, all pixels.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+
+    ARRAY_SIZE = get_array_size(dut)
+    in_c = 24
+    out_h, out_w = 2, 2
+
+    # Weights: all ones. k_depth=24, 6 words per column
+    words_per_col = in_c // 4  # 6
+    for col in range(ARRAY_SIZE):
+        for w in range(words_per_col):
+            write_sram_word(dut, 'wgt', col * words_per_col + w,
+                            pack_i8x4(1, 1, 1, 1))
+
+    # Activations: 2x2 input with in_c=24 per pixel = 96 bytes = 24 words
+    # Layout NHWC: pixel(y,x) at byte offset (y*in_w + x)*in_c
+    # All ones
+    total_act_bytes = out_h * out_w * in_c  # 96
+    for w in range(total_act_bytes // 4):
+        write_sram_word(dut, 'act', w, pack_i8x4(1, 1, 1, 1))
+
+    # Pre-zero output region (overlaps input for this simple case)
+    # Output: 2x2 * 16ch = 64 bytes = 16 words starting at out_base=0
+    # Input: 2x2 * 24ch = 96 bytes = 24 words
+    # Output will overwrite words 0-15 (ok, input already consumed)
+
+    # Params: passthrough
+    for ch in range(ARRAY_SIZE):
+        base = ch * 4
+        write_sram_word(dut, 'param', base + 0, 0x00000001)
+        write_sram_word(dut, 'param', base + 1, 0)
+        write_sram_word(dut, 'param', base + 2, 0)
+        write_sram_word(dut, 'param', base + 3, 0)
+
+    dut.ppu_mode.value = 3
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    set_cfg(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=1, kw=1,
+            out_h=out_h, out_w=out_w, in_h=out_h, in_w=out_w)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=100000), "done never asserted (k_depth=24, 2x2)"
+
+    # Verify: each pixel, each channel = 24
+    expected = 24
+    for pixel in range(out_h * out_w):
+        for word_offset in range(ARRAY_SIZE // 4):
+            addr = pixel * (ARRAY_SIZE // 4) + word_offset
+            out_word = read_sram_word(dut, 'act', addr)
+            for b in range(4):
+                ch = word_offset * 4 + b
+                byte_val = (out_word >> (b * 8)) & 0xFF
+                assert byte_val == expected, \
+                    f"Pixel {pixel} ch {ch}: got {byte_val}, expected {expected}"
+
+    dut._log.info(f"PASS: k_depth=24, 2x2 spatial, all outputs = {expected}")
+
+
+@cocotb.test()
+async def test_conv3x3_single_pixel(dut):
+    """Conv 3×3, in_c=1, out_c=ARRAY_SIZE, 3×3 input (no pad), 1×1 output.
+
+    k_depth = 3*3*1 = 9. Single pass (9 < 16).
+    All weights = 1 → dot product = sum of 9 input values.
+    Input values = [1,2,3,4,5,6,7,8,9] → dot = 45.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+
+    ARRAY_SIZE = get_array_size(dut)
+    in_c = 1
+    kh, kw = 3, 3
+    in_h, in_w = 3, 3
+    k_depth = kh * kw * in_c  # 9
+
+    # Weights: all ones. OHWI layout: col c has k_depth bytes starting at byte c*k_depth.
+    # Pack all weight bytes contiguously into SRAM words.
+    total_wgt_bytes = ARRAY_SIZE * k_depth  # 16 * 9 = 144 bytes
+    wgt_bytes = [1] * total_wgt_bytes  # all ones
+    for w_idx in range(0, total_wgt_bytes, 4):
+        b0 = wgt_bytes[w_idx] if w_idx < total_wgt_bytes else 0
+        b1 = wgt_bytes[w_idx+1] if w_idx+1 < total_wgt_bytes else 0
+        b2 = wgt_bytes[w_idx+2] if w_idx+2 < total_wgt_bytes else 0
+        b3 = wgt_bytes[w_idx+3] if w_idx+3 < total_wgt_bytes else 0
+        write_sram_word(dut, 'wgt', w_idx // 4, pack_i8x4(b0, b1, b2, b3))
+
+    # Activations: 3×3×1 = 9 bytes → values 1..9
+    # NHWC layout: pixel(y,x) at byte offset (y*in_w + x)*in_c
+    # 9 bytes = 3 words (with zero padding)
+    write_sram_word(dut, 'act', 0, pack_i8x4(1, 2, 3, 4))
+    write_sram_word(dut, 'act', 1, pack_i8x4(5, 6, 7, 8))
+    write_sram_word(dut, 'act', 2, pack_i8x4(9, 0, 0, 0))
+
+    # Params: passthrough
+    for ch in range(ARRAY_SIZE):
+        base = ch * 4
+        write_sram_word(dut, 'param', base + 0, 0x00000001)
+        write_sram_word(dut, 'param', base + 1, 0)
+        write_sram_word(dut, 'param', base + 2, 0)
+        write_sram_word(dut, 'param', base + 3, 0)
+
+    dut.ppu_mode.value = 3  # PASSTHROUGH
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    set_cfg(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=kh, kw=kw,
+            out_h=1, out_w=1, in_h=in_h, in_w=in_w,
+            stride_h=1, stride_w=1, pad_top=0, pad_left=0)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    # Debug: monitor FSM state
+    for cyc in range(5000):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        try:
+            state = int(dut.u_compute.state.value)
+            if cyc % 500 == 0:
+                dut._log.info(f"cyc={cyc} state={state}")
+            if int(dut.done.value) == 1:
+                dut._log.info(f"DONE at cycle {cyc}")
+                break
+        except ValueError:
+            dut._log.info(f"cyc={cyc} X-values in state/signals")
+    else:
+        assert False, "done never asserted (conv3x3) - check FSM states in log"
+
+    # Expected dot product = sum(1..9) = 45
+    expected = 45
+    out_word = read_sram_word(dut, 'act', 0)
+    for b in range(4):
+        byte_val = (out_word >> (b * 8)) & 0xFF
+        assert byte_val == expected, \
+            f"Channel {b}: got {byte_val}, expected {expected}"
+
+    dut._log.info(f"PASS: conv3x3 single pixel, output = {expected}")
+
+
+@cocotb.test()
+async def test_conv3x3_with_padding(dut):
+    """Conv 3×3, in_c=1, out_c=ARRAY_SIZE, 2×2 input, pad=1, stride=1 → 2×2 output.
+
+    k_depth = 3*3*1 = 9. Single pass (9 < 16).
+    Weights = all 1 → dot product = sum of valid input values.
+    Input (2×2, in_c=1):
+        [[1, 2],
+         [3, 4]]
+    With pad=1, output pixel (oh,ow) sees a 3×3 window centered at (oh, ow):
+      (0,0): window rows -1..1, cols -1..1 → valid (0,0)=1, (0,1)=2, (1,0)=3, (1,1)=4 → sum=10
+      (0,1): window rows -1..1, cols 0..2 → valid (0,0)=1, (0,1)=2, (1,0)=3, (1,1)=4 → sum=10
+      (1,0): window rows 0..2, cols -1..1 → valid (0,0)=1, (0,1)=2, (1,0)=3, (1,1)=4 → sum=10
+      (1,1): window rows 0..2, cols 0..2 → valid (0,0)=1, (0,1)=2, (1,0)=3, (1,1)=4 → sum=10
+    All 4 output pixels = 10.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+
+    ARRAY_SIZE = get_array_size(dut)
+    in_c = 1
+    kh, kw = 3, 3
+    in_h, in_w = 2, 2
+    out_h, out_w = 2, 2
+    k_depth = kh * kw * in_c  # 9
+
+    # Weights: all ones. Contiguous OHWI byte packing.
+    total_wgt_bytes = ARRAY_SIZE * k_depth
+    wgt_bytes = [1] * total_wgt_bytes
+    for w_idx in range(0, total_wgt_bytes, 4):
+        b0 = wgt_bytes[w_idx] if w_idx < total_wgt_bytes else 0
+        b1 = wgt_bytes[w_idx+1] if w_idx+1 < total_wgt_bytes else 0
+        b2 = wgt_bytes[w_idx+2] if w_idx+2 < total_wgt_bytes else 0
+        b3 = wgt_bytes[w_idx+3] if w_idx+3 < total_wgt_bytes else 0
+        write_sram_word(dut, 'wgt', w_idx // 4, pack_i8x4(b0, b1, b2, b3))
+
+    # Activations: 2×2×1 = 4 bytes → values 1,2,3,4
+    # Put input at word offset 64 to avoid overlap with output at word 0
+    ACT_BASE = 64  # word address
+    write_sram_word(dut, 'act', ACT_BASE + 0, pack_i8x4(1, 2, 3, 4))
+
+    # Params: passthrough (scale=1, shift=0, bias=0, zp=0)
+    for ch in range(ARRAY_SIZE):
+        base = ch * 4
+        write_sram_word(dut, 'param', base + 0, 0x00000001)
+        write_sram_word(dut, 'param', base + 1, 0)
+        write_sram_word(dut, 'param', base + 2, 0)
+        write_sram_word(dut, 'param', base + 3, 0)
+
+    dut.ppu_mode.value = 3  # PASSTHROUGH
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    set_cfg(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=kh, kw=kw,
+            out_h=out_h, out_w=out_w, in_h=in_h, in_w=in_w,
+            stride_h=1, stride_w=1, pad_top=1, pad_left=1,
+            act_base=ACT_BASE, out_base=0)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    done = await wait_done(dut, timeout=5000)
+    assert done, "done never asserted (conv3x3 with padding)"
+
+    # Expected: all 4 pixels = 10 for all ARRAY_SIZE channels
+    expected = 10
+    # Output layout: NHWC, pixel (oh, ow) at byte (oh*out_w + ow)*out_c + c
+    # Total output bytes = 2*2*ARRAY_SIZE
+    total_out_bytes = out_h * out_w * ARRAY_SIZE
+    for px in range(out_h * out_w):
+        for ch in range(min(4, ARRAY_SIZE)):  # Check first 4 channels
+            byte_offset = px * ARRAY_SIZE + ch
+            word_idx = byte_offset // 4
+            byte_pos = byte_offset % 4
+            out_word = read_sram_word(dut, 'act', word_idx)
+            byte_val = (out_word >> (byte_pos * 8)) & 0xFF
+            assert byte_val == expected, \
+                f"Pixel {px}, ch {ch}: got {byte_val}, expected {expected}"
+
+    dut._log.info(f"PASS: conv3x3 with padding, all pixels = {expected}")

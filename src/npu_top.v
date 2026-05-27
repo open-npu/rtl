@@ -570,6 +570,8 @@ module npu_top #(
         .cfg_tile_num_w (reg_tile_count[31:16]),
         .cfg_in_w       (reg_in_dim_hw[15:0]),
         .cfg_in_h       (reg_in_dim_hw[31:16]),
+        .cfg_act_base   ({ACT_ADDR_W{1'b0}}),
+        .cfg_out_base   ({ACT_ADDR_W{1'b0}}),
         // Weight SRAM Port B
         .wgt_rd_en      (wgt_b_en),
         .wgt_rd_addr    (wgt_b_addr),
