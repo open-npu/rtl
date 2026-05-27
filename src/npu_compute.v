@@ -183,6 +183,7 @@ module npu_compute #(
 
     // ─── Drain state ───
     reg [$clog2(ARRAY_SIZE)-1:0] drain_col;
+    reg [$clog2(ARRAY_SIZE)-1:0] col_last;  // last valid drain column for current oc_group
 
     // ─── PPU state ───
     reg [$clog2(ARRAY_SIZE):0] ppu_feed_cnt;  // how many acc values fed to PPU
@@ -289,7 +290,7 @@ module npu_compute #(
             wgt_word_addr <= 0; wgt_read_issued <= 0; wgt_data_ready <= 0;
             act_cnt <= 0; act_word_addr <= 0;
             act_read_issued <= 0; act_data_ready <= 0; act_buf <= 0; act_byte_sel <= 0;
-            drain_col <= 0;
+            drain_col <= 0; col_last <= COL_MAX;
             ppu_feed_cnt <= 0; ppu_wait_cnt <= 0;
             param_word_idx <= 0; param_read_issued <= 0; param_data_ready <= 0;
             wb_cnt <= 0; wb_pack <= 0; wb_addr <= 0;
@@ -395,6 +396,16 @@ module npu_compute #(
                 // Multi-pass setup
                 k_pass <= 0;
                 k_pass_max <= (k_depth - 1) / ARRAY_SIZE_16;
+
+                // Last valid drain column for this oc_group
+                begin : col_last_blk
+                    reg [15:0] remaining_oc;
+                    remaining_oc = cfg_out_c - oc_group * ARRAY_SIZE_16;
+                    if (remaining_oc >= ARRAY_SIZE_16)
+                        col_last <= COL_MAX;
+                    else
+                        col_last <= remaining_oc[$clog2(ARRAY_SIZE)-1:0] - 1;
+                end
 
                 // Reset spatial coords for first pixel
                 sp_oh <= 0;
@@ -759,23 +770,22 @@ module npu_compute #(
                         // Write full word (4 output channels)
                         act_wr_en   <= 1'b1;
                         act_wr_addr <= out_base +
-                            ((sp_oh * out_tile_w + sp_ow) * cfg_out_c
-                             + oc_group * ARRAY_SIZE_16
-                             + ({12'd0, drain_col} & ~16'd3)) >> 2;
+                            (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
+                              + oc_group * ARRAY_SIZE_16
+                              + ({12'd0, drain_col} & ~16'd3)) >> 2);
                         act_wr_data <= {ppu_out_data, wb_pack[23:0]};
                     end
                 endcase
 
                 // Advance to next channel or finish pixel
-                if (drain_col == COL_MAX) begin
-                    // Flush remaining partial word if ARRAY_SIZE not multiple of 4
-                    // (ARRAY_SIZE is always >=4 and power of 2, so this won't trigger)
+                if (drain_col == col_last) begin
+                    // Flush remaining partial word if col_last not 4-aligned
                     if (drain_col[1:0] != 2'd3) begin
                         act_wr_en   <= 1'b1;
                         act_wr_addr <= out_base +
-                            ((sp_oh * out_tile_w + sp_ow) * cfg_out_c
-                             + oc_group * ARRAY_SIZE_16
-                             + ({12'd0, drain_col} & ~16'd3)) >> 2;
+                            (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
+                              + oc_group * ARRAY_SIZE_16
+                              + ({12'd0, drain_col} & ~16'd3)) >> 2);
                         act_wr_data <= wb_pack;
                     end
                     state <= S_PIXEL_NEXT;
