@@ -24,11 +24,15 @@
 `define WEIGHT_BUF_SIZE (`SPAD_KB * 1024 / 2)  // Weight buffer = SPAD/2
 
 // ─── Data widths ───
-`define DATA_WIDTH     8      // INT8 data element width
+`define DATA_WIDTH     16     // Data port width (always 16-bit; INT8 sign-extends)
 `define ACC_WIDTH      40     // Accumulator width (supports C_in<=512)
 `define MULT_WIDTH     16     // Multiplier operand width (for M parameter)
 `define BIAS_WIDTH     64     // Per-channel bias width
 `define SHIFT_WIDTH    6      // Shift parameter width
+
+// ─── Element packing ───
+`define ELEM_BYTES_INT8   1   // Bytes per element in INT8 mode
+`define ELEM_BYTES_INT16  2   // Bytes per element in INT16 mode
 
 // ─── Bus configuration ───
 `define WB_DATA_WIDTH  32     // Wishbone data bus width

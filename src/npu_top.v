@@ -517,6 +517,7 @@ module npu_top #(
         .relu_en    (reg_post_ctrl[2]),
         .bias_en    (reg_post_ctrl[6]),
         .zp_en      (reg_post_ctrl[5]),
+        .int16_mode (reg_post_ctrl[7]),
         .acc_in     (ppu_acc_in),
         .in_valid   (ppu_in_valid),
         .bias       (ppu_bias),
@@ -555,6 +556,7 @@ module npu_top #(
         .done           (compute_done_w),
         // Layer config from CSR
         .cfg_op_type    (reg_layer_mode[7:0]),
+        .cfg_int16      (reg_post_ctrl[7]),
         .cfg_in_c       (reg_in_dim_c[15:0]),
         .cfg_out_h      (reg_out_dim_hw[31:16]),
         .cfg_out_w      (reg_out_dim_hw[15:0]),
