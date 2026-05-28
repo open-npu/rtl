@@ -41,7 +41,8 @@ module npu_compute_tb #(
     input  wire [1:0]  ppu_mode,
     input  wire        ppu_relu_en,
     input  wire        ppu_bias_en,
-    input  wire        ppu_zp_en
+    input  wire        ppu_zp_en,
+    input  wire        cfg_int16
 );
 
     localparam DATA_W       = `DATA_WIDTH;
@@ -139,6 +140,7 @@ module npu_compute_tb #(
         .clk(clk), .rst_n(rst_n),
         .start(start), .done(done),
         .cfg_op_type(cfg_op_type),
+        .cfg_int16(cfg_int16),
         .cfg_in_c(cfg_in_c), .cfg_out_h(cfg_out_h), .cfg_out_w(cfg_out_w),
         .cfg_out_c(cfg_out_c), .cfg_kernel_h(cfg_kernel_h), .cfg_kernel_w(cfg_kernel_w),
         .cfg_stride_h(cfg_stride_h), .cfg_stride_w(cfg_stride_w),
@@ -216,6 +218,7 @@ module npu_compute_tb #(
         .relu_en(ppu_relu_en),
         .bias_en(ppu_bias_en),
         .zp_en(ppu_zp_en),
+        .int16_mode(cfg_int16),
         .acc_in(ppu_acc_in), .in_valid(ppu_in_valid),
         .bias(ppu_bias), .mult_m(ppu_mult_m),
         .shift_s(ppu_shift_s), .zero_point(ppu_zero_point),

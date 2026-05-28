@@ -31,6 +31,7 @@ module npu_ppu #(
     input  wire                         relu_en,    // Enable ReLU
     input  wire                         bias_en,    // Enable bias addition
     input  wire                         zp_en,      // Enable zero_point addition
+    input  wire                         int16_mode, // 1=INT16 clamp, 0=INT8 clamp
 
     // ─── Input ───
     input  wire signed [ACC_W-1:0]      acc_in,     // From systolic array
@@ -66,6 +67,7 @@ module npu_ppu #(
     reg signed [ZP_W-1:0]       s1_zp;
     reg                         s1_relu_en;
     reg                         s1_zp_en;
+    reg                         s1_int16;
 
     // Stage 2: after multiply
     reg signed [PROD_W-1:0]     s2_product;
@@ -75,6 +77,7 @@ module npu_ppu #(
     reg signed [ZP_W-1:0]       s2_zp;
     reg                         s2_relu_en;
     reg                         s2_zp_en;
+    reg                         s2_int16;
 
     // Stage 3: after shift
     reg signed [ZP_W:0]         s3_shifted;  // 17-bit
@@ -83,6 +86,7 @@ module npu_ppu #(
     reg signed [ZP_W-1:0]       s3_zp;
     reg                         s3_relu_en;
     reg                         s3_zp_en;
+    reg                         s3_int16;
 
     // ═══════════════════════════════════════════════════════════════════
     // Pipeline — single always block with all computations inline
@@ -106,6 +110,7 @@ module npu_ppu #(
             s1_zp      <= 0;
             s1_relu_en <= 1'b0;
             s1_zp_en   <= 1'b0;
+            s1_int16   <= 1'b0;
 
             s2_product <= 0;
             s2_valid   <= 1'b0;
@@ -114,6 +119,7 @@ module npu_ppu #(
             s2_zp      <= 0;
             s2_relu_en <= 1'b0;
             s2_zp_en   <= 1'b0;
+            s2_int16   <= 1'b0;
 
             s3_shifted <= 0;
             s3_valid   <= 1'b0;
@@ -121,6 +127,7 @@ module npu_ppu #(
             s3_zp      <= 0;
             s3_relu_en <= 1'b0;
             s3_zp_en   <= 1'b0;
+            s3_int16   <= 1'b0;
 
             out_data   <= 0;
             out_valid  <= 1'b0;
@@ -136,25 +143,53 @@ module npu_ppu #(
             if (s3_mode == MODE_PASSTHROUGH) begin
                 out_data <= zp_result[DATA_W-1:0];
             end else if (s3_mode == MODE_RELU_ONLY) begin
-                if (s3_relu_en && zp_result < $signed(17'sd0))
-                    out_data <= 8'sd0;
-                else if (zp_result < -$signed(17'sd128))
-                    out_data <= -8'sd128;
-                else if (zp_result > $signed(17'sd127))
-                    out_data <= 8'sd127;
-                else
-                    out_data <= zp_result[DATA_W-1:0];
-            end else begin
-                // MODE_CONV_REQ: Clamp then ReLU
-                if (zp_result < -$signed(17'sd128)) begin
-                    out_data <= (s3_relu_en) ? 8'sd0 : -8'sd128;
-                end else if (zp_result > $signed(17'sd127)) begin
-                    out_data <= 8'sd127;
-                end else begin
+                if (s3_int16) begin
+                    // INT16 clamp+relu
                     if (s3_relu_en && zp_result < $signed(17'sd0))
-                        out_data <= 8'sd0;
+                        out_data <= 16'sd0;
+                    else if (zp_result < -$signed(17'sd32768))
+                        out_data <= -16'sd32768;
+                    else if (zp_result > $signed(17'sd32767))
+                        out_data <= 16'sd32767;
                     else
                         out_data <= zp_result[DATA_W-1:0];
+                end else begin
+                    // INT8 clamp+relu (sign-extend to 16-bit output)
+                    if (s3_relu_en && zp_result < $signed(17'sd0))
+                        out_data <= 16'sd0;
+                    else if (zp_result < -$signed(17'sd128))
+                        out_data <= {{8{1'b1}}, 8'h80};  // -128 sign-extended
+                    else if (zp_result > $signed(17'sd127))
+                        out_data <= 16'sd127;
+                    else
+                        out_data <= {{8{zp_result[7]}}, zp_result[7:0]};
+                end
+            end else begin
+                // MODE_CONV_REQ: Clamp then ReLU
+                if (s3_int16) begin
+                    // INT16: clamp to [-32768, 32767]
+                    if (zp_result < -$signed(17'sd32768)) begin
+                        out_data <= (s3_relu_en) ? 16'sd0 : -16'sd32768;
+                    end else if (zp_result > $signed(17'sd32767)) begin
+                        out_data <= 16'sd32767;
+                    end else begin
+                        if (s3_relu_en && zp_result < $signed(17'sd0))
+                            out_data <= 16'sd0;
+                        else
+                            out_data <= zp_result[DATA_W-1:0];
+                    end
+                end else begin
+                    // INT8: clamp to [-128, 127], sign-extend to 16-bit
+                    if (zp_result < -$signed(17'sd128)) begin
+                        out_data <= (s3_relu_en) ? 16'sd0 : {{8{1'b1}}, 8'h80};
+                    end else if (zp_result > $signed(17'sd127)) begin
+                        out_data <= 16'sd127;
+                    end else begin
+                        if (s3_relu_en && zp_result < $signed(17'sd0))
+                            out_data <= 16'sd0;
+                        else
+                            out_data <= {{8{zp_result[7]}}, zp_result[7:0]};
+                    end
                 end
             end
 
@@ -177,6 +212,7 @@ module npu_ppu #(
             s3_zp      <= s2_zp;
             s3_relu_en <= s2_relu_en;
             s3_zp_en   <= s2_zp_en;
+            s3_int16   <= s2_int16;
 
             // ─── Compute Stage 2: multiply (reads current s1 regs) ───
             if (s1_mode == MODE_CONV_REQ)
@@ -191,6 +227,7 @@ module npu_ppu #(
             s2_zp      <= s1_zp;
             s2_relu_en <= s1_relu_en;
             s2_zp_en   <= s1_zp_en;
+            s2_int16   <= s1_int16;
 
             // ─── Compute Stage 1: bias addition (reads input ports) ───
             if (bias_en && mode == MODE_CONV_REQ)
@@ -206,6 +243,7 @@ module npu_ppu #(
             s1_zp      <= zero_point;
             s1_relu_en <= relu_en;
             s1_zp_en   <= zp_en;
+            s1_int16   <= int16_mode;
         end
     end
 

@@ -37,6 +37,7 @@ async def reset_dut(dut):
     dut.ppu_relu_en.value = 0
     dut.ppu_bias_en.value = 1
     dut.ppu_zp_en.value = 1
+    dut.cfg_int16.value = 0     # INT8 mode
     dut.cfg_act_base.value = 0
     dut.cfg_out_base.value = 0
     for _ in range(5):
