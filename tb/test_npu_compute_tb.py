@@ -1261,3 +1261,251 @@ async def test_conv3x3_with_padding(dut):
                 f"Pixel {px}, ch {ch}: got {byte_val}, expected {expected}"
 
     dut._log.info(f"PASS: conv3x3 with padding, all pixels = {expected}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INT16 MODE TESTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def pack_i16x2(s0, s1):
+    """Pack 2 signed int16 into a uint32 (little-endian half-word order)."""
+    def to_u16(v):
+        return v & 0xFFFF
+    return to_u16(s0) | (to_u16(s1) << 16)
+
+
+def unpack_i16(word, idx):
+    """Extract signed int16 at index idx (0 or 1) from a 32-bit word."""
+    val = (word >> (idx * 16)) & 0xFFFF
+    if val >= 0x8000:
+        val -= 0x10000
+    return val
+
+
+@cocotb.test()
+async def test_conv1x1_int16_basic(dut):
+    """INT16 mode: 1x1 conv, identity weights, verify 16-bit dot product.
+
+    in_c=4, out_c=ARRAY_SIZE, all-ones weights, activations=[300, -200, 150, -50].
+    These values exceed INT8 range, confirming 16-bit precision.
+    Expected dot product per column = 300 + (-200) + 150 + (-50) = 200.
+    Passthrough PPU → output should be 200 (lower 16 bits of accumulator).
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+    dut.cfg_int16.value = 1  # INT16 mode
+
+    ARRAY_SIZE = get_array_size(dut)
+    in_c = 4
+
+    # Weights: all ones, INT16 packed — 2 elements per word, 2 words per column
+    for oc in range(ARRAY_SIZE):
+        word_base = oc * (in_c // 2)  # 2 words per column
+        write_sram_word(dut, 'wgt', word_base + 0, pack_i16x2(1, 1))
+        write_sram_word(dut, 'wgt', word_base + 1, pack_i16x2(1, 1))
+
+    # Activations: [300, -200, 150, -50] packed as INT16
+    write_sram_word(dut, 'act', 0, pack_i16x2(300, -200))
+    write_sram_word(dut, 'act', 1, pack_i16x2(150, -50))
+
+    # Params: passthrough
+    for ch in range(ARRAY_SIZE):
+        base = ch * 4
+        write_sram_word(dut, 'param', base + 0, 0x00000001)  # M=1, S=0
+        write_sram_word(dut, 'param', base + 1, 0)
+        write_sram_word(dut, 'param', base + 2, 0)
+        write_sram_word(dut, 'param', base + 3, 0)
+
+    dut.ppu_mode.value = 3  # PASSTHROUGH
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    set_cfg(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=1, kw=1,
+            out_h=1, out_w=1, in_h=1, in_w=1)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=20000), "INT16 conv1x1 timed out"
+
+    # Output: ARRAY_SIZE channels packed 2 per word
+    expected = 200  # sum of [300, -200, 150, -50]
+    n_out_words = ARRAY_SIZE // 2
+    for w in range(n_out_words):
+        out_word = read_sram_word(dut, 'act', w)
+        v0 = unpack_i16(out_word, 0)
+        v1 = unpack_i16(out_word, 1)
+        assert v0 == expected, f"INT16 ch {w*2}: got {v0}, expected {expected}"
+        assert v1 == expected, f"INT16 ch {w*2+1}: got {v1}, expected {expected}"
+
+    dut._log.info(f"PASS: INT16 conv1x1 basic, all channels = {expected}")
+
+
+@cocotb.test()
+async def test_conv1x1_int16_large_values(dut):
+    """INT16 mode: verify large values beyond INT8 range survive the pipeline.
+
+    Weights=[10, 20], activations=[1000, -500]. in_c=2, out_c=ARRAY_SIZE.
+    Expected dot product = 10*1000 + 20*(-500) = 10000 - 10000 = 0.
+
+    Also tests a second case: weights=[3, 7], act=[100, 200].
+    dot = 3*100 + 7*200 = 300 + 1400 = 1700.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+    dut.cfg_int16.value = 1
+
+    ARRAY_SIZE = get_array_size(dut)
+    in_c = 2
+
+    # Weights: [3, 7] for all columns — 1 word per column
+    for oc in range(ARRAY_SIZE):
+        write_sram_word(dut, 'wgt', oc, pack_i16x2(3, 7))
+
+    # Activations: [100, 200]
+    write_sram_word(dut, 'act', 0, pack_i16x2(100, 200))
+
+    # Params: passthrough
+    for ch in range(ARRAY_SIZE):
+        base = ch * 4
+        write_sram_word(dut, 'param', base + 0, 0x00000001)
+        write_sram_word(dut, 'param', base + 1, 0)
+        write_sram_word(dut, 'param', base + 2, 0)
+        write_sram_word(dut, 'param', base + 3, 0)
+
+    dut.ppu_mode.value = 3  # PASSTHROUGH
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    set_cfg(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=1, kw=1,
+            out_h=1, out_w=1, in_h=1, in_w=1)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=20000), "INT16 large values timed out"
+
+    expected = 1700  # 3*100 + 7*200
+    n_out_words = ARRAY_SIZE // 2
+    for w in range(n_out_words):
+        out_word = read_sram_word(dut, 'act', w)
+        v0 = unpack_i16(out_word, 0)
+        v1 = unpack_i16(out_word, 1)
+        assert v0 == expected, f"INT16 ch {w*2}: got {v0}, expected {expected}"
+        assert v1 == expected, f"INT16 ch {w*2+1}: got {v1}, expected {expected}"
+
+    dut._log.info(f"PASS: INT16 large values, all channels = {expected}")
+
+
+@cocotb.test()
+async def test_dw_conv_int16(dut):
+    """INT16 mode: DW Conv 1x1 kernel, single channel, verify accumulation.
+
+    weight=5, activation=400, expected output = 5*400 = 2000 (beyond INT8 range).
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+    dut.cfg_int16.value = 1
+
+    ARRAY_SIZE = get_array_size(dut)
+
+    # DW Conv: op_type=1, kh=1, kw=1, in_c=out_c=1
+    # Weight: single value 5 at word 0
+    write_sram_word(dut, 'wgt', 0, pack_i16x2(5, 0))
+
+    # Activation: single value 400
+    write_sram_word(dut, 'act', 0, pack_i16x2(400, 0))
+
+    # Params for channel 0
+    write_sram_word(dut, 'param', 0, 0x00000001)  # M=1, S=0
+    write_sram_word(dut, 'param', 1, 0)
+    write_sram_word(dut, 'param', 2, 0)
+    write_sram_word(dut, 'param', 3, 0)
+
+    dut.ppu_mode.value = 3  # PASSTHROUGH
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    set_cfg(dut, in_c=1, out_c=1, kh=1, kw=1, out_h=1, out_w=1,
+            in_h=1, in_w=1, op_type=1)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=20000), "INT16 DW conv timed out"
+
+    out_word = read_sram_word(dut, 'act', 0)
+    v0 = unpack_i16(out_word, 0)
+    expected = 2000  # 5 * 400
+    assert v0 == expected, f"INT16 DW conv: got {v0}, expected {expected}"
+
+    dut._log.info(f"PASS: INT16 DW conv 1x1, output = {expected}")
+
+
+@cocotb.test()
+async def test_conv_spatial_2x2_int16(dut):
+    """INT16 mode: 1x1 conv with 2×2 spatial output.
+
+    Verifies writeback packing: 2 int16 values per 32-bit word in NHWC layout.
+    in_c=2, out_c=ARRAY_SIZE, weights=all-ones, activations=all 500.
+    Expected per-channel output = 500*2 = 1000.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+    dut.cfg_int16.value = 1
+
+    ARRAY_SIZE = get_array_size(dut)
+    in_c = 2
+    out_h, out_w = 2, 2
+    in_h, in_w = 2, 2
+
+    # Weights: all ones, 1 word per column (2 elements)
+    for oc in range(ARRAY_SIZE):
+        write_sram_word(dut, 'wgt', oc, pack_i16x2(1, 1))
+
+    # Activations: 2×2 spatial, 2 channels, value=500
+    # NHWC layout: (h, w, c) — 2 channels per word
+    for px in range(out_h * out_w):
+        write_sram_word(dut, 'act', px, pack_i16x2(500, 500))
+
+    # Params: passthrough
+    for ch in range(ARRAY_SIZE):
+        base = ch * 4
+        write_sram_word(dut, 'param', base + 0, 0x00000001)
+        write_sram_word(dut, 'param', base + 1, 0)
+        write_sram_word(dut, 'param', base + 2, 0)
+        write_sram_word(dut, 'param', base + 3, 0)
+
+    dut.ppu_mode.value = 3  # PASSTHROUGH
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    # out_base after input data
+    out_base = out_h * out_w  # 4 words for input
+    set_cfg(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=1, kw=1,
+            out_h=out_h, out_w=out_w, in_h=in_h, in_w=in_w,
+            out_base=out_base)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=50000), "INT16 spatial 2x2 timed out"
+
+    # Verify output: each pixel has ARRAY_SIZE channels, 2 per word
+    expected = 1000  # 1*500 + 1*500
+    for px in range(out_h * out_w):
+        for ch_pair in range(ARRAY_SIZE // 2):
+            word_offset = px * (ARRAY_SIZE // 2) + ch_pair
+            out_word = read_sram_word(dut, 'act', out_base + word_offset)
+            v0 = unpack_i16(out_word, 0)
+            v1 = unpack_i16(out_word, 1)
+            assert v0 == expected, \
+                f"Pixel {px} ch {ch_pair*2}: got {v0}, expected {expected}"
+            assert v1 == expected, \
+                f"Pixel {px} ch {ch_pair*2+1}: got {v1}, expected {expected}"
+
+    dut._log.info(f"PASS: INT16 spatial 2x2, all outputs = {expected}")
