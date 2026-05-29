@@ -223,7 +223,8 @@ module npu_top #(
         .cfg_dma_out_size   (reg_dma_out_size),
         .cfg_param_count    (reg_post_param_count[15:0]),
         .cfg_dma_ctrl       (reg_dma_ctrl),
-        .cfg_layer_mode     (reg_layer_mode)
+        .cfg_layer_mode     (reg_layer_mode),
+        .cfg_out_base       (reg_sram_base[ACT_ADDR_W+16-1:16])
     );
 
     // ════════════════════════════════════════════════════════════════════
@@ -479,7 +480,7 @@ module npu_top #(
         .clk        (clk),
         .rst_n      (rst_n),
         .kernel_h   (reg_kernel_size[3:0]),
-        .kernel_w   (reg_kernel_size[7:4]),
+        .kernel_w   (reg_kernel_size[11:8]),
         .wgt_load   (dw_wgt_load),
         .wgt_valid  (dw_wgt_valid),
         .wgt_data   (dw_wgt_data),
@@ -555,7 +556,7 @@ module npu_top #(
         .start          (compute_start),
         .done           (compute_done_w),
         // Layer config from CSR
-        .cfg_op_type    (reg_layer_mode[7:0]),
+        .cfg_op_type    ({4'd0, reg_layer_mode[3:0]}),
         .cfg_int16      (reg_post_ctrl[7]),
         .cfg_in_c       (reg_in_dim_c[15:0]),
         .cfg_out_h      (reg_out_dim_hw[31:16]),
