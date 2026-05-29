@@ -224,7 +224,8 @@ module npu_compute #(
     reg [1:0]  dw_wgt_bsel_base;       // starting byte offset for weight reads
 
     // ─── Spatial pixel loop (Conv2D Plan A) ───
-    reg [15:0] sp_oh, sp_ow;                  // Current output pixel coordinates
+    reg [15:0] sp_oh, sp_ow;                  // Current output pixel coordinates (tile-local)
+    reg [15:0] tile_oh_origin, tile_ow_origin; // Global origin of current tile
     reg signed [ACC_W-1:0] dot_acc;           // Reduction accumulator
     reg [$clog2(ARRAY_SIZE):0] reduce_cnt;    // Reduction counter
     reg [ACT_ADDR_W-1:0] pixel_act_base;     // Per-pixel activation base address
@@ -302,7 +303,7 @@ module npu_compute #(
             dw_wb_phase <= 0; dw_wb_byte <= 0; dw_wb_bytesel <= 0; dw_wb_addr <= 0;
             dw_wgt_bsel_base <= 0;
             flush_cnt <= 0;
-            sp_oh <= 0; sp_ow <= 0;
+            sp_oh <= 0; sp_ow <= 0; tile_oh_origin <= 0; tile_ow_origin <= 0;
             dot_acc <= 0; reduce_cnt <= 0; pixel_act_base <= 0;
             k_pass <= 0; k_pass_max <= 0; k_pass_remain <= 0;
             conv_fh <= 0; conv_fw <= 0; conv_ch_cnt <= 0;
@@ -362,24 +363,19 @@ module npu_compute #(
                 // Compute base addresses
                 wgt_base <= 0;  // Weight base fixed (all OC weights from start)
                 param_base <= 0;
-                // Input activation base = cfg_act_base + tile offset
-                // In INT16 mode, each element is 2 bytes; in INT8 mode, 1 byte
+                // Input: always use cfg_act_base; tile offset is folded into
+                // conv_ih_base/conv_iw_base via tile_oh_origin/tile_ow_origin
+                // so the padding check and address calc use global coordinates.
+                act_base <= cfg_act_base;
+                tile_oh_origin <= tile_y * out_tile_h;
+                tile_ow_origin <= tile_x * out_tile_w;
+                // Output base includes tile offset
                 if (cfg_int16) begin
-                    act_base <= cfg_act_base
-                               + ((tile_y * out_tile_h * {8'd0, cfg_stride_h}
-                                  * cfg_in_w * cfg_in_c * 16'd2
-                                 + tile_x * out_tile_w * {8'd0, cfg_stride_w}
-                                  * cfg_in_c * 16'd2) >> 2);
                     out_base <= cfg_out_base
                                + ((tile_y * out_tile_h * cfg_out_w
                                   * cfg_out_c * 16'd2
                                  + tile_x * out_tile_w * cfg_out_c * 16'd2) >> 2);
                 end else begin
-                    act_base <= cfg_act_base
-                               + ((tile_y * out_tile_h * {8'd0, cfg_stride_h}
-                                  * cfg_in_w * cfg_in_c
-                                 + tile_x * out_tile_w * {8'd0, cfg_stride_w}
-                                  * cfg_in_c) >> 2);
                     out_base <= cfg_out_base
                                + ((tile_y * out_tile_h * cfg_out_w
                                   * cfg_out_c
@@ -873,9 +869,10 @@ module npu_compute #(
             // ══════════════════════════════════════════════════════════════
             S_SPATIAL_SETUP: begin
                 // Compute input window origin for output pixel (sp_oh, sp_ow)
-                conv_ih_base <= $signed({1'b0, sp_oh}) * $signed({1'b0, cfg_stride_h[7:0]})
+                // Use global output coordinates for input address & padding check
+                conv_ih_base <= $signed({1'b0, tile_oh_origin + sp_oh}) * $signed({1'b0, cfg_stride_h[7:0]})
                               - $signed({1'b0, cfg_pad_top[7:0]});
-                conv_iw_base <= $signed({1'b0, sp_ow}) * $signed({1'b0, cfg_stride_w[7:0]})
+                conv_iw_base <= $signed({1'b0, tile_ow_origin + sp_ow}) * $signed({1'b0, cfg_stride_w[7:0]})
                               - $signed({1'b0, cfg_pad_left[7:0]});
 
                 // Compute starting (fh, fw, ch) from k_pass offset
@@ -1119,9 +1116,9 @@ module npu_compute #(
                 begin : dw_act_stream_blk
                     reg signed [15:0] ih_s, iw_s;
                     reg               is_pad;
-                    ih_s = $signed({1'b0, dw_oh}) * $signed({1'b0, cfg_stride_h[7:0]})
+                    ih_s = $signed({1'b0, tile_oh_origin + dw_oh}) * $signed({1'b0, cfg_stride_h[7:0]})
                          - $signed({1'b0, cfg_pad_top[7:0]}) + $signed({1'b0, dw_fh});
-                    iw_s = $signed({1'b0, dw_ow}) * $signed({1'b0, cfg_stride_w[7:0]})
+                    iw_s = $signed({1'b0, tile_ow_origin + dw_ow}) * $signed({1'b0, cfg_stride_w[7:0]})
                          - $signed({1'b0, cfg_pad_left[7:0]}) + $signed({1'b0, dw_fw});
                     is_pad = (ih_s < 0) || (ih_s >= $signed({1'b0, cfg_in_h}))
                           || (iw_s < 0) || (iw_s >= $signed({1'b0, cfg_in_w}));

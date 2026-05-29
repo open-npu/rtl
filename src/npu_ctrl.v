@@ -53,7 +53,8 @@ module npu_ctrl (
     input  wire [31:0]  cfg_dma_out_size,    // in bytes
     input  wire [15:0]  cfg_param_count,     // number of output channels
     input  wire [31:0]  cfg_dma_ctrl,        // sched_ctrl: [0]=DB_EN, [1]=FUSE_START, [2]=FUSE_MID, [3]=FUSE_END
-    input  wire [31:0]  cfg_layer_mode       // OP type + data type
+    input  wire [31:0]  cfg_layer_mode,      // OP type + data type
+    input  wire [15:0]  cfg_out_base         // Output base address in SRAM (word addr)
 );
 
     // ─── FSM States ───
@@ -231,7 +232,7 @@ module npu_ctrl (
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b1;  // store
                         dma_ext_addr  <= cfg_dma_out_addr;
-                        dma_sram_addr <= 16'd0;
+                        dma_sram_addr <= cfg_out_base;
                         dma_xfer_len  <= out_words;
                         state         <= S_WAIT_STORE;
                     end else begin

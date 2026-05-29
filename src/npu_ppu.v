@@ -201,7 +201,14 @@ module npu_ppu #(
                 else
                     rounded_v = s2_product;
                 shifted_full = rounded_v >>> shift_amt;
-                shifted_v = shifted_full[ZP_W:0];
+                // Saturate to 17-bit signed range to avoid truncation overflow
+                // 17-bit signed: [-65536, +65535]
+                if (shifted_full > 55'sd65535)
+                    shifted_v = 17'sd65535;
+                else if (shifted_full < -55'sd65536)
+                    shifted_v = -17'sd65536;
+                else
+                    shifted_v = shifted_full[ZP_W:0];
             end else begin
                 shifted_v = s2_product[ZP_W:0];
             end
