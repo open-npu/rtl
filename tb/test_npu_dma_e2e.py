@@ -654,3 +654,382 @@ async def test_dma_e2e_tiling_int16(dut):
         assert ok, detail
 
     dut._log.info("[INT16 32x32] All 6 layers PASSED - tiling verified!")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Pooling + Add test imports
+# ═══════════════════════════════════════════════════════════════════════
+
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gen_dma_e2e_golden import gen_pooling_test, gen_add_test
+
+
+# DDR addresses for operator tests
+POOL_WGT_ADDR   = 0x1000_0000
+POOL_PARAM_ADDR = 0x2000_0000
+POOL_IN_ADDR    = 0x3000_0000
+POOL_OUT_ADDR   = 0x3001_0000
+ADD_B_ADDR      = 0x4000_0000
+ADD_PARAM_ADDR  = 0x2001_0000
+
+
+async def program_pooling_layer(wb, meta, data):
+    """Program CSR registers for a pooling test layer."""
+    # LAYER_MODE: op_type=3 | (data_type << 4)
+    await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
+
+    # Dimensions
+    await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
+    await wb.write(0x048, meta['in_c'])
+    await wb.write(0x04C, (meta['out_h'] << 16) | meta['out_w'])
+    await wb.write(0x050, meta['out_c'])
+
+    # Kernel & stride & padding (used by tiling / addr calc)
+    await wb.write(0x054, meta['kernel_h'] | (meta['kernel_w'] << 8))
+    await wb.write(0x058, meta['stride_h'] | (meta['stride_w'] << 8))
+    await wb.write(0x05C, meta['pad_top'] | (meta['pad_left'] << 8))
+
+    # POOL_CFG register (0x060)
+    await wb.write(0x060, meta['pool_cfg'])
+
+    # Tiling: no tiling
+    await wb.write(0x070, 0)
+    await wb.write(0x074, (1 << 16) | 1)
+
+    # SRAM_BASE: act_base=0, out_base after input
+    out_base = meta['n_input_words']
+    await wb.write(0x078, (out_base << 16) | 0)
+
+    # DMA addresses
+    await wb.write(0x100, POOL_IN_ADDR)
+    await wb.write(0x104, POOL_OUT_ADDR)
+    await wb.write(0x108, POOL_WGT_ADDR)
+    await wb.write(0x10C, POOL_PARAM_ADDR)
+
+    # DMA sizes
+    await wb.write(0x128, meta['dma_in_size'])
+    await wb.write(0x12C, meta['dma_wgt_size'])  # 0 for pooling
+    await wb.write(0x130, meta['dma_out_size'])
+
+    # Post-processing
+    await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x188, meta['dma_param_count'])
+
+    # No fusion
+    await wb.write(0x118, 0)
+
+
+async def program_add_layer(wb, meta, data):
+    """Program CSR registers for an eltwise add test layer."""
+    # LAYER_MODE: op_type=4 | (data_type << 4)
+    await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
+
+    # Dimensions
+    await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
+    await wb.write(0x048, meta['in_c'])
+    await wb.write(0x04C, (meta['out_h'] << 16) | meta['out_w'])
+    await wb.write(0x050, meta['out_c'])
+
+    # Kernel, stride, padding (1x1, stride 1, no pad)
+    await wb.write(0x054, 1 | (1 << 8))
+    await wb.write(0x058, 1 | (1 << 8))
+    await wb.write(0x05C, 0)
+
+    # Tiling: no tiling
+    await wb.write(0x070, 0)
+    await wb.write(0x074, (1 << 16) | 1)
+
+    # SRAM_BASE: act_base=0, out_base after input A
+    out_base = meta['n_input_words']
+    await wb.write(0x078, (out_base << 16) | 0)
+
+    # DMA addresses
+    await wb.write(0x100, POOL_IN_ADDR)     # Input A from DDR
+    await wb.write(0x104, POOL_OUT_ADDR)    # Output to DDR (reads from out_base in SRAM)
+    await wb.write(0x108, POOL_WGT_ADDR)    # No weights
+    await wb.write(0x10C, ADD_PARAM_ADDR)   # Add params (2 words)
+    await wb.write(0x120, ADD_B_ADDR)       # DMA_ADD_B_ADDR
+
+    # DMA sizes
+    await wb.write(0x128, meta['dma_in_size'])
+    await wb.write(0x12C, 0)  # No weights
+    await wb.write(0x130, meta['dma_out_size'])
+
+    # Post-processing
+    await wb.write(0x180, meta['post_ctrl'])
+    # Param count: for Add, the per-channel PPU params are not used.
+    # The add params (2 words) are loaded to param SRAM via DMA_PARAM_ADDR.
+    # We load 2 words (set param_count such that param_words=2 → count=0 special case).
+    # Actually the controller loads param_count*4 words. We have 2 words.
+    # Let's just set param_count=1 (loads 4 words, only first 2 matter).
+    await wb.write(0x188, 1)
+
+    # No fusion
+    await wb.write(0x118, 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: MaxPool 2x2 stride 2, INT8
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_pool_max_2x2_s2(dut):
+    """MaxPool 2x2 stride 2, 4x4x8 -> 2x2x8, INT8."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_pooling_test(mode='max', pool_h=2, pool_w=2,
+                                  pool_sh=2, pool_sw=2,
+                                  in_h=4, in_w=4, in_c=8, seed=42)
+
+    # Populate DDR
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    # Program and run
+    await program_pooling_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=100000)
+    assert done, "MaxPool 2x2 did not complete"
+
+    # Verify output
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"MaxPool: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"MaxPool 2x2 PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: AvgPool 2x2 stride 2, INT8
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_pool_avg_2x2_s2(dut):
+    """AvgPool 2x2 stride 2, 4x4x8 -> 2x2x8, INT8."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_pooling_test(mode='avg', pool_h=2, pool_w=2,
+                                  pool_sh=2, pool_sw=2,
+                                  in_h=4, in_w=4, in_c=8, seed=43)
+
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_pooling_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=100000)
+    assert done, "AvgPool 2x2 did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"AvgPool: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"AvgPool 2x2 PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Global AvgPool, INT8
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_pool_avg_global(dut):
+    """Global AvgPool 4x4x4 -> 1x1x4, INT8."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_pooling_test(mode='avg', pool_h=4, pool_w=4,
+                                  pool_sh=4, pool_sw=4,
+                                  in_h=4, in_w=4, in_c=4,
+                                  global_pool=True, seed=44)
+
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_pooling_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=100000)
+    assert done, "Global AvgPool did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"GlobalPool: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"Global AvgPool PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Eltwise Add basic, INT8
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_add_basic(dut):
+    """Eltwise Add 4x4x8 with relu, INT8."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_add_test(h=4, w=4, c=8, relu=True, int16_mode=False, seed=100)
+
+    # Populate DDR: input A, input B, add params
+    mem.populate(POOL_IN_ADDR, data['input_a_words'])
+    mem.populate(ADD_B_ADDR, data['input_b_words'])
+    mem.populate(ADD_PARAM_ADDR, data['add_param_words'])
+
+    await program_add_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=200000)
+    assert done, "Add basic did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"Add basic: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"Add basic PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Eltwise Add no relu, INT8
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_add_no_relu(dut):
+    """Eltwise Add 4x4x8 without relu, INT8."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_add_test(h=4, w=4, c=8, relu=False, int16_mode=False, seed=101)
+
+    mem.populate(POOL_IN_ADDR, data['input_a_words'])
+    mem.populate(ADD_B_ADDR, data['input_b_words'])
+    mem.populate(ADD_PARAM_ADDR, data['add_param_words'])
+
+    await program_add_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=200000)
+    assert done, "Add no_relu did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"Add no_relu: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"Add no_relu PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Eltwise Add, INT16
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_add_int16(dut):
+    """Eltwise Add 4x4x4 with relu, INT16."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_add_test(h=4, w=4, c=4, relu=True, int16_mode=True, seed=102)
+
+    mem.populate(POOL_IN_ADDR, data['input_a_words'])
+    mem.populate(ADD_B_ADDR, data['input_b_words'])
+    mem.populate(ADD_PARAM_ADDR, data['add_param_words'])
+
+    await program_add_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=200000)
+    assert done, "Add INT16 did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"Add INT16: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"Add INT16 PASSED: {n_words} words bit-exact")

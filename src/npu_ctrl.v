@@ -54,7 +54,8 @@ module npu_ctrl (
     input  wire [15:0]  cfg_param_count,     // number of output channels
     input  wire [31:0]  cfg_dma_ctrl,        // sched_ctrl: [0]=DB_EN, [1]=FUSE_START, [2]=FUSE_MID, [3]=FUSE_END
     input  wire [31:0]  cfg_layer_mode,      // OP type + data type
-    input  wire [15:0]  cfg_out_base         // Output base address in SRAM (word addr)
+    input  wire [15:0]  cfg_out_base,        // Output base address in SRAM (word addr)
+    input  wire [31:0]  cfg_dma_add_b_addr   // DDR address of Add Branch B data
 );
 
     // ─── FSM States ───
@@ -71,6 +72,8 @@ module npu_ctrl (
     localparam S_WAIT_STORE = 4'd10;
     localparam S_DONE       = 4'd11;
     localparam S_ERROR      = 4'd12;
+    localparam S_LOAD_ADD_B = 4'd13;  // DMA: load Add Branch B
+    localparam S_WAIT_ADD_B = 4'd14;
 
     reg [3:0] state;
 
@@ -160,7 +163,10 @@ module npu_ctrl (
                         state <= S_DONE;
                     end else if (skip_act_load || in_words == 0) begin
                         // Fused mid/end: input already in SRAM, skip load
-                        state <= S_LOAD_PARAM;
+                        if (cfg_layer_mode[3:0] == 4'd4)
+                            state <= S_LOAD_ADD_B;
+                        else
+                            state <= S_LOAD_PARAM;
                     end else begin
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;
@@ -175,7 +181,10 @@ module npu_ctrl (
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else if (dma_done) begin
-                        state <= S_LOAD_PARAM;
+                        if (cfg_layer_mode[3:0] == 4'd4)
+                            state <= S_LOAD_ADD_B;
+                        else
+                            state <= S_LOAD_PARAM;
                     end
                 end
 
@@ -245,6 +254,30 @@ module npu_ctrl (
                         state <= S_DONE;
                     end else if (dma_done) begin
                         state <= S_DONE;
+                    end
+                end
+
+                // ─── Phase 2b: Load Add Branch B (op_type==4 only) ───
+                S_LOAD_ADD_B: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else if (cfg_dma_add_b_addr != 0 && in_words != 0) begin
+                        dma_start     <= 1'b1;
+                        dma_dir       <= 1'b0;  // load
+                        dma_ext_addr  <= cfg_dma_add_b_addr;
+                        dma_sram_addr <= cfg_out_base;
+                        dma_xfer_len  <= in_words;
+                        state         <= S_WAIT_ADD_B;
+                    end else begin
+                        state <= S_LOAD_PARAM;
+                    end
+                end
+
+                S_WAIT_ADD_B: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else if (dma_done) begin
+                        state <= S_LOAD_PARAM;
                     end
                 end
 

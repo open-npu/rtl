@@ -57,6 +57,7 @@ module npu_compute #(
     input  wire [15:0]                  cfg_in_h,
     input  wire [ACT_ADDR_W-1:0]        cfg_act_base,   // Input activation base (word addr)
     input  wire [ACT_ADDR_W-1:0]        cfg_out_base,   // Output base (word addr in act SRAM)
+    input  wire [31:0]                  cfg_pool_cfg,   // Pooling config register
 
     // ─── Weight SRAM Port B (read-only) ───
     output reg                          wgt_rd_en,
@@ -122,39 +123,60 @@ module npu_compute #(
     localparam [15:0] ARRAY_SIZE_16 = ARRAY_SIZE;  // 16-bit for comparisons
 
     // ─── FSM States ───
-    localparam [4:0]
-        S_IDLE        = 5'd0,
-        S_TILE_SETUP  = 5'd1,
-        S_OC_SETUP    = 5'd2,
-        S_WGT_CMD     = 5'd3,
-        S_WGT_LOAD    = 5'd4,   // Read+fill wgt_data for one column
-        S_WGT_EMIT    = 5'd5,   // Pulse wgt_valid
-        S_ACT_CMD     = 5'd6,
-        S_ACT_LOAD    = 5'd7,   // Read activation word from SRAM
-        S_ACT_EMIT    = 5'd8,   // Pulse act_valid with one byte
-        S_ACT_FLUSH   = 5'd9,
-        S_DRAIN_CMD   = 5'd10,
-        S_DRAIN_WAIT  = 5'd11,
-        S_PARAM_LOAD  = 5'd12,
-        S_PPU_FEED    = 5'd13,
-        S_PPU_WAIT    = 5'd14,
-        S_WRITEBACK   = 5'd15,
-        S_OC_NEXT     = 5'd16,
-        S_TILE_NEXT   = 5'd17,
-        S_DONE        = 5'd18,
-        S_DW_WGT_LOAD = 5'd19,
-        S_DW_COMPUTE  = 5'd20,
-        S_DW_DRAIN    = 5'd21,
-        S_DW_PARAM    = 5'd22,
-        S_DW_PPU      = 5'd23,
-        S_DW_ACT_STREAM = 5'd24,
-        S_DW_PPU_WAIT   = 5'd25,
-        S_DW_WB         = 5'd26,
-        S_SPATIAL_SETUP = 5'd27,
-        S_REDUCE        = 5'd28,
-        S_PIXEL_NEXT    = 5'd29;
+    localparam [5:0]
+        S_IDLE        = 6'd0,
+        S_TILE_SETUP  = 6'd1,
+        S_OC_SETUP    = 6'd2,
+        S_WGT_CMD     = 6'd3,
+        S_WGT_LOAD    = 6'd4,   // Read+fill wgt_data for one column
+        S_WGT_EMIT    = 6'd5,   // Pulse wgt_valid
+        S_ACT_CMD     = 6'd6,
+        S_ACT_LOAD    = 6'd7,   // Read activation word from SRAM
+        S_ACT_EMIT    = 6'd8,   // Pulse act_valid with one byte
+        S_ACT_FLUSH   = 6'd9,
+        S_DRAIN_CMD   = 6'd10,
+        S_DRAIN_WAIT  = 6'd11,
+        S_PARAM_LOAD  = 6'd12,
+        S_PPU_FEED    = 6'd13,
+        S_PPU_WAIT    = 6'd14,
+        S_WRITEBACK   = 6'd15,
+        S_OC_NEXT     = 6'd16,
+        S_TILE_NEXT   = 6'd17,
+        S_DONE        = 6'd18,
+        S_DW_WGT_LOAD = 6'd19,
+        S_DW_COMPUTE  = 6'd20,
+        S_DW_DRAIN    = 6'd21,
+        S_DW_PARAM    = 6'd22,
+        S_DW_PPU      = 6'd23,
+        S_DW_ACT_STREAM = 6'd24,
+        S_DW_PPU_WAIT   = 6'd25,
+        S_DW_WB         = 6'd26,
+        S_SPATIAL_SETUP = 6'd27,
+        S_REDUCE        = 6'd28,
+        S_PIXEL_NEXT    = 6'd29,
+        // Pooling states
+        S_POOL_SETUP    = 6'd30,
+        S_POOL_CH_SETUP = 6'd31,
+        S_POOL_READ     = 6'd32,
+        S_POOL_ACC      = 6'd33,
+        S_POOL_DIV      = 6'd34,
+        S_POOL_PPU      = 6'd35,
+        S_POOL_PPU_WAIT = 6'd36,
+        S_POOL_WB       = 6'd37,
+        S_POOL_PIX_NEXT = 6'd38,
+        S_POOL_CH_NEXT  = 6'd39,
+        // Eltwise Add states
+        S_ADD_SETUP     = 6'd40,
+        S_ADD_PARAM     = 6'd41,
+        S_ADD_READ_A    = 6'd42,
+        S_ADD_READ_B    = 6'd43,
+        S_ADD_COMPUTE   = 6'd44,
+        S_ADD_PPU       = 6'd45,
+        S_ADD_PPU_WAIT  = 6'd46,
+        S_ADD_WB        = 6'd47,
+        S_ADD_NEXT      = 6'd48;
 
-    reg [4:0] state;
+    reg [5:0] state;
 
     // ─── Tile iteration ───
     reg [15:0] tile_y, tile_x;
@@ -247,6 +269,40 @@ module npu_compute #(
     // ─── Flush counter (reused) ───
     reg [15:0] flush_cnt;
 
+    // ─── Pooling state ───
+    wire        pool_mode     = cfg_pool_cfg[0];      // 0=Max, 1=Avg
+    wire [3:0]  pool_cfg_h    = cfg_pool_cfg[7:4];
+    wire [3:0]  pool_cfg_w    = cfg_pool_cfg[11:8];
+    wire [3:0]  pool_cfg_sh   = cfg_pool_cfg[15:12];
+    wire [3:0]  pool_cfg_sw   = cfg_pool_cfg[19:16];
+    wire        global_pool   = cfg_pool_cfg[20];
+    reg signed [ACC_W-1:0] pool_acc;     // Running sum or max
+    reg [15:0]             pool_count;   // Valid element count (AvgPool)
+    reg [3:0]              pool_fh, pool_fw; // Window position
+    reg [15:0]             pool_oh, pool_ow; // Output pixel coords
+    reg [15:0]             pool_ch;          // Current channel
+    reg [7:0]              pool_kh, pool_kw; // Effective kernel size
+    reg [7:0]              pool_sh, pool_sw; // Effective stride
+    reg [1:0]              pool_rd_phase;    // SRAM read phasing
+    reg [1:0]              pool_wb_phase;    // Writeback phasing
+    reg [ACT_ADDR_W-1:0]  pool_wb_addr;     // Writeback word address
+    reg [1:0]              pool_wb_bytesel;  // Writeback byte select
+    reg [15:0]             pool_wb_byte;     // PPU output to write
+
+    // ─── Eltwise Add state ───
+    reg [14:0] add_M_A, add_M_B;
+    reg [5:0]  add_S_A, add_S_B;
+    reg signed [ACC_W-1:0] add_val_a, add_val_b;
+    reg [15:0] add_elem_cnt;      // Current element index (flat)
+    reg [15:0] add_total_elems;   // H * W * C
+    reg [1:0]  add_rd_phase;      // SRAM read phasing
+    reg [1:0]  add_param_phase;   // Param read phasing
+    reg [1:0]  add_param_idx;     // Which param word (0 or 1)
+    reg [1:0]  add_wb_phase;      // Writeback phasing
+    reg [ACT_ADDR_W-1:0]  add_wb_addr;     // Writeback word address
+    reg [1:0]             add_wb_bytesel;  // Writeback byte select
+    reg [15:0]            add_wb_byte;     // PPU output to write
+
     integer i;
 
     // ════════════════════════════════════════════════════════════════════
@@ -309,6 +365,18 @@ module npu_compute #(
             conv_fh <= 0; conv_fw <= 0; conv_ch_cnt <= 0;
             conv_ih_base <= 0; conv_iw_base <= 0; conv_is_pad <= 0;
             conv_elem_cnt <= 0;
+            // Pooling resets
+            pool_acc <= 0; pool_count <= 0;
+            pool_fh <= 0; pool_fw <= 0; pool_oh <= 0; pool_ow <= 0;
+            pool_ch <= 0; pool_kh <= 0; pool_kw <= 0; pool_sh <= 0; pool_sw <= 0;
+            pool_rd_phase <= 0; pool_wb_phase <= 0;
+            pool_wb_addr <= 0; pool_wb_bytesel <= 0; pool_wb_byte <= 0;
+            // Add resets
+            add_M_A <= 0; add_M_B <= 0; add_S_A <= 0; add_S_B <= 0;
+            add_val_a <= 0; add_val_b <= 0;
+            add_elem_cnt <= 0; add_total_elems <= 0;
+            add_rd_phase <= 0; add_param_phase <= 0; add_param_idx <= 0;
+            add_wb_phase <= 0; add_wb_addr <= 0; add_wb_bytesel <= 0; add_wb_byte <= 0;
             for (i = 0; i < ARRAY_SIZE; i = i + 1) begin
                 sa_wgt_data[i] <= 0;
                 sa_act_data[i] <= 0;
@@ -337,7 +405,7 @@ module npu_compute #(
             // ══════════════════════════════════════════════════════════════
             S_IDLE: begin
                 if (start) begin
-                    if (cfg_op_type == 8'd1)
+                    if (cfg_op_type == 8'd1 || cfg_op_type == 8'd3)
                         oc_groups_total <= cfg_out_c;
                     else
                         oc_groups_total <= (cfg_out_c + ARRAY_SIZE_16 - 1) / ARRAY_SIZE_16;
@@ -389,6 +457,10 @@ module npu_compute #(
                     dw_read_issued <= 1'b0;
                     dw_init_phase <= 2'd0;
                     state <= S_DW_WGT_LOAD;
+                end else if (cfg_op_type == 8'd3) begin
+                    state <= S_POOL_SETUP;
+                end else if (cfg_op_type == 8'd4) begin
+                    state <= S_ADD_SETUP;
                 end else begin
                     state <= S_OC_SETUP;
                 end
@@ -1290,6 +1362,471 @@ module npu_compute #(
             S_DW_PPU: begin
                 // No longer used (writeback handled in S_DW_WB)
                 state <= S_OC_NEXT;
+            end
+
+            // ══════════════════════════════════════════════════════════════
+            // POOLING Path (op_type=3)
+            // Flow: SETUP → CH_SETUP → [READ → ACC]* → DIV → PPU → PPU_WAIT → WB → PIX_NEXT → CH_NEXT
+            // ══════════════════════════════════════════════════════════════
+            S_POOL_SETUP: begin
+                // Latch effective pool kernel/stride (global override)
+                if (global_pool) begin
+                    pool_kh <= cfg_in_h[7:0];
+                    pool_kw <= cfg_in_w[7:0];
+                    pool_sh <= cfg_in_h[7:0];
+                    pool_sw <= cfg_in_w[7:0];
+                end else begin
+                    pool_kh <= {4'd0, pool_cfg_h};
+                    pool_kw <= {4'd0, pool_cfg_w};
+                    pool_sh <= {4'd0, pool_cfg_sh};
+                    pool_sw <= {4'd0, pool_cfg_sw};
+                end
+                pool_ch <= 0;
+                param_word_idx <= 0;
+                param_read_issued <= 1'b0;
+                state <= S_POOL_CH_SETUP;
+            end
+
+            S_POOL_CH_SETUP: begin
+                // Load 4 PPU param words for current channel (same as DW_PARAM)
+                if (!param_read_issued) begin
+                    param_rd_en   <= 1'b1;
+                    param_rd_addr <= (pool_ch * 4) + param_word_idx;
+                    param_read_issued <= 1'b1;
+                    act_read_issued <= 1'b0;
+                end else if (!act_read_issued) begin
+                    act_read_issued <= 1'b1;
+                end else begin
+                    param_buf[param_word_idx] <= param_rd_data;
+                    if (param_word_idx == 3'd3) begin
+                        ppu_mult_m     <= param_buf[0][14:0];
+                        ppu_shift_s    <= param_buf[0][21:16];
+                        ppu_zero_point <= $signed(param_buf[1][15:0]);
+                        ppu_bias       <= $signed({param_buf[3][15:0], param_buf[2],
+                                                   param_buf[1][31:16]});
+                        // Start spatial loop for this channel
+                        pool_oh <= 0;
+                        pool_ow <= 0;
+                        pool_fh <= 0;
+                        pool_fw <= 0;
+                        pool_rd_phase <= 0;
+                        // Initialize accumulator
+                        if (pool_mode) begin
+                            pool_acc <= 0;  // AvgPool: sum=0
+                        end else begin
+                            pool_acc <= {1'b1, {(ACC_W-1){1'b0}}};  // MaxPool: -2^(ACC_W-1)
+                        end
+                        pool_count <= 0;
+                        state <= S_POOL_READ;
+                    end else begin
+                        param_word_idx <= param_word_idx + 1;
+                        param_read_issued <= 1'b0;
+                    end
+                end
+            end
+
+            S_POOL_READ: begin
+                // Compute input coords, bounds-check, issue SRAM read
+                begin : pool_read_blk
+                    reg signed [15:0] ih_s, iw_s;
+                    reg               is_oob;
+                    ih_s = $signed({1'b0, tile_oh_origin + pool_oh}) * $signed({1'b0, pool_sh})
+                         - $signed({1'b0, cfg_pad_top[7:0]}) + $signed({1'b0, pool_fh});
+                    iw_s = $signed({1'b0, tile_ow_origin + pool_ow}) * $signed({1'b0, pool_sw})
+                         - $signed({1'b0, cfg_pad_left[7:0]}) + $signed({1'b0, pool_fw});
+                    is_oob = (ih_s < 0) || (ih_s >= $signed({1'b0, cfg_in_h}))
+                          || (iw_s < 0) || (iw_s >= $signed({1'b0, cfg_in_w}));
+
+                    if (is_oob) begin
+                        // Out-of-bounds: skip, advance window position
+                        if ({4'd0, pool_fw} + 1 >= pool_kw) begin
+                            pool_fw <= 0;
+                            if ({4'd0, pool_fh} + 1 >= pool_kh) begin
+                                // Window complete
+                                state <= S_POOL_DIV;
+                            end else begin
+                                pool_fh <= pool_fh + 1;
+                            end
+                        end else begin
+                            pool_fw <= pool_fw + 1;
+                        end
+                    end else if (pool_rd_phase == 0) begin
+                        // Issue SRAM read
+                        begin : pool_addr_calc
+                            reg [31:0] elem_off;
+                            reg [31:0] byte_off;
+                            elem_off = (ih_s[15:0] * cfg_in_w * cfg_in_c)
+                                     + (iw_s[15:0] * cfg_in_c)
+                                     + pool_ch;
+                            byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                            act_rd_en   <= 1'b1;
+                            act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
+                            act_byte_sel <= byte_off[1:0];
+                        end
+                        pool_rd_phase <= 1;
+                    end else if (pool_rd_phase == 1) begin
+                        // Wait for SRAM latency
+                        pool_rd_phase <= 2;
+                    end else begin
+                        // Data available — go to ACC
+                        pool_rd_phase <= 0;
+                        state <= S_POOL_ACC;
+                    end
+                end
+            end
+
+            S_POOL_ACC: begin
+                // Extract element and accumulate
+                begin : pool_acc_blk
+                    reg signed [ACC_W-1:0] val;
+                    if (cfg_int16) begin
+                        case (act_byte_sel[1])
+                            1'b0: val = $signed(act_rd_data[15:0]);
+                            1'b1: val = $signed(act_rd_data[31:16]);
+                        endcase
+                    end else begin
+                        case (act_byte_sel)
+                            2'd0: val = {{(ACC_W-8){act_rd_data[7]}},  act_rd_data[7:0]};
+                            2'd1: val = {{(ACC_W-8){act_rd_data[15]}}, act_rd_data[15:8]};
+                            2'd2: val = {{(ACC_W-8){act_rd_data[23]}}, act_rd_data[23:16]};
+                            2'd3: val = {{(ACC_W-8){act_rd_data[31]}}, act_rd_data[31:24]};
+                        endcase
+                    end
+
+                    if (pool_mode) begin
+                        // AvgPool: accumulate sum
+                        pool_acc <= pool_acc + val;
+                    end else begin
+                        // MaxPool: keep max
+                        if (val > pool_acc)
+                            pool_acc <= val;
+                    end
+                    pool_count <= pool_count + 1;
+                end
+
+                // Advance window position
+                if ({4'd0, pool_fw} + 1 >= pool_kw) begin
+                    pool_fw <= 0;
+                    if ({4'd0, pool_fh} + 1 >= pool_kh) begin
+                        // Window complete
+                        state <= S_POOL_DIV;
+                    end else begin
+                        pool_fh <= pool_fh + 1;
+                        state <= S_POOL_READ;
+                    end
+                end else begin
+                    pool_fw <= pool_fw + 1;
+                    state <= S_POOL_READ;
+                end
+            end
+
+            S_POOL_DIV: begin
+                // AvgPool: symmetric rounding division
+                // MaxPool: pass through
+                if (pool_mode && pool_count > 0) begin
+                    begin : pool_div_blk
+                        reg signed [ACC_W-1:0] rounded;
+                        reg signed [ACC_W-1:0] half_count;
+                        half_count = pool_count >> 1;
+                        if (pool_acc >= 0)
+                            rounded = pool_acc + half_count;
+                        else
+                            rounded = pool_acc - half_count;
+                        pool_acc <= rounded / $signed({1'b0, pool_count});
+                    end
+                end
+                state <= S_POOL_PPU;
+            end
+
+            S_POOL_PPU: begin
+                // Feed pool_acc to PPU (CONV_REQ mode)
+                ppu_acc_in   <= pool_acc;
+                ppu_in_valid <= 1'b1;
+                state <= S_POOL_PPU_WAIT;
+            end
+
+            S_POOL_PPU_WAIT: begin
+                if (ppu_out_valid) begin
+                    // Compute writeback address
+                    begin : pool_wb_addr_calc
+                        reg [31:0] elem_off;
+                        reg [31:0] byte_off;
+                        elem_off = (pool_oh * out_tile_w + pool_ow)
+                                 * cfg_out_c + pool_ch;
+                        byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                        pool_wb_addr    <= out_base + byte_off[ACT_ADDR_W+1:2];
+                        pool_wb_bytesel <= byte_off[1:0];
+                    end
+                    pool_wb_byte <= ppu_out_data;
+                    pool_wb_phase <= 2'd0;
+                    state <= S_POOL_WB;
+                end
+            end
+
+            S_POOL_WB: begin
+                // Read-modify-write (same pattern as S_DW_WB)
+                case (pool_wb_phase)
+                2'd0: begin
+                    act_rd_en   <= 1'b1;
+                    act_rd_addr <= pool_wb_addr;
+                    pool_wb_phase <= 2'd1;
+                end
+                2'd1: begin
+                    pool_wb_phase <= 2'd2;
+                end
+                2'd2: begin
+                    begin : pool_wb_merge
+                        reg [31:0] merged;
+                        merged = act_rd_data;
+                        if (cfg_int16) begin
+                            case (pool_wb_bytesel[1])
+                                1'b0: merged[15:0]  = pool_wb_byte;
+                                1'b1: merged[31:16] = pool_wb_byte;
+                            endcase
+                        end else begin
+                            case (pool_wb_bytesel)
+                                2'd0: merged[7:0]   = pool_wb_byte[7:0];
+                                2'd1: merged[15:8]  = pool_wb_byte[7:0];
+                                2'd2: merged[23:16] = pool_wb_byte[7:0];
+                                2'd3: merged[31:24] = pool_wb_byte[7:0];
+                            endcase
+                        end
+                        act_wr_en   <= 1'b1;
+                        act_wr_addr <= pool_wb_addr;
+                        act_wr_data <= merged;
+                    end
+                    state <= S_POOL_PIX_NEXT;
+                end
+                default: pool_wb_phase <= 2'd0;
+                endcase
+            end
+
+            S_POOL_PIX_NEXT: begin
+                // Advance output pixel, reset window for next pixel
+                pool_fh <= 0;
+                pool_fw <= 0;
+                pool_rd_phase <= 0;
+                if (pool_mode) begin
+                    pool_acc <= 0;
+                end else begin
+                    pool_acc <= {1'b1, {(ACC_W-1){1'b0}}};
+                end
+                pool_count <= 0;
+
+                if (pool_ow + 1 >= out_tile_w) begin
+                    pool_ow <= 0;
+                    if (pool_oh + 1 >= out_tile_h) begin
+                        state <= S_POOL_CH_NEXT;
+                    end else begin
+                        pool_oh <= pool_oh + 1;
+                        state <= S_POOL_READ;
+                    end
+                end else begin
+                    pool_ow <= pool_ow + 1;
+                    state <= S_POOL_READ;
+                end
+            end
+
+            S_POOL_CH_NEXT: begin
+                if (pool_ch + 1 >= cfg_out_c) begin
+                    state <= S_TILE_NEXT;
+                end else begin
+                    pool_ch <= pool_ch + 1;
+                    param_word_idx <= 0;
+                    param_read_issued <= 1'b0;
+                    state <= S_POOL_CH_SETUP;
+                end
+            end
+
+            // ══════════════════════════════════════════════════════════════
+            // Eltwise Add Path (op_type=4)
+            // Flow: SETUP → PARAM → [READ_A → READ_B → COMPUTE → PPU → PPU_WAIT → WB → NEXT]*
+            // ══════════════════════════════════════════════════════════════
+            S_ADD_SETUP: begin
+                add_total_elems <= cfg_out_h * cfg_out_w * cfg_out_c;
+                add_elem_cnt <= 0;
+                add_param_idx <= 0;
+                add_param_phase <= 0;
+                state <= S_ADD_PARAM;
+            end
+
+            S_ADD_PARAM: begin
+                // Read 2 words from Param SRAM (global Add rescale params)
+                if (add_param_phase == 0) begin
+                    param_rd_en   <= 1'b1;
+                    param_rd_addr <= add_param_idx;
+                    add_param_phase <= 1;
+                end else if (add_param_phase == 1) begin
+                    // Wait SRAM latency
+                    add_param_phase <= 2;
+                end else begin
+                    // Capture
+                    if (add_param_idx == 0) begin
+                        add_M_A <= param_rd_data[14:0];
+                        add_S_A <= param_rd_data[21:16];
+                        add_param_idx <= 1;
+                        add_param_phase <= 0;
+                    end else begin
+                        add_M_B <= param_rd_data[14:0];
+                        add_S_B <= param_rd_data[21:16];
+                        add_rd_phase <= 0;
+                        state <= S_ADD_READ_A;
+                    end
+                end
+            end
+
+            S_ADD_READ_A: begin
+                // Read element from Branch A (act_base region)
+                if (add_rd_phase == 0) begin
+                    begin : add_a_addr_calc
+                        reg [31:0] byte_off;
+                        byte_off = cfg_int16 ? ({16'd0, add_elem_cnt} << 1) : {16'd0, add_elem_cnt};
+                        act_rd_en   <= 1'b1;
+                        act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_byte_sel <= byte_off[1:0];
+                    end
+                    add_rd_phase <= 1;
+                end else if (add_rd_phase == 1) begin
+                    add_rd_phase <= 2;
+                end else begin
+                    // Extract element
+                    if (cfg_int16) begin
+                        case (act_byte_sel[1])
+                            1'b0: add_val_a <= $signed(act_rd_data[15:0]);
+                            1'b1: add_val_a <= $signed(act_rd_data[31:16]);
+                        endcase
+                    end else begin
+                        case (act_byte_sel)
+                            2'd0: add_val_a <= {{(ACC_W-8){act_rd_data[7]}},  act_rd_data[7:0]};
+                            2'd1: add_val_a <= {{(ACC_W-8){act_rd_data[15]}}, act_rd_data[15:8]};
+                            2'd2: add_val_a <= {{(ACC_W-8){act_rd_data[23]}}, act_rd_data[23:16]};
+                            2'd3: add_val_a <= {{(ACC_W-8){act_rd_data[31]}}, act_rd_data[31:24]};
+                        endcase
+                    end
+                    add_rd_phase <= 0;
+                    state <= S_ADD_READ_B;
+                end
+            end
+
+            S_ADD_READ_B: begin
+                // Read element from Branch B (out_base region)
+                if (add_rd_phase == 0) begin
+                    begin : add_b_addr_calc
+                        reg [31:0] byte_off;
+                        byte_off = cfg_int16 ? ({16'd0, add_elem_cnt} << 1) : {16'd0, add_elem_cnt};
+                        act_rd_en   <= 1'b1;
+                        act_rd_addr <= cfg_out_base + byte_off[ACT_ADDR_W+1:2];
+                        act_byte_sel <= byte_off[1:0];
+                    end
+                    add_rd_phase <= 1;
+                end else if (add_rd_phase == 1) begin
+                    add_rd_phase <= 2;
+                end else begin
+                    // Extract element
+                    if (cfg_int16) begin
+                        case (act_byte_sel[1])
+                            1'b0: add_val_b <= $signed(act_rd_data[15:0]);
+                            1'b1: add_val_b <= $signed(act_rd_data[31:16]);
+                        endcase
+                    end else begin
+                        case (act_byte_sel)
+                            2'd0: add_val_b <= {{(ACC_W-8){act_rd_data[7]}},  act_rd_data[7:0]};
+                            2'd1: add_val_b <= {{(ACC_W-8){act_rd_data[15]}}, act_rd_data[15:8]};
+                            2'd2: add_val_b <= {{(ACC_W-8){act_rd_data[23]}}, act_rd_data[23:16]};
+                            2'd3: add_val_b <= {{(ACC_W-8){act_rd_data[31]}}, act_rd_data[31:24]};
+                        endcase
+                    end
+                    add_rd_phase <= 0;
+                    state <= S_ADD_COMPUTE;
+                end
+            end
+
+            S_ADD_COMPUTE: begin
+                // Dual rescale: rescaled_A = (val_A * M_A + round) >> S_A
+                begin : add_compute_blk
+                    reg signed [ACC_W-1:0] prod_a, prod_b;
+                    reg signed [ACC_W-1:0] rescaled_a, rescaled_b;
+                    prod_a = add_val_a * $signed({1'b0, add_M_A});
+                    prod_b = add_val_b * $signed({1'b0, add_M_B});
+                    if (add_S_A > 0)
+                        rescaled_a = (prod_a + (1 <<< (add_S_A - 1))) >>> add_S_A;
+                    else
+                        rescaled_a = prod_a;
+                    if (add_S_B > 0)
+                        rescaled_b = (prod_b + (1 <<< (add_S_B - 1))) >>> add_S_B;
+                    else
+                        rescaled_b = prod_b;
+                    ppu_acc_in <= rescaled_a + rescaled_b;
+                end
+                state <= S_ADD_PPU;
+            end
+
+            S_ADD_PPU: begin
+                ppu_in_valid <= 1'b1;
+                state <= S_ADD_PPU_WAIT;
+            end
+
+            S_ADD_PPU_WAIT: begin
+                if (ppu_out_valid) begin
+                    // Compute writeback address (overwrite B at out_base)
+                    begin : add_wb_addr_calc
+                        reg [31:0] byte_off;
+                        byte_off = cfg_int16 ? ({16'd0, add_elem_cnt} << 1) : {16'd0, add_elem_cnt};
+                        add_wb_addr    <= cfg_out_base + byte_off[ACT_ADDR_W+1:2];
+                        add_wb_bytesel <= byte_off[1:0];
+                    end
+                    add_wb_byte <= ppu_out_data;
+                    add_wb_phase <= 2'd0;
+                    state <= S_ADD_WB;
+                end
+            end
+
+            S_ADD_WB: begin
+                // Read-modify-write
+                case (add_wb_phase)
+                2'd0: begin
+                    act_rd_en   <= 1'b1;
+                    act_rd_addr <= add_wb_addr;
+                    add_wb_phase <= 2'd1;
+                end
+                2'd1: begin
+                    add_wb_phase <= 2'd2;
+                end
+                2'd2: begin
+                    begin : add_wb_merge
+                        reg [31:0] merged;
+                        merged = act_rd_data;
+                        if (cfg_int16) begin
+                            case (add_wb_bytesel[1])
+                                1'b0: merged[15:0]  = add_wb_byte;
+                                1'b1: merged[31:16] = add_wb_byte;
+                            endcase
+                        end else begin
+                            case (add_wb_bytesel)
+                                2'd0: merged[7:0]   = add_wb_byte[7:0];
+                                2'd1: merged[15:8]  = add_wb_byte[7:0];
+                                2'd2: merged[23:16] = add_wb_byte[7:0];
+                                2'd3: merged[31:24] = add_wb_byte[7:0];
+                            endcase
+                        end
+                        act_wr_en   <= 1'b1;
+                        act_wr_addr <= add_wb_addr;
+                        act_wr_data <= merged;
+                    end
+                    state <= S_ADD_NEXT;
+                end
+                default: add_wb_phase <= 2'd0;
+                endcase
+            end
+
+            S_ADD_NEXT: begin
+                if (add_elem_cnt + 1 >= add_total_elems) begin
+                    state <= S_DONE;
+                end else begin
+                    add_elem_cnt <= add_elem_cnt + 1;
+                    add_rd_phase <= 0;
+                    state <= S_ADD_READ_A;
+                end
             end
 
             default: state <= S_IDLE;
