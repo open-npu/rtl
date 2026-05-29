@@ -122,6 +122,99 @@ def ref_postproc(acc, M_arr, S_arr, bias_arr, zp_arr, relu6=False,
     return out
 
 
+def ref_pooling(input_nhwc, cfg, int16_mode=False):
+    """Reference Pooling (Max or Avg) matching CSIM npu_pooling().
+
+    Returns int64 accumulator [out_h][out_w][ch].
+    """
+    in_h, in_w, ch = cfg['in_h'], cfg['in_w'], cfg['in_c']
+    out_h, out_w = cfg['out_h'], cfg['out_w']
+    pool_h, pool_w = cfg['pool_h'], cfg['pool_w']
+    pool_sh, pool_sw = cfg['pool_stride_h'], cfg['pool_stride_w']
+    pad_t, pad_l = cfg['pad_top'], cfg['pad_left']
+    is_avg = cfg['pool_mode'] == 1
+
+    if cfg.get('global_pool', False):
+        pool_h, pool_w = in_h, in_w
+        pool_sh, pool_sw = in_h, in_w
+
+    acc = np.zeros((out_h, out_w, ch), dtype=np.int64)
+    for oh in range(out_h):
+        for ow in range(out_w):
+            for c in range(ch):
+                if is_avg:
+                    result = np.int64(0)
+                else:
+                    result = np.int64(-2**63)
+                count = 0
+                for ph in range(pool_h):
+                    ih = oh * pool_sh - pad_t + ph
+                    if ih < 0 or ih >= in_h:
+                        continue
+                    for pw in range(pool_w):
+                        iw = ow * pool_sw - pad_l + pw
+                        if iw < 0 or iw >= in_w:
+                            continue
+                        val = np.int64(input_nhwc[ih, iw, c])
+                        if is_avg:
+                            result += val
+                            count += 1
+                        else:
+                            if val > result:
+                                result = val
+                            count += 1
+                # AvgPool: symmetric rounding integer division
+                if is_avg and count > 0:
+                    if result >= 0:
+                        result = (result + count // 2) // count
+                    else:
+                        result = -(-result + count // 2) // count
+                acc[oh, ow, c] = result
+    return acc
+
+
+def ref_eltwise_add(input_a, input_b, M_A, S_A, M_B, S_B, relu=True,
+                    clamp_min=-128, clamp_max=127):
+    """Reference Eltwise Add with dual rescale + clamp + relu.
+
+    Matches RTL: rescale_A + rescale_B -> clamp -> relu (PPU MODE_RELU_ONLY).
+    """
+    flat_a = input_a.flatten().astype(np.int64)
+    flat_b = input_b.flatten().astype(np.int64)
+    n = len(flat_a)
+    dtype_out = np.int8 if clamp_max <= 127 else np.int16
+
+    out_flat = np.zeros(n, dtype=dtype_out)
+    for i in range(n):
+        prod_a = flat_a[i] * np.int64(M_A)
+        prod_b = flat_b[i] * np.int64(M_B)
+        if S_A > 0:
+            rescaled_a = (prod_a + (np.int64(1) << (S_A - 1))) >> S_A
+        else:
+            rescaled_a = prod_a
+        if S_B > 0:
+            rescaled_b = (prod_b + (np.int64(1) << (S_B - 1))) >> S_B
+        else:
+            rescaled_b = prod_b
+        s = rescaled_a + rescaled_b
+        s = max(clamp_min, min(clamp_max, int(s)))
+        if relu:
+            s = max(0, s)
+        out_flat[i] = dtype_out(s)
+    return out_flat.reshape(input_a.shape)
+
+
+def pack_add_params(M_A, S_A, M_B, S_B):
+    """Pack Add rescale params into 2 uint32 words.
+
+    Word 0: M_A[14:0] at [15:0], S_A[5:0] at [21:16]
+    Word 1: M_B[14:0] at [15:0], S_B[5:0] at [21:16]
+    """
+    w0 = (int(M_A) & 0x7FFF) | ((int(S_A) & 0x3F) << 16)
+    w1 = (int(M_B) & 0x7FFF) | ((int(S_B) & 0x3F) << 16)
+    return [w0, w1]
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Packing functions (INT8)
 # ═══════════════════════════════════════════════════════════════════════
@@ -554,6 +647,194 @@ def save_golden(output_dir, int16_mode=False):
               f"  DDR: in=0x{m['ddr_in_addr']:08X} out=0x{m['ddr_out_addr']:08X}")
 
     return metadata
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Pooling + Add standalone test generators
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def gen_pooling_test(mode='max', pool_h=2, pool_w=2, pool_sh=2, pool_sw=2,
+                     in_h=4, in_w=4, in_c=8, global_pool=False,
+                     int16_mode=False, seed=42):
+    """Generate one pooling test layer (input + params + expected output).
+
+    Returns dict with packed uint32 word arrays and metadata.
+    """
+    np.random.seed(seed)
+
+    if int16_mode:
+        act_range = (-200, 200)
+        clamp_min, clamp_max = -32768, 32767
+        dtype_act = np.int16
+    else:
+        act_range = (-64, 64)
+        clamp_min, clamp_max = -128, 127
+        dtype_act = np.int8
+
+    if global_pool:
+        out_h, out_w = 1, 1
+    else:
+        out_h = (in_h + 0 - pool_h) // pool_sh + 1  # no padding for pool tests
+        out_w = (in_w + 0 - pool_w) // pool_sw + 1
+
+    cfg = {
+        'op_type': 3,
+        'data_type': 1 if int16_mode else 0,
+        'in_h': in_h, 'in_w': in_w, 'in_c': in_c,
+        'out_h': out_h, 'out_w': out_w, 'out_c': in_c,
+        'kernel_h': pool_h, 'kernel_w': pool_w,
+        'stride_h': pool_sh, 'stride_w': pool_sw,
+        'pad_top': 0, 'pad_left': 0,
+        'pool_h': pool_h, 'pool_w': pool_w,
+        'pool_stride_h': pool_sh, 'pool_stride_w': pool_sw,
+        'pool_mode': 1 if mode == 'avg' else 0,
+        'global_pool': global_pool,
+        'relu6': True,
+    }
+
+    # Input activation
+    input_nhwc = np.random.randint(act_range[0], act_range[1],
+                                   (in_h, in_w, in_c), dtype=dtype_act)
+
+    # Compute pooling acc
+    acc = ref_pooling(input_nhwc, cfg, int16_mode=int16_mode)
+
+    # Per-channel post-processing params (same as conv)
+    M_arr = np.zeros(in_c, dtype=np.uint16)
+    S_arr = np.zeros(in_c, dtype=np.uint8)
+    bias_arr = np.zeros(in_c, dtype=np.int64)
+    zp_arr = np.zeros(in_c, dtype=np.int16)
+    for c in range(in_c):
+        # Scale ~1.0 to keep values in range
+        M_arr[c], S_arr[c] = compute_ms(0.8 + 0.4 * np.random.rand())
+
+    out = ref_postproc(acc, M_arr, S_arr, bias_arr, zp_arr,
+                       relu6=True, clamp_min=clamp_min, clamp_max=clamp_max)
+
+    # Pack
+    if int16_mode:
+        input_words = pack_i16_to_words(input_nhwc)
+        output_words = pack_i16_to_words(out)
+    else:
+        input_words = pack_i8_to_words(input_nhwc)
+        output_words = pack_i8_to_words(out)
+    param_words = pack_params_for_sram(M_arr, S_arr, bias_arr, zp_arr, in_c)
+
+    # POOL_CFG register encoding
+    pool_cfg_reg = (cfg['pool_mode']
+                    | (pool_h << 4) | (pool_w << 8)
+                    | (pool_sh << 12) | (pool_sw << 16)
+                    | ((1 if global_pool else 0) << 20))
+
+    # POST_CTRL: mode=CONV_REQ(00), relu_en=1, bias_en=0, zp_en=0
+    # Since bias=0 and zp=0, we still enable them (PPU passes through 0)
+    post_ctrl = 0x64  # bias_en + zp_en + relu_en
+    if int16_mode:
+        post_ctrl |= 0x80
+
+    meta = {
+        'op_type': 3,
+        'data_type': cfg['data_type'],
+        'in_h': in_h, 'in_w': in_w, 'in_c': in_c,
+        'out_h': out_h, 'out_w': out_w, 'out_c': in_c,
+        'kernel_h': pool_h, 'kernel_w': pool_w,
+        'stride_h': pool_sh, 'stride_w': pool_sw,
+        'pad_top': 0, 'pad_left': 0,
+        'pool_cfg': pool_cfg_reg,
+        'post_ctrl': post_ctrl,
+        'dma_wgt_size': 0,  # No weights for pooling
+        'dma_in_size': len(input_words) * 4,
+        'dma_out_size': len(output_words) * 4,
+        'dma_param_count': in_c,
+        'n_input_words': len(input_words),
+        'n_output_words': len(output_words),
+        'n_param_words': len(param_words),
+    }
+
+    return meta, {
+        'input_words': input_words,
+        'param_words': param_words,
+        'output_words': output_words,
+    }
+
+
+def gen_add_test(h=4, w=4, c=8, relu=True, int16_mode=False, seed=100):
+    """Generate one eltwise add test layer (2 inputs + params + expected output).
+
+    Returns dict with packed uint32 word arrays and metadata.
+    """
+    np.random.seed(seed)
+
+    if int16_mode:
+        act_range = (-200, 200)
+        clamp_min, clamp_max = -32768, 32767
+        dtype_act = np.int16
+    else:
+        act_range = (-64, 64)
+        clamp_min, clamp_max = -128, 127
+        dtype_act = np.int8
+
+    # Two inputs
+    input_a = np.random.randint(act_range[0], act_range[1],
+                                (h, w, c), dtype=dtype_act)
+    input_b = np.random.randint(act_range[0], act_range[1],
+                                (h, w, c), dtype=dtype_act)
+
+    # Rescale params: scale ~0.5 for each branch (sum of two halves ~= 1.0)
+    M_A, S_A = compute_ms(0.5 + 0.2 * np.random.rand())
+    M_B, S_B = compute_ms(0.5 + 0.2 * np.random.rand())
+
+    # Compute golden output
+    out = ref_eltwise_add(input_a, input_b, M_A, S_A, M_B, S_B,
+                          relu=relu, clamp_min=clamp_min, clamp_max=clamp_max)
+
+    # Pack
+    if int16_mode:
+        input_a_words = pack_i16_to_words(input_a)
+        input_b_words = pack_i16_to_words(input_b)
+        output_words = pack_i16_to_words(out)
+    else:
+        input_a_words = pack_i8_to_words(input_a)
+        input_b_words = pack_i8_to_words(input_b)
+        output_words = pack_i8_to_words(out)
+
+    add_param_words = pack_add_params(M_A, S_A, M_B, S_B)
+
+    # POST_CTRL: mode=RELU_ONLY(10), relu_en
+    post_ctrl = 0x02  # mode=10 at bits[1:0]
+    if relu:
+        post_ctrl |= 0x04  # relu_en
+    if int16_mode:
+        post_ctrl |= 0x80
+
+    meta = {
+        'op_type': 4,
+        'data_type': 1 if int16_mode else 0,
+        'in_h': h, 'in_w': w, 'in_c': c,
+        'out_h': h, 'out_w': w, 'out_c': c,
+        'kernel_h': 1, 'kernel_w': 1,
+        'stride_h': 1, 'stride_w': 1,
+        'pad_top': 0, 'pad_left': 0,
+        'post_ctrl': post_ctrl,
+        'dma_wgt_size': 0,
+        'dma_in_size': len(input_a_words) * 4,
+        'dma_out_size': len(output_words) * 4,
+        'dma_param_count': 0,  # Add params go separately (2 words)
+        'n_input_words': len(input_a_words),
+        'n_input_b_words': len(input_b_words),
+        'n_output_words': len(output_words),
+        'n_add_param_words': len(add_param_words),
+        'relu': relu,
+        'M_A': M_A, 'S_A': S_A, 'M_B': M_B, 'S_B': S_B,
+    }
+
+    return meta, {
+        'input_a_words': input_a_words,
+        'input_b_words': input_b_words,
+        'add_param_words': add_param_words,
+        'output_words': output_words,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
