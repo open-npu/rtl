@@ -968,6 +968,154 @@ def gen_resize_test(in_h=4, in_w=4, in_c=4, out_h=8, out_w=8,
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Deconv (Transposed Convolution) reference + test generator
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def ref_deconv(input_nhwc, weight_ohwi, cfg):
+    """Deconv (transposed conv) → int64 accumulator [out_h][out_w][out_c].
+
+    Algorithm: insert zeros between input elements, then standard conv.
+    Weight layout: [out_c][kh][kw][in_c] (same as Conv2D).
+    """
+    in_h, in_w, in_c = cfg['in_h'], cfg['in_w'], cfg['in_c']
+    out_h, out_w, out_c = cfg['out_h'], cfg['out_w'], cfg['out_c']
+    kh, kw = cfg['kernel_h'], cfg['kernel_w']
+    ins_h, ins_w = cfg['insert_h'], cfg['insert_w']
+    pad_t, pad_l = cfg['pad_top'], cfg['pad_left']
+
+    exp_h = in_h + (in_h - 1) * ins_h
+    exp_w = in_w + (in_w - 1) * ins_w
+
+    acc = np.zeros((out_h, out_w, out_c), dtype=np.int64)
+    for oh in range(out_h):
+        for ow in range(out_w):
+            for oc in range(out_c):
+                s = np.int64(0)
+                for fh in range(kh):
+                    eh = oh + pad_t - fh
+                    if eh < 0 or eh >= exp_h:
+                        continue
+                    if eh % (ins_h + 1) != 0:
+                        continue
+                    ih = eh // (ins_h + 1)
+                    for fw in range(kw):
+                        ew = ow + pad_l - fw
+                        if ew < 0 or ew >= exp_w:
+                            continue
+                        if ew % (ins_w + 1) != 0:
+                            continue
+                        iw = ew // (ins_w + 1)
+                        for ic in range(in_c):
+                            s += np.int64(input_nhwc[ih, iw, ic]) * \
+                                 np.int64(weight_ohwi[oc, fh, fw, ic])
+                acc[oh, ow, oc] = s
+    return acc
+
+
+def gen_deconv_test(in_h=4, in_w=4, in_c=4, out_c=4,
+                    kernel_h=2, kernel_w=2, insert_h=1, insert_w=1,
+                    pad_top=0, pad_left=0,
+                    int16_mode=False, seed=200):
+    """Generate one deconv test layer (wgt + params + input + expected output)."""
+    np.random.seed(seed)
+
+    if int16_mode:
+        act_range = (-100, 100)
+        wgt_range = (-20, 20)
+        clamp_min, clamp_max = -32768, 32767
+        dtype_act = np.int16
+        dtype_wgt = np.int16
+    else:
+        act_range = (-64, 64)
+        wgt_range = (-30, 30)
+        clamp_min, clamp_max = -128, 127
+        dtype_act = np.int8
+        dtype_wgt = np.int8
+
+    # Compute output dimensions: out = (in-1)*(ins+1) + kernel - 2*pad
+    out_h = (in_h - 1) * (insert_h + 1) + kernel_h - 2 * pad_top
+    out_w = (in_w - 1) * (insert_w + 1) + kernel_w - 2 * pad_left
+
+    input_nhwc = np.random.randint(act_range[0], act_range[1],
+                                   (in_h, in_w, in_c), dtype=dtype_act)
+    weight_ohwi = np.random.randint(wgt_range[0], wgt_range[1],
+                                    (out_c, kernel_h, kernel_w, in_c), dtype=dtype_wgt)
+
+    k_depth = kernel_h * kernel_w * in_c
+
+    cfg = {
+        'op_type': 6,
+        'data_type': 1 if int16_mode else 0,
+        'in_h': in_h, 'in_w': in_w, 'in_c': in_c,
+        'out_h': out_h, 'out_w': out_w, 'out_c': out_c,
+        'kernel_h': kernel_h, 'kernel_w': kernel_w,
+        'stride_h': 1, 'stride_w': 1,
+        'pad_top': pad_top, 'pad_left': pad_left,
+        'insert_h': insert_h, 'insert_w': insert_w,
+    }
+
+    acc = ref_deconv(input_nhwc, weight_ohwi, cfg)
+
+    # Per-channel PPU params (identity requant for testing: M=1, S=0, bias=0, zp=0)
+    M_arr = np.ones(out_c, dtype=np.uint16)
+    S_arr = np.zeros(out_c, dtype=np.uint8)
+    bias_arr = np.zeros(out_c, dtype=np.int64)
+    zp_arr = np.zeros(out_c, dtype=np.int16)
+
+    out = ref_postproc(acc, M_arr, S_arr, bias_arr, zp_arr,
+                       relu6=False, clamp_min=clamp_min, clamp_max=clamp_max)
+
+    # Pack data
+    if int16_mode:
+        input_words = pack_i16_to_words(input_nhwc)
+        wgt_words = pack_conv_weights_i16(weight_ohwi, out_c, k_depth)
+        output_words = pack_i16_to_words(out)
+    else:
+        input_words = pack_i8_to_words(input_nhwc)
+        wgt_words = pack_conv_weights_i8(weight_ohwi, out_c, k_depth)
+        output_words = pack_i8_to_words(out)
+    param_words = pack_params_for_sram(M_arr, S_arr, bias_arr, zp_arr, out_c)
+
+    # CSR register value: DECONV_CFG = INSERT_H | (INSERT_W << 8)
+    deconv_cfg_reg = insert_h | (insert_w << 8)
+
+    # post_ctrl: MODE_CONV_REQ (0x00), no relu6
+    post_ctrl = 0x00
+    if int16_mode:
+        post_ctrl |= 0x80
+
+    meta = {
+        'op_type': 6,
+        'data_type': cfg['data_type'],
+        'in_h': in_h, 'in_w': in_w, 'in_c': in_c,
+        'out_h': out_h, 'out_w': out_w, 'out_c': out_c,
+        'kernel_h': kernel_h, 'kernel_w': kernel_w,
+        'stride_h': 1, 'stride_w': 1,
+        'pad_top': pad_top, 'pad_left': pad_left,
+        'insert_h': insert_h, 'insert_w': insert_w,
+        'deconv_cfg': deconv_cfg_reg,
+        'k_depth': k_depth,
+        'post_ctrl': post_ctrl,
+        'dma_wgt_size': len(wgt_words) * 4,
+        'dma_in_size': len(input_words) * 4,
+        'dma_out_size': len(output_words) * 4,
+        'dma_param_count': out_c,
+        'n_wgt_words': len(wgt_words),
+        'n_input_words': len(input_words),
+        'n_output_words': len(output_words),
+        'n_param_words': len(param_words),
+    }
+
+    return meta, {
+        'wgt_words': wgt_words,
+        'input_words': input_words,
+        'param_words': param_words,
+        'output_words': output_words,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 

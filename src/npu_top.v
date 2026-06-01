@@ -580,6 +580,7 @@ module npu_top #(
         .cfg_out_base   (reg_sram_base[ACT_ADDR_W+16-1:16]),
         .cfg_pool_cfg   (reg_pool_cfg),
         .cfg_resize_cfg (reg_resize_cfg),
+        .cfg_deconv_cfg (reg_deconv_cfg),
         // Weight SRAM Port B
         .wgt_rd_en      (wgt_b_en),
         .wgt_rd_addr    (wgt_b_addr),

@@ -17,7 +17,7 @@
 //   - Spatial output count is handled by repeated compute passes
 //   - Weights reloaded per-pixel per-pass (correctness over efficiency)
 //
-// Op types: 0=Conv2D, 1=DWConv, 2=FC, 3=Pooling, 4=Add, 5=Resize
+// Op types: 0=Conv2D, 1=DWConv, 2=FC, 3=Pooling, 4=Add, 5=Resize, 6=Deconv
 
 `include "npu_defines.vh"
 
@@ -59,6 +59,7 @@ module npu_compute #(
     input  wire [ACT_ADDR_W-1:0]        cfg_out_base,   // Output base (word addr in act SRAM)
     input  wire [31:0]                  cfg_pool_cfg,   // Pooling config register
     input  wire [31:0]                  cfg_resize_cfg, // Resize config register
+    input  wire [31:0]                  cfg_deconv_cfg, // Deconv config: [7:0]=INSERT_H, [15:8]=INSERT_W
 
     // ─── Weight SRAM Port B (read-only) ───
     output reg                          wgt_rd_en,
@@ -292,6 +293,15 @@ module npu_compute #(
     wire [3:0]  pool_cfg_sw   = cfg_pool_cfg[19:16];
     wire        global_pool   = cfg_pool_cfg[20];
     wire        resize_mode   = cfg_resize_cfg[0];   // 0=nearest, 1=bilinear
+    // ─── Deconv state ───
+    wire [7:0]  cfg_insert_h  = cfg_deconv_cfg[7:0];
+    wire [7:0]  cfg_insert_w  = cfg_deconv_cfg[15:8];
+    wire        is_deconv     = (cfg_op_type == 8'd6);
+    wire [15:0] deconv_exp_h  = cfg_in_h + (cfg_in_h - 16'd1) * {8'd0, cfg_insert_h};
+    wire [15:0] deconv_exp_w  = cfg_in_w + (cfg_in_w - 16'd1) * {8'd0, cfg_insert_w};
+    wire [8:0]  deconv_step_h = {1'b0, cfg_insert_h} + 9'd1; // ins_h + 1
+    wire [8:0]  deconv_step_w = {1'b0, cfg_insert_w} + 9'd1; // ins_w + 1
+    reg         deconv_skip;  // 1 = current (fh, fw) maps to zero-inserted position
     reg signed [ACC_W-1:0] pool_acc;     // Running sum or max
     reg [15:0]             pool_count;   // Valid element count (AvgPool)
     reg [3:0]              pool_fh, pool_fw; // Window position
@@ -670,18 +680,43 @@ module npu_compute #(
                     // Compute activation address for current (conv_fh, conv_fw)
                     begin : act_addr_blk
                         reg signed [15:0] ih, iw;
+                        reg signed [15:0] eh, ew;
                         reg [15:0] elem_off;
                         reg [15:0] byte_off;
-                        ih = conv_ih_base + $signed({8'd0, conv_fh});
-                        iw = conv_iw_base + $signed({8'd0, conv_fw});
-                        conv_is_pad <= (ih < 0) || (ih >= $signed({1'b0, cfg_in_h}))
-                                    || (iw < 0) || (iw >= $signed({1'b0, cfg_in_w}));
-                        // Element offset within activation SRAM
-                        elem_off = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c
-                                 + conv_ch_cnt;
-                        byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
-                        act_word_addr <= {2'd0, act_base} + byte_off[15:2];
-                        act_byte_sel <= byte_off[1:0];
+                        if (is_deconv) begin
+                            // Deconv: eh = oh + pad - fh, then check modulo
+                            eh = conv_ih_base - $signed({8'd0, conv_fh});
+                            ew = conv_iw_base - $signed({8'd0, conv_fw});
+                            if ((eh < 0) || (eh >= $signed({1'b0, deconv_exp_h}))
+                                || (ew < 0) || (ew >= $signed({1'b0, deconv_exp_w}))
+                                || (eh[15:0] % deconv_step_h[8:0] != 0)
+                                || (ew[15:0] % deconv_step_w[8:0] != 0)) begin
+                                conv_is_pad  <= 1'b0;
+                                deconv_skip  <= 1'b1;
+                            end else begin
+                                ih = $signed(eh[15:0] / deconv_step_h[8:0]);
+                                iw = $signed(ew[15:0] / deconv_step_w[8:0]);
+                                conv_is_pad  <= (ih < 0) || (ih >= $signed({1'b0, cfg_in_h}))
+                                             || (iw < 0) || (iw >= $signed({1'b0, cfg_in_w}));
+                                deconv_skip  <= 1'b0;
+                                elem_off = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c
+                                         + conv_ch_cnt;
+                                byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                                act_word_addr <= {2'd0, act_base} + byte_off[15:2];
+                                act_byte_sel <= byte_off[1:0];
+                            end
+                        end else begin
+                            ih = conv_ih_base + $signed({8'd0, conv_fh});
+                            iw = conv_iw_base + $signed({8'd0, conv_fw});
+                            conv_is_pad <= (ih < 0) || (ih >= $signed({1'b0, cfg_in_h}))
+                                        || (iw < 0) || (iw >= $signed({1'b0, cfg_in_w}));
+                            deconv_skip <= 1'b0;
+                            elem_off = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c
+                                     + conv_ch_cnt;
+                            byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                            act_word_addr <= {2'd0, act_base} + byte_off[15:2];
+                            act_byte_sel <= byte_off[1:0];
+                        end
                     end
                     state <= S_ACT_LOAD;
                 end
@@ -689,8 +724,8 @@ module npu_compute #(
 
             S_ACT_LOAD: begin
                 // Read one SRAM word (4 activation bytes)
-                // If padding, skip read and go directly to emit zeros
-                if (conv_is_pad) begin
+                // If padding or deconv_skip, skip read and go directly to emit zeros
+                if (conv_is_pad || deconv_skip) begin
                     act_buf <= 32'd0;
                     state <= S_ACT_EMIT;
                 end else if (!act_read_issued) begin
@@ -760,6 +795,7 @@ module npu_compute #(
                     state <= S_ACT_LOAD;
                     begin : next_pos_blk
                         reg signed [15:0] nih, niw;
+                        reg signed [15:0] neh, new_;
                         reg [15:0] elem_off_n;
                         reg [15:0] byte_off_n;
                         reg [7:0] next_fw, next_fh;
@@ -770,14 +806,37 @@ module npu_compute #(
                             next_fw = conv_fw + 1;
                             next_fh = conv_fh;
                         end
-                        nih = conv_ih_base + $signed({8'd0, next_fh});
-                        niw = conv_iw_base + $signed({8'd0, next_fw});
-                        conv_is_pad <= (nih < 0) || (nih >= $signed({1'b0, cfg_in_h}))
-                                    || (niw < 0) || (niw >= $signed({1'b0, cfg_in_w}));
-                        elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c;
-                        byte_off_n = cfg_int16 ? (elem_off_n << 1) : elem_off_n;
-                        act_word_addr <= {2'd0, act_base} + byte_off_n[15:2];
-                        act_byte_sel <= byte_off_n[1:0];
+                        if (is_deconv) begin
+                            neh = conv_ih_base - $signed({8'd0, next_fh});
+                            new_ = conv_iw_base - $signed({8'd0, next_fw});
+                            if ((neh < 0) || (neh >= $signed({1'b0, deconv_exp_h}))
+                                || (new_ < 0) || (new_ >= $signed({1'b0, deconv_exp_w}))
+                                || (neh[15:0] % deconv_step_h[8:0] != 0)
+                                || (new_[15:0] % deconv_step_w[8:0] != 0)) begin
+                                conv_is_pad  <= 1'b0;
+                                deconv_skip  <= 1'b1;
+                            end else begin
+                                nih = $signed(neh[15:0] / deconv_step_h[8:0]);
+                                niw = $signed(new_[15:0] / deconv_step_w[8:0]);
+                                conv_is_pad <= (nih < 0) || (nih >= $signed({1'b0, cfg_in_h}))
+                                            || (niw < 0) || (niw >= $signed({1'b0, cfg_in_w}));
+                                deconv_skip <= 1'b0;
+                                elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c;
+                                byte_off_n = cfg_int16 ? (elem_off_n << 1) : elem_off_n;
+                                act_word_addr <= {2'd0, act_base} + byte_off_n[15:2];
+                                act_byte_sel <= byte_off_n[1:0];
+                            end
+                        end else begin
+                            nih = conv_ih_base + $signed({8'd0, next_fh});
+                            niw = conv_iw_base + $signed({8'd0, next_fw});
+                            conv_is_pad <= (nih < 0) || (nih >= $signed({1'b0, cfg_in_h}))
+                                        || (niw < 0) || (niw >= $signed({1'b0, cfg_in_w}));
+                            deconv_skip <= 1'b0;
+                            elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c;
+                            byte_off_n = cfg_int16 ? (elem_off_n << 1) : elem_off_n;
+                            act_word_addr <= {2'd0, act_base} + byte_off_n[15:2];
+                            act_byte_sel <= byte_off_n[1:0];
+                        end
                     end
                 end else if (cfg_int16 ? (act_byte_sel[1] == 1'b1) : (act_byte_sel == 2'd3)) begin
                     // Need next SRAM word
@@ -979,10 +1038,18 @@ module npu_compute #(
             S_SPATIAL_SETUP: begin
                 // Compute input window origin for output pixel (sp_oh, sp_ow)
                 // Use global output coordinates for input address & padding check
-                conv_ih_base <= $signed({1'b0, tile_oh_origin + sp_oh}) * $signed({1'b0, cfg_stride_h[7:0]})
-                              - $signed({1'b0, cfg_pad_top[7:0]});
-                conv_iw_base <= $signed({1'b0, tile_ow_origin + sp_ow}) * $signed({1'b0, cfg_stride_w[7:0]})
-                              - $signed({1'b0, cfg_pad_left[7:0]});
+                if (is_deconv) begin
+                    // Deconv: ih_base = oh + pad_top (fh subtracted later in S_ACT_CMD)
+                    conv_ih_base <= $signed({1'b0, tile_oh_origin + sp_oh})
+                                  + $signed({1'b0, cfg_pad_top[7:0]});
+                    conv_iw_base <= $signed({1'b0, tile_ow_origin + sp_ow})
+                                  + $signed({1'b0, cfg_pad_left[7:0]});
+                end else begin
+                    conv_ih_base <= $signed({1'b0, tile_oh_origin + sp_oh}) * $signed({1'b0, cfg_stride_h[7:0]})
+                                  - $signed({1'b0, cfg_pad_top[7:0]});
+                    conv_iw_base <= $signed({1'b0, tile_ow_origin + sp_ow}) * $signed({1'b0, cfg_stride_w[7:0]})
+                                  - $signed({1'b0, cfg_pad_left[7:0]});
+                end
 
                 // Compute starting (fh, fw, ch) from k_pass offset
                 // flat_start = k_pass * ARRAY_SIZE
