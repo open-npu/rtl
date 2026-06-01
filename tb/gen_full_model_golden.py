@@ -101,11 +101,21 @@ def crop_input_for_tile(full_input, tile_y, tile_h, out_h,
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def build_allops_mini(int16_mode=False):
-    """Build AllOps-Mini model: 18 layers, 16×16×3 input, all 7 op types.
+def build_allops_model(int16_mode=False, input_size=16):
+    """Build AllOps model: 18 layers, all 7 op types.
 
-    Compact dimensions (max 8×8 spatial) for fast Icarus simulation.
-    All layers fit in SRAM natively — no tiling needed.
+    Args:
+        int16_mode: Use INT16 data path
+        input_size: Input spatial dimension (16 for mini, 128 for large)
+
+    For input_size=16 (AllOps-Mini):
+      Compact dims (max 8×8 spatial) for fast Icarus simulation.
+      All layers fit in SRAM natively — no tiling needed.
+
+    For input_size=128 (AllOps-128):
+      128×128 input exercises DMA tiling on early Conv/DW layers.
+      Two extra stride-2 to reduce spatial before non-tiled operators.
+      Tests real-world memory bandwidth pressure.
 
     Returns list of "invocations" — each invocation is a dict with:
       - 'meta': CSR metadata for the DMA E2E test
@@ -133,8 +143,7 @@ def build_allops_mini(int16_mode=False):
     invocations = []
     scale_in = 1.0 / 64.0
 
-    # Generate input — 16×16×3 for fast Icarus simulation
-    INPUT_H, INPUT_W = 16, 16
+    INPUT_H, INPUT_W = input_size, input_size
     input_img = np.random.randint(act_range[0], act_range[1],
                                    (INPUT_H, INPUT_W, 3), dtype=dtype_act)
 
@@ -758,73 +767,98 @@ def build_allops_mini(int16_mode=False):
         layer_outputs[layer_idx_b] = combined
         return combined, h, w, total_c
 
-    # ─── Build AllOps-Mini architecture (16×16 input, all 7 ops) ───
-    # Compact dims (max 8×8 spatial) — all layers fit in SRAM, no tiling.
-    #
-    # Layer 0: Conv2D 16×16×3 → 8×8×8, k=3 s=2
+    # ─── Build model architecture ───
     cur = input_img
-    cur, h, w, c = add_conv_invocations(0, cur, INPUT_H, INPUT_W, 3, 8, 3, 2, True)
 
-    # Layer 1: DWConv 8×8×8 → 8×8×8, k=3 s=1
-    cur, h, w, c = add_dw_invocations(1, cur, h, w, c, 1, True)
+    if input_size <= 16:
+        # AllOps-Mini: 16×16 input, compact dims, no tiling needed
+        # Channel config: 8→16→32→48→16→8
+        ch_stem, ch_mid, ch_wide, ch_concat_total = 8, 16, 32, 48
 
-    # Layer 2: Conv2D 8×8×8 → 8×8×16, k=1 s=1
-    cur, h, w, c = add_conv_invocations(2, cur, h, w, c, 16, 1, 1, True)
-    save_l2 = cur.copy()  # 8×8×16 for residual
+        cur, h, w, c = add_conv_invocations(0, cur, INPUT_H, INPUT_W, 3, ch_stem, 3, 2, True)
+        cur, h, w, c = add_dw_invocations(1, cur, h, w, c, 1, True)
+        cur, h, w, c = add_conv_invocations(2, cur, h, w, c, ch_mid, 1, 1, True)
+        save_l2 = cur.copy()
+        cur, h, w, c = add_dw_invocations(3, cur, h, w, c, 1, True)
+        cur, h, w, c = add_conv_invocations(4, cur, h, w, c, ch_mid, 1, 1, False)
+        cur, h, w, c = add_add_invocation(5, save_l2, cur, h, w, c, relu=True)
+        cur, h, w, c = add_dw_invocations(6, cur, h, w, c, 2, True)
+        cur, h, w, c = add_conv_invocations(7, cur, h, w, c, ch_wide, 1, 1, True)
+        save_l7 = cur.copy()
+        pool_in_h, pool_in_w = h, w
+        cur, h, w, c = add_pooling_invocation(8, cur, h, w, c, 2, 2, 2, 2, mode='max')
+        cur, h, w, c = add_conv_invocations(9, cur, h, w, c, ch_wide, 1, 1, True)
+        cur, h, w, c = add_resize_invocation(10, cur, h, w, c, pool_in_h, pool_in_w, 0)
+        cur, h, w, c = add_conv_invocations(11, cur, h, w, c, ch_mid, 1, 1, True)
+        concat_branch_a = cur
+        concat_branch_b = save_l7
+        c_a, c_b = ch_mid, ch_wide
+    else:
+        # AllOps-128: 128×128 input, exercises DMA tiling
+        # Two stride-2 early to reduce spatial before non-tiled ops
+        # Channel config: 8→8→32→40→16→8 (smaller channels to fit SRAM)
+        ch_stem, ch_mid, ch_wide = 8, 8, 32
 
-    # Layer 3: DWConv 8×8×16 → 8×8×16, k=3 s=1
-    cur, h, w, c = add_dw_invocations(3, cur, h, w, c, 1, True)
+        # L0: Conv2D 128×128×3 → 64×64×8, k=3 s=2 [TILED]
+        cur, h, w, c = add_conv_invocations(0, cur, INPUT_H, INPUT_W, 3, ch_stem, 3, 2, True)
+        # L1: DWConv 64×64×8 → 32×32×8, k=3 s=2 [TILED]
+        cur, h, w, c = add_dw_invocations(1, cur, h, w, c, 2, True)
+        # L2: Conv2D 32×32×8 → 32×32×8, k=1 s=1 [save residual]
+        cur, h, w, c = add_conv_invocations(2, cur, h, w, c, ch_mid, 1, 1, True)
+        save_l2 = cur.copy()
+        # L3: DWConv 32×32×8 → 32×32×8, k=3 s=1
+        cur, h, w, c = add_dw_invocations(3, cur, h, w, c, 1, True)
+        # L4: Conv2D 32×32×8 → 32×32×8, k=1 s=1
+        cur, h, w, c = add_conv_invocations(4, cur, h, w, c, ch_mid, 1, 1, False)
+        # L5: Add (L2 + L4), 32×32×8 → 2048w *3 = 6144 < 8192 ✓
+        cur, h, w, c = add_add_invocation(5, save_l2, cur, h, w, c, relu=True)
+        # L6: DWConv 32×32×8 → 16×16×8, k=3 s=2
+        cur, h, w, c = add_dw_invocations(6, cur, h, w, c, 2, True)
+        # L7: Conv2D 16×16×8 → 16×16×32, k=1 s=1 [save concat]
+        cur, h, w, c = add_conv_invocations(7, cur, h, w, c, ch_wide, 1, 1, True)
+        save_l7 = cur.copy()
+        pool_in_h, pool_in_w = h, w
+        # L8: Pooling 16×16×32 → 8×8×32, MaxPool k=2 s=2
+        cur, h, w, c = add_pooling_invocation(8, cur, h, w, c, 2, 2, 2, 2, mode='max')
+        # L9: Conv2D 8×8×32 → 8×8×32, k=1 s=1
+        cur, h, w, c = add_conv_invocations(9, cur, h, w, c, ch_wide, 1, 1, True)
+        # L10: Resize 8×8×32 → 16×16×32, nearest 2×
+        cur, h, w, c = add_resize_invocation(10, cur, h, w, c, pool_in_h, pool_in_w, 0)
+        # L11: Conv2D 16×16×32 → 16×16×8, k=1 s=1
+        cur, h, w, c = add_conv_invocations(11, cur, h, w, c, ch_mid, 1, 1, True)
+        concat_branch_a = cur
+        concat_branch_b = save_l7
+        c_a, c_b = ch_mid, ch_wide
 
-    # Layer 4: Conv2D 8×8×16 → 8×8×16, k=1 s=1
-    cur, h, w, c = add_conv_invocations(4, cur, h, w, c, 16, 1, 1, False)
+    # ─── Common tail (both models) ───
+    ch_concat_total = c_a + c_b
 
-    # Layer 5: Add (residual L2 + L4)
-    # 8×8×16 INT8 = 256 words → Add needs 2×256 = 512 ≤ 8192 ✓
-    cur, h, w, c = add_add_invocation(5, save_l2, cur, h, w, c, relu=True)
-
-    # Layer 6: DWConv 8×8×16 → 4×4×16, k=3 s=2
-    cur, h, w, c = add_dw_invocations(6, cur, h, w, c, 2, True)
-
-    # Layer 7: Conv2D 4×4×16 → 4×4×32, k=1 s=1
-    cur, h, w, c = add_conv_invocations(7, cur, h, w, c, 32, 1, 1, True)
-    save_l7 = cur.copy()  # 4×4×32 for concat branch B
-
-    # Layer 8: Pooling MaxPool 4×4×32 → 2×2×32, k=2 s=2
-    cur, h, w, c = add_pooling_invocation(8, cur, h, w, c,
-                                           2, 2, 2, 2, mode='max')
-
-    # Layer 9: Conv2D 2×2×32 → 2×2×32, k=1 s=1
-    cur, h, w, c = add_conv_invocations(9, cur, h, w, c, 32, 1, 1, True)
-
-    # Layer 10: Resize 2×2×32 → 4×4×32, nearest 2×
-    cur, h, w, c = add_resize_invocation(10, cur, h, w, c, 4, 4, 0)
-
-    # Layer 11: Conv2D 4×4×32 → 4×4×16, k=1 s=1
-    cur, h, w, c = add_conv_invocations(11, cur, h, w, c, 16, 1, 1, True)
-
-    # Layer 12+13: Concat (L11=4×4×16, L7=4×4×32) → 4×4×48
-    concat_branch_a = cur       # L11: 4×4×16
-    concat_branch_b = save_l7   # L7:  4×4×32
+    # L12+L13: Concat
     cur, h, w, c = add_concat_invocations(
         12, 13, concat_branch_a, concat_branch_b,
-        4, 4, 16, 32, relu=True)
+        h, w, c_a, c_b, relu=True)
 
-    # Layer 14: Conv2D 4×4×48 → 2×2×16, k=3 s=2
+    # L14: Conv2D → stride-2 downsample
     cur, h, w, c = add_conv_invocations(14, cur, h, w, c, 16, 3, 2, True)
 
-    # Layer 15: Pooling GlobalAvgPool 2×2×16 → 1×1×16
+    # L15: Pooling GlobalAvgPool → 1×1×16
     cur, h, w, c = add_pooling_invocation(15, cur, h, w, c,
-                                           2, 2, 2, 2,
+                                           h, w, h, w,
                                            mode='avg', global_pool=True)
 
-    # Layer 16: Deconv 1×1×16 → 2×2×16, k=2 s=2
+    # L16: Deconv 1×1×16 → 2×2×16, k=2 s=2
     cur, h, w, c = add_deconv_invocation(16, cur, h, w, c, 16,
                                           2, 2, 1, 1, 0, 0)
 
-    # Layer 17: Conv2D 2×2×16 → 1×1×8, k=2 s=1 pad=0
+    # L17: Conv2D 2×2×16 → 1×1×8, k=2 s=1 pad=0
     cur, h, w, c = add_conv_invocations(17, cur, h, w, c, 8, 2, 1, False, pad=0)
 
     return invocations
+
+
+def build_allops_mini(int16_mode=False):
+    """Backward-compatible wrapper for 16×16 AllOps-Mini model."""
+    return build_allops_model(int16_mode=int16_mode, input_size=16)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -835,11 +869,12 @@ def build_allops_mini(int16_mode=False):
 WGT_BASE   = 0x1000_0000
 PARAM_BASE = 0x2000_0000
 ACT_BASE   = 0x3000_0000
-INV_OFFSET = 0x0000_4000   # 16KB per invocation (sufficient for mini model)
+INV_OFFSET_MINI = 0x0000_4000   # 16KB per invocation (sufficient for mini model)
+INV_OFFSET_128  = 0x0002_0000   # 128KB per invocation (for 128×128 model)
 ADD_B_BASE = 0x4000_0000
 
 
-def assign_ddr_addrs(invocations):
+def assign_ddr_addrs(invocations, inv_offset=INV_OFFSET_MINI):
     """Assign DDR addresses to each invocation.
 
     For layer chaining across tiles: consecutive tiles of the same layer
@@ -857,13 +892,13 @@ def assign_ddr_addrs(invocations):
         meta = inv['meta']
         data = inv['data']
 
-        meta['ddr_wgt_addr'] = WGT_BASE + i * INV_OFFSET
-        meta['ddr_param_addr'] = PARAM_BASE + i * INV_OFFSET
-        meta['ddr_in_addr'] = ACT_BASE + i * INV_OFFSET
-        meta['ddr_out_addr'] = ACT_BASE + (i + 1) * INV_OFFSET
+        meta['ddr_wgt_addr'] = WGT_BASE + i * inv_offset
+        meta['ddr_param_addr'] = PARAM_BASE + i * inv_offset
+        meta['ddr_in_addr'] = ACT_BASE + i * inv_offset
+        meta['ddr_out_addr'] = ACT_BASE + (i + 1) * inv_offset
 
         if 'input_b_words' in data:
-            meta['ddr_add_b_addr'] = ADD_B_BASE + i * INV_OFFSET
+            meta['ddr_add_b_addr'] = ADD_B_BASE + i * inv_offset
 
         # Compute DMA sizes
         meta['dma_in_size'] = len(data['input_words']) * 4
@@ -890,15 +925,18 @@ def assign_ddr_addrs(invocations):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def save_golden(output_dir, int16_mode=False):
+def save_golden(output_dir, int16_mode=False, input_size=16):
     """Generate and save golden data for full model E2E test."""
     mode_str = "INT16" if int16_mode else "INT8"
+    model_name = f"AllOps-{input_size}"
     print(f"\n{'='*60}")
-    print(f"Generating AllOps-Mini golden data — {mode_str}")
+    print(f"Generating {model_name} golden data — {mode_str}")
     print(f"{'='*60}")
 
-    invocations = build_allops_mini(int16_mode=int16_mode)
-    assign_ddr_addrs(invocations)
+    invocations = build_allops_model(int16_mode=int16_mode,
+                                     input_size=input_size)
+    inv_offset = INV_OFFSET_128 if input_size > 16 else INV_OFFSET_MINI
+    assign_ddr_addrs(invocations, inv_offset=inv_offset)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -950,11 +988,25 @@ def save_golden(output_dir, int16_mode=False):
 
 
 if __name__ == '__main__':
-    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            'golden_full_model')
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input-size', type=int, default=16,
+                        help='Input spatial size (16=mini, 128=large)')
+    args = parser.parse_args()
 
-    save_golden(os.path.join(base_dir, 'int8'), int16_mode=False)
+    size = args.input_size
+    model_name = f"AllOps-{size}"
+
+    if size == 16:
+        base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'golden_full_model')
+    else:
+        base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                f'golden_full_model_{size}')
+
+    save_golden(os.path.join(base_dir, 'int8'), int16_mode=False,
+                input_size=size)
 
     print(f"\n{'='*60}")
-    print("DONE. Golden data ready for AllOps-Mini full-model RTL E2E.")
+    print(f"DONE. Golden data ready for {model_name} full-model RTL E2E.")
     print(f"{'='*60}")

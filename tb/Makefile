@@ -55,7 +55,12 @@ VERILOG_SOURCES = $(RTL_DIR)/$(DUT).v
 endif
 
 # ─── Compile flags ───
+ifeq ($(SIM),verilator)
+COMPILE_ARGS = +incdir+$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) \
+               -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT
+else
 COMPILE_ARGS = -g2012 -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB)
+endif
 
 # ─── cocotb config ───
 TOPLEVEL   = $(DUT)
