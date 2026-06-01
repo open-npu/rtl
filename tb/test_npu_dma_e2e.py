@@ -1606,3 +1606,220 @@ async def test_concat_3branch(dut):
         branches=[{'in_c': 4}, {'in_c': 4}, {'in_c': 4}],
         int16_mode=False, relu=True, seed=203,
         test_name="Concat 3-branch")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# AllOps-Mini Full Model E2E Test
+# ═══════════════════════════════════════════════════════════════════════
+
+
+FULL_MODEL_GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      'golden_full_model')
+
+
+def load_golden_full_model(mode='int8'):
+    """Load golden data for AllOps-Mini full model test."""
+    d = os.path.join(FULL_MODEL_GOLDEN_DIR, mode)
+    with open(os.path.join(d, 'metadata.json')) as f:
+        metadata = json.load(f)
+
+    inv_data = []
+    for i in range(len(metadata)):
+        prefix = f'inv_{i:03d}'
+        entry = {
+            'wgt': np.load(os.path.join(d, f'{prefix}_wgt_words.npy')),
+            'param': np.load(os.path.join(d, f'{prefix}_param_words.npy')),
+            'input': np.load(os.path.join(d, f'{prefix}_input_words.npy')),
+            'output': np.load(os.path.join(d, f'{prefix}_output_words.npy')),
+        }
+        # Load optional Add/Concat data
+        b_path = os.path.join(d, f'{prefix}_input_b_words.npy')
+        if os.path.exists(b_path):
+            entry['input_b'] = np.load(b_path)
+        p_path = os.path.join(d, f'{prefix}_add_param_words.npy')
+        if os.path.exists(p_path):
+            entry['add_param'] = np.load(p_path)
+        inv_data.append(entry)
+
+    return metadata, inv_data
+
+
+async def program_generic_layer(wb, meta, out_base=None):
+    """Program CSR registers for any op type.
+
+    Handles Conv2D(0), DWConv(1), Pooling(3), Add(4), Resize(5),
+    Deconv(6), Concat(7).
+    """
+    op_type = meta['op_type']
+
+    # LAYER_MODE: op_type | (data_type << 4)
+    await wb.write(0x040, op_type | (meta['data_type'] << 4))
+
+    # Dimensions
+    await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
+    await wb.write(0x048, meta['in_c'])
+    await wb.write(0x04C, (meta['out_h'] << 16) | meta['out_w'])
+    await wb.write(0x050, meta['out_c'])
+
+    # Kernel & stride & padding
+    await wb.write(0x054, meta['kernel_h'] | (meta['kernel_w'] << 8))
+    await wb.write(0x058, meta['stride_h'] | (meta['stride_w'] << 8))
+    await wb.write(0x05C, meta['pad_top'] | (meta['pad_left'] << 8))
+
+    # Op-specific registers
+    if op_type == 3 and 'pool_cfg' in meta:
+        await wb.write(0x060, meta['pool_cfg'])
+    if op_type == 5 and 'resize_cfg' in meta:
+        await wb.write(0x064, meta['resize_cfg'])
+    if op_type == 6 and 'deconv_cfg' in meta:
+        await wb.write(0x068, meta['deconv_cfg'])
+    if op_type == 7 and 'concat_cfg' in meta:
+        await wb.write(0x06C, meta['concat_cfg'])
+
+    # Tiling
+    tile_h = meta.get('tile_h', 0)
+    tile_w = meta.get('tile_w', 0)
+    tile_num_h = meta.get('tile_num_h', 1)
+    tile_num_w = meta.get('tile_num_w', 1)
+    await wb.write(0x070, tile_h | (tile_w << 16))
+    await wb.write(0x074, tile_num_h | (tile_num_w << 16))
+
+    # SRAM_BASE
+    if out_base is None:
+        out_base = meta['n_input_words']
+    await wb.write(0x078, (out_base << 16) | 0)
+
+    # DMA addresses
+    await wb.write(0x100, meta['ddr_in_addr'])
+    await wb.write(0x104, meta['ddr_out_addr'])
+    await wb.write(0x108, meta['ddr_wgt_addr'])
+    await wb.write(0x10C, meta['ddr_param_addr'])
+
+    # DMA_ADD_B_ADDR for Add (op_type=4)
+    if 'ddr_add_b_addr' in meta:
+        await wb.write(0x120, meta['ddr_add_b_addr'])
+
+    # DMA sizes
+    await wb.write(0x128, meta['dma_in_size'])
+    await wb.write(0x12C, meta['dma_wgt_size'])
+    await wb.write(0x130, meta['dma_out_size'])
+
+    # Post-processing
+    await wb.write(0x180, meta['post_ctrl'])
+    param_count = meta.get('dma_param_count', 0)
+    if op_type in (4, 7):
+        # Add/Concat: param_count=1 to load the rescale params
+        param_count = 1
+    await wb.write(0x188, param_count)
+
+    # No fusion
+    await wb.write(0x118, 0)
+
+
+OP_NAMES = {0: 'Conv2D', 1: 'DWConv', 3: 'Pooling', 4: 'Add',
+             5: 'Resize', 6: 'Deconv', 7: 'Concat'}
+
+
+@cocotb.test()
+async def test_full_model_allops(dut):
+    """AllOps-Mini: 18-layer full model, 16×16 input, all 7 operator types.
+
+    Tests Conv2D→DWConv→Pool→Add→Resize→Concat→Deconv pipeline with
+    residual connections in a compact model for fast Icarus simulation.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    metadata, inv_data = load_golden_full_model('int8')
+
+    n_inv = len(metadata)
+    dut._log.info(f"[AllOps-Mini] Starting {n_inv} invocations "
+                  f"({len(set(m['layer_idx'] for m in metadata))} layers)")
+
+    # Pre-populate all weights and params in DDR
+    for i, (meta, data) in enumerate(zip(metadata, inv_data)):
+        if len(data['wgt']) > 0:
+            mem.populate(meta['ddr_wgt_addr'], data['wgt'])
+        if len(data['param']) > 0:
+            mem.populate(meta['ddr_param_addr'], data['param'])
+
+    # Track concat out_base for shared output region
+    concat_out_base = None
+
+    for i, (meta, data) in enumerate(zip(metadata, inv_data)):
+        op_type = meta['op_type']
+        op_name = OP_NAMES.get(op_type, f'Op{op_type}')
+        tile_s = f" tile[{meta['tile_idx']}]" if meta['tile_idx'] >= 0 else ""
+
+        dut._log.info(
+            f"  Inv{i:3d} L{meta['layer_idx']:2d}{tile_s}: {op_name:7s} "
+            f"[{meta['in_h']}x{meta['in_w']}x{meta['in_c']}] -> "
+            f"[{meta['out_h']}x{meta['out_w']}x{meta['out_c']}]")
+
+        # Populate input DDR
+        mem.populate(meta['ddr_in_addr'], data['input'])
+
+        # Add: also populate input B and add params
+        if 'input_b' in data:
+            mem.populate(meta['ddr_add_b_addr'], data['input_b'])
+        if 'add_param' in data:
+            mem.populate(meta['ddr_param_addr'], data['add_param'])
+
+        # Compute out_base
+        out_base = None
+        if op_type == 7:
+            # Concat: all branches share same out_base (max of all branch inputs)
+            if concat_out_base is None:
+                # First concat branch — compute shared out_base
+                # Look ahead to find all concat branches for this group
+                concat_input_sizes = []
+                for j in range(i, n_inv):
+                    if metadata[j]['op_type'] == 7:
+                        concat_input_sizes.append(metadata[j]['n_input_words'])
+                    else:
+                        break
+                concat_out_base = max(concat_input_sizes)
+            out_base = concat_out_base
+        else:
+            concat_out_base = None  # reset for non-concat layers
+
+        await program_generic_layer(wb, meta, out_base=out_base)
+
+        done = await run_layer_and_wait(wb, dut, timeout=500000)
+        assert done, f"Inv {i} (L{meta['layer_idx']}{tile_s}) did not complete"
+
+        # Verify output (only for invocations that have expected output)
+        n_out = meta['n_output_words']
+        if n_out > 0:
+            out_addr = meta['ddr_out_addr']
+            mismatches = []
+            for w_idx in range(n_out):
+                addr = out_addr + w_idx * 4
+                got = mem.mem.get(addr, None)
+                exp = int(data['output'][w_idx])
+                if got is None:
+                    mismatches.append((w_idx, exp, 'NOT_WRITTEN'))
+                elif got != exp:
+                    mismatches.append((w_idx, exp, got))
+
+            if mismatches:
+                detail = (f"Inv {i} L{meta['layer_idx']}{tile_s}: "
+                          f"{len(mismatches)}/{n_out} mismatches")
+                for idx_m, exp, got in mismatches[:5]:
+                    if got == 'NOT_WRITTEN':
+                        detail += f"\n  word[{idx_m}]: exp 0x{exp:08X}, NOT WRITTEN"
+                    else:
+                        detail += f"\n  word[{idx_m}]: exp 0x{exp:08X}, got 0x{got:08X}"
+                if len(mismatches) > 5:
+                    detail += f"\n  ... and {len(mismatches)-5} more"
+                dut._log.error(detail)
+                assert False, detail
+            else:
+                dut._log.info(f"    PASS: {n_out} words bit-exact")
+
+    dut._log.info(f"[AllOps-Mini] ALL {n_inv} invocations PASSED — "
+                  f"full model bit-exact!")
