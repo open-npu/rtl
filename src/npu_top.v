@@ -224,7 +224,7 @@ module npu_top #(
         .cfg_param_count    (reg_post_param_count[15:0]),
         .cfg_dma_ctrl       (reg_dma_ctrl),
         .cfg_layer_mode     (reg_layer_mode),
-        .cfg_out_base       (reg_sram_base[ACT_ADDR_W+16-1:16]),
+        .cfg_out_base       ({3'd0, reg_sram_base[ACT_ADDR_W+16-1:16]}),
         .cfg_dma_add_b_addr (reg_dma_add_b_addr)
     );
 
@@ -579,6 +579,7 @@ module npu_top #(
         .cfg_act_base   (reg_sram_base[ACT_ADDR_W-1:0]),
         .cfg_out_base   (reg_sram_base[ACT_ADDR_W+16-1:16]),
         .cfg_pool_cfg   (reg_pool_cfg),
+        .cfg_resize_cfg (reg_resize_cfg),
         // Weight SRAM Port B
         .wgt_rd_en      (wgt_b_en),
         .wgt_rd_addr    (wgt_b_addr),
@@ -632,4 +633,3 @@ module npu_top #(
     assign act_b_addr = act_b_wr_en ? act_b_wr_addr : act_b_rd_addr;
 
 endmodule
-
