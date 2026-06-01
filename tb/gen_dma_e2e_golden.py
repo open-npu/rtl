@@ -1116,6 +1116,140 @@ def gen_deconv_test(in_h=4, in_w=4, in_c=4, out_c=4,
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Concat (op_type=7) — Channel concatenation with per-branch rescale
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def ref_concat(input_nhwc, M_A, S_A, concat_offset, concat_total_c,
+               relu=True, clamp_min=-128, clamp_max=127):
+    """Reference Concat: rescale + place at channel offset.
+
+    Returns flat output array of shape [H, W, total_c].
+    Input shape is [H, W, in_c]. Output only has channels written at
+    [offset : offset+in_c]; the rest should be pre-filled (or from other branches).
+    """
+    h, w, in_c = input_nhwc.shape
+    dtype_out = np.int8 if clamp_max <= 127 else np.int16
+    out = np.zeros((h, w, concat_total_c), dtype=dtype_out)
+
+    for ih in range(h):
+        for iw in range(w):
+            for ic in range(in_c):
+                val = int(input_nhwc[ih, iw, ic])
+                prod = val * int(M_A)
+                if S_A > 0:
+                    rescaled = (prod + (1 << (S_A - 1))) >> S_A
+                else:
+                    rescaled = prod
+                rescaled = max(clamp_min, min(clamp_max, rescaled))
+                if relu:
+                    rescaled = max(0, rescaled)
+                out[ih, iw, concat_offset + ic] = dtype_out(rescaled)
+    return out
+
+
+def gen_concat_test(h=4, w=4, branches=None, relu=True,
+                    int16_mode=False, seed=200):
+    """Generate concat test data for multiple branches.
+
+    branches: list of dicts with {'in_c': int} per branch.
+    Returns a list of (meta, data) tuples (one per branch) plus the expected
+    combined output.
+    """
+    np.random.seed(seed)
+
+    if branches is None:
+        branches = [{'in_c': 4}, {'in_c': 4}]
+
+    total_c = sum(b['in_c'] for b in branches)
+
+    if int16_mode:
+        act_range = (-200, 200)
+        clamp_min, clamp_max = -32768, 32767
+        dtype_act = np.int16
+    else:
+        act_range = (-64, 64)
+        clamp_min, clamp_max = -128, 127
+        dtype_act = np.int8
+
+    # Generate input and params per branch
+    branch_results = []
+    offset = 0
+    combined_out = np.zeros((h, w, total_c), dtype=dtype_act)
+
+    for br in branches:
+        in_c = br['in_c']
+        inp = np.random.randint(act_range[0], act_range[1],
+                                (h, w, in_c), dtype=dtype_act)
+        # Rescale: scale ~0.8 (close to unity, keep values meaningful)
+        M_A, S_A = compute_ms(0.6 + 0.3 * np.random.rand())
+
+        # Compute golden for this branch
+        branch_out = ref_concat(inp, M_A, S_A, offset, total_c,
+                                relu=relu, clamp_min=clamp_min, clamp_max=clamp_max)
+
+        # Merge into combined output
+        combined_out[:, :, offset:offset+in_c] = branch_out[:, :, offset:offset+in_c]
+
+        # Pack input
+        if int16_mode:
+            input_words = pack_i16_to_words(inp)
+        else:
+            input_words = pack_i8_to_words(inp)
+
+        # Param: 1 word (M_A, S_A only)
+        param_word = (int(M_A) & 0x7FFF) | ((int(S_A) & 0x3F) << 16)
+        add_param_words = [param_word]
+
+        # POST_CTRL: mode=RELU_ONLY(10), relu_en
+        post_ctrl = 0x02  # mode=10 at bits[1:0]
+        if relu:
+            post_ctrl |= 0x04  # relu_en
+        if int16_mode:
+            post_ctrl |= 0x80
+
+        # concat_cfg register value: [15:0]=offset, [31:16]=total_c
+        concat_cfg = (offset & 0xFFFF) | ((total_c & 0xFFFF) << 16)
+
+        meta = {
+            'op_type': 7,
+            'data_type': 1 if int16_mode else 0,
+            'in_h': h, 'in_w': w, 'in_c': in_c,
+            'out_h': h, 'out_w': w, 'out_c': in_c,
+            'kernel_h': 1, 'kernel_w': 1,
+            'stride_h': 1, 'stride_w': 1,
+            'pad_top': 0, 'pad_left': 0,
+            'post_ctrl': post_ctrl,
+            'concat_cfg': concat_cfg,
+            'concat_offset': offset,
+            'concat_total_c': total_c,
+            'dma_wgt_size': 0,
+            'dma_in_size': len(input_words) * 4,
+            'dma_out_size': (h * w * total_c * (2 if int16_mode else 1) + 3) // 4 * 4,
+            'dma_param_count': 0,
+            'n_input_words': len(input_words),
+            'n_add_param_words': len(add_param_words),
+            'M_A': M_A, 'S_A': S_A,
+            'relu': relu,
+        }
+
+        branch_results.append((meta, {
+            'input_words': input_words,
+            'add_param_words': add_param_words,
+        }))
+
+        offset += in_c
+
+    # Pack combined output
+    if int16_mode:
+        output_words = pack_i16_to_words(combined_out)
+    else:
+        output_words = pack_i8_to_words(combined_out)
+
+    return branch_results, output_words, total_c
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
