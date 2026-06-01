@@ -662,7 +662,7 @@ async def test_dma_e2e_tiling_int16(dut):
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gen_dma_e2e_golden import gen_pooling_test, gen_add_test, gen_resize_test
+from gen_dma_e2e_golden import gen_pooling_test, gen_add_test, gen_resize_test, gen_deconv_test
 
 
 # DDR addresses for operator tests
@@ -1243,3 +1243,232 @@ async def test_resize_bilinear_3x3to5x5(dut):
             dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
     assert len(mismatches) == 0, f"Resize bilinear 3x3->5x5: {len(mismatches)}/{n_words} mismatches"
     dut._log.info(f"Resize bilinear 3x3->5x5 PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Deconv (Transposed Convolution) helpers and tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def program_deconv_layer(wb, meta, data):
+    """Program CSR registers for a deconv test layer."""
+    # LAYER_MODE: op_type=6 | (data_type << 4)
+    await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
+
+    # Dimensions
+    await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
+    await wb.write(0x048, meta['in_c'])
+    await wb.write(0x04C, (meta['out_h'] << 16) | meta['out_w'])
+    await wb.write(0x050, meta['out_c'])
+
+    # Kernel & stride & padding
+    await wb.write(0x054, meta['kernel_h'] | (meta['kernel_w'] << 8))
+    await wb.write(0x058, meta['stride_h'] | (meta['stride_w'] << 8))
+    await wb.write(0x05C, meta['pad_top'] | (meta['pad_left'] << 8))
+
+    # DECONV_CFG: [7:0]=INSERT_H, [15:8]=INSERT_W
+    await wb.write(0x068, meta['deconv_cfg'])
+
+    # Tiling: no tiling (single tile covers full output)
+    await wb.write(0x070, 0)
+    await wb.write(0x074, (1 << 16) | 1)
+
+    # SRAM_BASE: act_base=0, out_base after input+wgt
+    out_base = meta['n_input_words']
+    await wb.write(0x078, (out_base << 16) | 0)
+
+    # DMA addresses
+    await wb.write(0x100, POOL_IN_ADDR)
+    await wb.write(0x104, POOL_OUT_ADDR)
+    await wb.write(0x108, POOL_WGT_ADDR)
+    await wb.write(0x10C, POOL_PARAM_ADDR)
+
+    # DMA sizes
+    await wb.write(0x128, meta['dma_in_size'])
+    await wb.write(0x12C, meta['dma_wgt_size'])
+    await wb.write(0x130, meta['dma_out_size'])
+
+    # Post-processing (MODE_CONV_REQ)
+    await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x188, meta['dma_param_count'])
+    await wb.write(0x118, 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Deconv 2x2 stride 2, INT8
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_deconv_2x2_stride2(dut):
+    """Deconv 2x2 stride-2: 3x3x4 -> 6x6x4, INT8."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_deconv_test(in_h=3, in_w=3, in_c=4, out_c=4,
+                                  kernel_h=2, kernel_w=2, insert_h=1, insert_w=1,
+                                  pad_top=0, pad_left=0, int16_mode=False, seed=200)
+
+    mem.populate(POOL_WGT_ADDR, data['wgt_words'])
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_deconv_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=300000)
+    assert done, "Deconv 2x2 stride-2 did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"Deconv 2x2 stride-2: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"Deconv 2x2 stride-2 PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Deconv 3x3 stride 2, INT8
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_deconv_3x3_stride2(dut):
+    """Deconv 3x3 stride-2 with padding: 4x4x4 -> 7x7x4, INT8."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_deconv_test(in_h=4, in_w=4, in_c=4, out_c=4,
+                                  kernel_h=3, kernel_w=3, insert_h=1, insert_w=1,
+                                  pad_top=1, pad_left=1, int16_mode=False, seed=201)
+
+    mem.populate(POOL_WGT_ADDR, data['wgt_words'])
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_deconv_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=300000)
+    assert done, "Deconv 3x3 stride-2 did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"Deconv 3x3 stride-2: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"Deconv 3x3 stride-2 PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Deconv 2x2 stride 2, INT16
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_deconv_int16(dut):
+    """Deconv 2x2 stride-2: 3x3x4 -> 6x6x4, INT16."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_deconv_test(in_h=3, in_w=3, in_c=4, out_c=4,
+                                  kernel_h=2, kernel_w=2, insert_h=1, insert_w=1,
+                                  pad_top=0, pad_left=0, int16_mode=True, seed=202)
+
+    mem.populate(POOL_WGT_ADDR, data['wgt_words'])
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_deconv_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=300000)
+    assert done, "Deconv INT16 did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"Deconv INT16: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"Deconv INT16 PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Deconv multichannel (out_c=16, in_c=8)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_deconv_multichannel(dut):
+    """Deconv multichannel: 4x4x8 -> 8x8x16, kernel 2x2 stride-2, INT8."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_deconv_test(in_h=4, in_w=4, in_c=8, out_c=16,
+                                  kernel_h=2, kernel_w=2, insert_h=1, insert_w=1,
+                                  pad_top=0, pad_left=0, int16_mode=False, seed=203)
+
+    mem.populate(POOL_WGT_ADDR, data['wgt_words'])
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_deconv_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=500000)
+    assert done, "Deconv multichannel did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"Deconv multichannel: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"Deconv multichannel PASSED: {n_words} words bit-exact")
