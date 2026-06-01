@@ -37,24 +37,37 @@ module npu_systolic #(
     input  wire                         cmd_valid,
 
     // ─── Weight Load ───
-    input  wire signed [DATA_W-1:0]     wgt_data [0:ROWS-1],
+    input  wire [DATA_W*ROWS-1:0]       wgt_data_flat,
     input  wire                         wgt_valid,
 
     // ─── Activation Input ───
-    input  wire signed [DATA_W-1:0]     act_data [0:ROWS-1],
+    input  wire [DATA_W*ROWS-1:0]       act_data_flat,
     input  wire                         act_valid,
 
     // ─── Drain Control ───
     input  wire [$clog2(COLS)-1:0]      drain_col_sel,  // Which column to drain
 
     // ─── Accumulator Output ───
-    output wire signed [ACC_W-1:0]      acc_out [0:ROWS-1],
+    output wire [ACC_W*ROWS-1:0]        acc_out_flat,
     output reg                          acc_out_valid,
 
     // ─── Status ───
     output wire                         busy,
     output wire                         ready
 );
+
+    // ─── Unpack flattened ports to internal arrays ───
+    wire signed [DATA_W-1:0] wgt_data [0:ROWS-1];
+    wire signed [DATA_W-1:0] act_data [0:ROWS-1];
+    wire signed [ACC_W-1:0]  acc_out  [0:ROWS-1];
+    genvar gi;
+    generate
+        for (gi = 0; gi < ROWS; gi = gi + 1) begin : unpack_ports
+            assign wgt_data[gi] = wgt_data_flat[DATA_W*gi +: DATA_W];
+            assign act_data[gi] = act_data_flat[DATA_W*gi +: DATA_W];
+            assign acc_out_flat[ACC_W*gi +: ACC_W] = acc_out[gi];
+        end
+    endgenerate
 
     // ─── Mode encoding ───
     localparam MODE_IDLE     = 2'b00;

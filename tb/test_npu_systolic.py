@@ -21,6 +21,9 @@ MODE_WGT_LOAD = 0b01
 MODE_COMPUTE  = 0b10
 MODE_DRAIN    = 0b11
 
+DATA_W = 16
+ACC_W  = 40
+
 def get_array_size(dut):
     """Get array size from RTL parameter."""
     return int(dut.ROWS.value)
@@ -37,6 +40,19 @@ def signed_acc(val, bits=40):
     return val
 
 
+def pack_flat(values, elem_w):
+    """Pack a list of element values into a single flat integer."""
+    flat = 0
+    for i, v in enumerate(values):
+        flat |= (int(v) & ((1 << elem_w) - 1)) << (elem_w * i)
+    return flat
+
+
+def unpack_flat(flat_val, idx, elem_w):
+    """Extract element idx from a flat packed integer."""
+    return (int(flat_val) >> (elem_w * idx)) & ((1 << elem_w) - 1)
+
+
 async def reset_dut(dut):
     """Initialize and reset the DUT."""
     N = get_array_size(dut)
@@ -46,9 +62,8 @@ async def reset_dut(dut):
     dut.wgt_valid.value = 0
     dut.act_valid.value = 0
     dut.drain_col_sel.value = 0
-    for i in range(N):
-        dut.wgt_data[i].value = 0
-        dut.act_data[i].value = 0
+    dut.wgt_data_flat.value = 0
+    dut.act_data_flat.value = 0
     await RisingEdge(dut.clk)
 
 
@@ -69,8 +84,8 @@ async def load_weights(dut, weight_matrix):
 
     # Load one column per cycle
     for col in range(N):
-        for row in range(N):
-            dut.wgt_data[row].value = int8_to_unsigned(weight_matrix[col][row])
+        wgt_vals = [int8_to_unsigned(weight_matrix[col][row]) for row in range(N)]
+        dut.wgt_data_flat.value = pack_flat(wgt_vals, DATA_W)
         dut.wgt_valid.value = 1
         await RisingEdge(dut.clk)
 
@@ -100,8 +115,8 @@ async def stream_activations(dut, act_matrix):
 
     # Stream K activation vectors
     for k in range(K):
-        for row in range(N):
-            dut.act_data[row].value = int8_to_unsigned(act_matrix[k][row])
+        act_vals = [int8_to_unsigned(act_matrix[k][row]) for row in range(N)]
+        dut.act_data_flat.value = pack_flat(act_vals, DATA_W)
         dut.act_valid.value = 1
         await RisingEdge(dut.clk)
 
@@ -133,8 +148,9 @@ async def drain_column(dut, col):
     await RisingEdge(dut.clk)  # Cycle 2: S_DRAIN_OUT (valid=1)
 
     results = []
+    acc_flat = int(dut.acc_out_flat.value)
     for row in range(N):
-        results.append(signed_acc(dut.acc_out[row].value))
+        results.append(signed_acc(unpack_flat(acc_flat, row, ACC_W)))
 
     await RisingEdge(dut.clk)  # Cycle 3: back to READY
     return results

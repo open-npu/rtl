@@ -63,8 +63,7 @@ async def systolic_ppu_stub(dut):
             await RisingEdge(dut.clk)
             await RisingEdge(dut.clk)
             dut.sa_acc_out_valid.value = 1
-            for i in range(ARRAY_SIZE):
-                dut.sa_acc_out[i].value = 0
+            dut.sa_acc_out_flat.value = 0
             await RisingEdge(dut.clk)
             dut.sa_acc_out_valid.value = 0
             cycle += 3
