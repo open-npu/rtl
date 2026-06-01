@@ -940,6 +940,51 @@ async def test_pool_avg_global(dut):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Test: MaxPool 2x2 stride 2, INT16
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_pool_max_int16(dut):
+    """MaxPool 2x2 stride 2, 4x4x8 -> 2x2x8, INT16."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_pooling_test(mode='max', pool_h=2, pool_w=2,
+                                  pool_sh=2, pool_sw=2,
+                                  in_h=4, in_w=4, in_c=8,
+                                  int16_mode=True, seed=45)
+
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_pooling_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=100000)
+    assert done, "MaxPool INT16 did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"MaxPool INT16: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"MaxPool INT16 PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Test: Eltwise Add basic, INT8
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1822,6 +1867,112 @@ async def test_full_model_allops(dut):
                 dut._log.info(f"    PASS: {n_out} words bit-exact")
 
     dut._log.info(f"[AllOps-Mini] ALL {n_inv} invocations PASSED — "
+                  f"full model bit-exact!")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# AllOps-Mini INT16 Full Model E2E Test
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_full_model_allops_int16(dut):
+    """AllOps-Mini INT16: 18-layer full model, 16×16 input, all 7 operator types.
+
+    Same topology as test_full_model_allops but with INT16 data path.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    metadata, inv_data = load_golden_full_model('int16')
+
+    n_inv = len(metadata)
+    dut._log.info(f"[AllOps-Mini-INT16] Starting {n_inv} invocations "
+                  f"({len(set(m['layer_idx'] for m in metadata))} layers)")
+
+    # Pre-populate all weights and params in DDR
+    for i, (meta, data) in enumerate(zip(metadata, inv_data)):
+        if len(data['wgt']) > 0:
+            mem.populate(meta['ddr_wgt_addr'], data['wgt'])
+        if len(data['param']) > 0:
+            mem.populate(meta['ddr_param_addr'], data['param'])
+
+    # Track concat out_base for shared output region
+    concat_out_base = None
+
+    for i, (meta, data) in enumerate(zip(metadata, inv_data)):
+        op_type = meta['op_type']
+        op_name = OP_NAMES.get(op_type, f'Op{op_type}')
+        tile_s = f" tile[{meta['tile_idx']}]" if meta['tile_idx'] >= 0 else ""
+
+        dut._log.info(
+            f"  Inv{i:3d} L{meta['layer_idx']:2d}{tile_s}: {op_name:7s} "
+            f"[{meta['in_h']}x{meta['in_w']}x{meta['in_c']}] -> "
+            f"[{meta['out_h']}x{meta['out_w']}x{meta['out_c']}]")
+
+        # Populate input DDR
+        mem.populate(meta['ddr_in_addr'], data['input'])
+
+        # Add: also populate input B and add params
+        if 'input_b' in data:
+            mem.populate(meta['ddr_add_b_addr'], data['input_b'])
+        if 'add_param' in data:
+            mem.populate(meta['ddr_param_addr'], data['add_param'])
+
+        # Compute out_base
+        out_base = None
+        if op_type == 7:
+            if concat_out_base is None:
+                concat_input_sizes = []
+                for j in range(i, n_inv):
+                    if metadata[j]['op_type'] == 7:
+                        concat_input_sizes.append(metadata[j]['n_input_words'])
+                    else:
+                        break
+                concat_out_base = max(concat_input_sizes)
+            out_base = concat_out_base
+        else:
+            concat_out_base = None
+
+        await program_generic_layer(wb, meta, out_base=out_base)
+
+        done = await run_layer_and_wait(wb, dut, timeout=500000)
+        assert done, f"Inv {i} (L{meta['layer_idx']}{tile_s}) did not complete"
+
+        # Verify output
+        n_out = meta['n_output_words']
+        if n_out > 0:
+            out_addr = meta['ddr_out_addr']
+            mismatches = []
+            for w_idx in range(n_out):
+                addr = out_addr + w_idx * 4
+                got = mem.mem.get(addr, None)
+                exp = int(data['output'][w_idx])
+                if got is None:
+                    mismatches.append((w_idx, exp, 'NOT_WRITTEN'))
+                elif got != exp:
+                    mismatches.append((w_idx, exp, got))
+
+            if mismatches:
+                detail = (f"Inv {i} L{meta['layer_idx']}{tile_s}: "
+                          f"{len(mismatches)}/{n_out} mismatches")
+                for idx_m, exp, got in mismatches[:5]:
+                    if got == 'NOT_WRITTEN':
+                        detail += f"\n  word[{idx_m}]: exp 0x{exp:08X}, NOT WRITTEN"
+                    else:
+                        detail += f"\n  word[{idx_m}]: exp 0x{exp:08X}, got 0x{got:08X}"
+                if len(mismatches) > 5:
+                    detail += f"\n  ... and {len(mismatches)-5} more"
+                dut._log.error(detail)
+                assert False, detail
+            else:
+                dut._log.info(f"    PASS: {n_out} words bit-exact")
+
+    dut._log.info(f"[AllOps-Mini-INT16] ALL {n_inv} invocations PASSED — "
                   f"full model bit-exact!")
 
 

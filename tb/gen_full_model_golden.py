@@ -1007,6 +1007,9 @@ if __name__ == '__main__':
     save_golden(os.path.join(base_dir, 'int8'), int16_mode=False,
                 input_size=size)
 
+    save_golden(os.path.join(base_dir, 'int16'), int16_mode=True,
+                input_size=size)
+
     print(f"\n{'='*60}")
-    print(f"DONE. Golden data ready for {model_name} full-model RTL E2E.")
+    print(f"DONE. Golden data ready for {model_name} full-model RTL E2E (INT8 + INT16).")
     print(f"{'='*60}")
