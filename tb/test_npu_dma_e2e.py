@@ -662,7 +662,7 @@ async def test_dma_e2e_tiling_int16(dut):
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gen_dma_e2e_golden import gen_pooling_test, gen_add_test
+from gen_dma_e2e_golden import gen_pooling_test, gen_add_test, gen_resize_test
 
 
 # DDR addresses for operator tests
@@ -766,6 +766,40 @@ async def program_add_layer(wb, meta, data):
     await wb.write(0x188, 1)
 
     # No fusion
+    await wb.write(0x118, 0)
+
+
+async def program_resize_layer(wb, meta, data):
+    """Program CSR registers for a resize test layer."""
+    await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
+
+    await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
+    await wb.write(0x048, meta['in_c'])
+    await wb.write(0x04C, (meta['out_h'] << 16) | meta['out_w'])
+    await wb.write(0x050, meta['out_c'])
+
+    await wb.write(0x054, 1 | (1 << 8))
+    await wb.write(0x058, 1 | (1 << 8))
+    await wb.write(0x05C, 0)
+    await wb.write(0x064, meta['resize_cfg'])
+
+    await wb.write(0x070, 0)
+    await wb.write(0x074, (1 << 16) | 1)
+
+    out_base = meta['n_input_words']
+    await wb.write(0x078, (out_base << 16) | 0)
+
+    await wb.write(0x100, POOL_IN_ADDR)
+    await wb.write(0x104, POOL_OUT_ADDR)
+    await wb.write(0x108, POOL_WGT_ADDR)
+    await wb.write(0x10C, POOL_PARAM_ADDR)
+
+    await wb.write(0x128, meta['dma_in_size'])
+    await wb.write(0x12C, 0)
+    await wb.write(0x130, meta['dma_out_size'])
+
+    await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x188, meta['dma_param_count'])
     await wb.write(0x118, 0)
 
 
@@ -1033,3 +1067,179 @@ async def test_add_int16(dut):
             dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
     assert len(mismatches) == 0, f"Add INT16: {len(mismatches)}/{n_words} mismatches"
     dut._log.info(f"Add INT16 PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Resize nearest 2x, INT8
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_resize_nearest_2x(dut):
+    """Resize nearest 4x4x4 -> 8x8x4, INT8."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_resize_test(in_h=4, in_w=4, in_c=4,
+                                 out_h=8, out_w=8,
+                                 resize_mode=0, int16_mode=False, seed=120)
+
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_resize_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=200000)
+    assert done, "Resize nearest 2x did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"Resize nearest 2x: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"Resize nearest 2x PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Resize bilinear 2x, INT8
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_resize_bilinear_2x(dut):
+    """Resize bilinear 4x4x4 -> 8x8x4, INT8."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_resize_test(in_h=4, in_w=4, in_c=4,
+                                 out_h=8, out_w=8,
+                                 resize_mode=1, int16_mode=False, seed=121)
+
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_resize_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=200000)
+    assert done, "Resize bilinear 2x did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"Resize bilinear 2x: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"Resize bilinear 2x PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Resize nearest 2x, INT16
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_resize_nearest_int16(dut):
+    """Resize nearest 4x4x4 -> 8x8x4, INT16."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_resize_test(in_h=4, in_w=4, in_c=4,
+                                 out_h=8, out_w=8,
+                                 resize_mode=0, int16_mode=True, seed=122)
+
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_resize_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=200000)
+    assert done, "Resize nearest INT16 did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"Resize nearest INT16: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"Resize nearest INT16 PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Resize bilinear 3x3 -> 5x5, INT8
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_resize_bilinear_3x3to5x5(dut):
+    """Resize bilinear 3x3x4 -> 5x5x4, INT8."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_resize_test(in_h=3, in_w=3, in_c=4,
+                                 out_h=5, out_w=5,
+                                 resize_mode=1, int16_mode=False, seed=123)
+
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_resize_layer(wb, meta, data)
+    done = await run_layer_and_wait(wb, dut, timeout=200000)
+    assert done, "Resize bilinear 3x3->5x5 did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"Resize bilinear 3x3->5x5: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"Resize bilinear 3x3->5x5 PASSED: {n_words} words bit-exact")

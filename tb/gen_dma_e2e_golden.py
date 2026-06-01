@@ -204,6 +204,55 @@ def ref_eltwise_add(input_a, input_b, M_A, S_A, M_B, S_B, relu=True,
     return out_flat.reshape(input_a.shape)
 
 
+def ref_resize(input_nhwc, cfg, int16_mode=False):
+    """Reference Resize matching csim/src/resize.c.
+
+    Returns int64 accumulator [out_h][out_w][ch].
+    """
+    in_h, in_w, ch = cfg['in_h'], cfg['in_w'], cfg['in_c']
+    out_h, out_w = cfg['out_h'], cfg['out_w']
+    acc = np.zeros((out_h, out_w, ch), dtype=np.int64)
+
+    if cfg['resize_mode'] == 0:
+        for oh in range(out_h):
+            ih = (oh * in_h) // out_h
+            ih = min(ih, in_h - 1)
+            for ow in range(out_w):
+                iw = (ow * in_w) // out_w
+                iw = min(iw, in_w - 1)
+                acc[oh, ow, :] = input_nhwc[ih, iw, :].astype(np.int64)
+    else:
+        for oh in range(out_h):
+            if out_h > 1:
+                src_h_q8 = oh * ((in_h - 1) << 8) // (out_h - 1)
+            else:
+                src_h_q8 = 0
+            ih0 = src_h_q8 >> 8
+            ih1 = min(ih0 + 1, in_h - 1)
+            frac_h = src_h_q8 & 0xFF
+
+            for ow in range(out_w):
+                if out_w > 1:
+                    src_w_q8 = ow * ((in_w - 1) << 8) // (out_w - 1)
+                else:
+                    src_w_q8 = 0
+                iw0 = src_w_q8 >> 8
+                iw1 = min(iw0 + 1, in_w - 1)
+                frac_w = src_w_q8 & 0xFF
+
+                v00 = input_nhwc[ih0, iw0, :].astype(np.int64)
+                v01 = input_nhwc[ih0, iw1, :].astype(np.int64)
+                v10 = input_nhwc[ih1, iw0, :].astype(np.int64)
+                v11 = input_nhwc[ih1, iw1, :].astype(np.int64)
+
+                top = v00 * (256 - frac_w) + v01 * frac_w
+                bot = v10 * (256 - frac_w) + v11 * frac_w
+                val = top * (256 - frac_h) + bot * frac_h
+                acc[oh, ow, :] = (val + (1 << 15)) >> 16
+
+    return acc
+
+
 def pack_add_params(M_A, S_A, M_B, S_B):
     """Pack Add rescale params into 2 uint32 words.
 
@@ -833,6 +882,87 @@ def gen_add_test(h=4, w=4, c=8, relu=True, int16_mode=False, seed=100):
         'input_a_words': input_a_words,
         'input_b_words': input_b_words,
         'add_param_words': add_param_words,
+        'output_words': output_words,
+    }
+
+
+def gen_resize_test(in_h=4, in_w=4, in_c=4, out_h=8, out_w=8,
+                    resize_mode=0, int16_mode=False, seed=120):
+    """Generate one resize test layer (input + params + expected output)."""
+    np.random.seed(seed)
+
+    if int16_mode:
+        act_range = (-200, 200)
+        clamp_min, clamp_max = -32768, 32767
+        dtype_act = np.int16
+    else:
+        act_range = (-64, 64)
+        clamp_min, clamp_max = -128, 127
+        dtype_act = np.int8
+
+    input_nhwc = np.random.randint(act_range[0], act_range[1],
+                                   (in_h, in_w, in_c), dtype=dtype_act)
+
+    cfg = {
+        'op_type': 5,
+        'data_type': 1 if int16_mode else 0,
+        'in_h': in_h, 'in_w': in_w, 'in_c': in_c,
+        'out_h': out_h, 'out_w': out_w, 'out_c': in_c,
+        'kernel_h': 1, 'kernel_w': 1,
+        'stride_h': 1, 'stride_w': 1,
+        'pad_top': 0, 'pad_left': 0,
+        'resize_mode': resize_mode,
+    }
+
+    acc = ref_resize(input_nhwc, cfg, int16_mode=int16_mode)
+
+    M_arr = np.ones(in_c, dtype=np.uint16)
+    S_arr = np.zeros(in_c, dtype=np.uint8)
+    bias_arr = np.zeros(in_c, dtype=np.int64)
+    zp_arr = np.zeros(in_c, dtype=np.int16)
+
+    out = ref_postproc(acc, M_arr, S_arr, bias_arr, zp_arr,
+                       relu6=False, clamp_min=clamp_min, clamp_max=clamp_max)
+
+    if int16_mode:
+        input_words = pack_i16_to_words(input_nhwc)
+        output_words = pack_i16_to_words(out)
+    else:
+        input_words = pack_i8_to_words(input_nhwc)
+        output_words = pack_i8_to_words(out)
+    param_words = pack_params_for_sram(M_arr, S_arr, bias_arr, zp_arr, in_c)
+
+    scale_h_q44 = int(round((out_h / in_h) * 16.0)) & 0xFF
+    scale_w_q44 = int(round((out_w / in_w) * 16.0)) & 0xFF
+    resize_cfg_reg = resize_mode | (scale_h_q44 << 8) | (scale_w_q44 << 16)
+
+    post_ctrl = 0x60
+    if int16_mode:
+        post_ctrl |= 0x80
+
+    meta = {
+        'op_type': 5,
+        'data_type': cfg['data_type'],
+        'in_h': in_h, 'in_w': in_w, 'in_c': in_c,
+        'out_h': out_h, 'out_w': out_w, 'out_c': in_c,
+        'kernel_h': 1, 'kernel_w': 1,
+        'stride_h': 1, 'stride_w': 1,
+        'pad_top': 0, 'pad_left': 0,
+        'resize_mode': resize_mode,
+        'resize_cfg': resize_cfg_reg,
+        'post_ctrl': post_ctrl,
+        'dma_wgt_size': 0,
+        'dma_in_size': len(input_words) * 4,
+        'dma_out_size': len(output_words) * 4,
+        'dma_param_count': in_c,
+        'n_input_words': len(input_words),
+        'n_output_words': len(output_words),
+        'n_param_words': len(param_words),
+    }
+
+    return meta, {
+        'input_words': input_words,
+        'param_words': param_words,
         'output_words': output_words,
     }
 

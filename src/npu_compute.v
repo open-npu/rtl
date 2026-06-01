@@ -17,7 +17,7 @@
 //   - Spatial output count is handled by repeated compute passes
 //   - Weights reloaded per-pixel per-pass (correctness over efficiency)
 //
-// Op types: 0=Conv2D, 1=DWConv, 2=FC
+// Op types: 0=Conv2D, 1=DWConv, 2=FC, 3=Pooling, 4=Add, 5=Resize
 
 `include "npu_defines.vh"
 
@@ -58,6 +58,7 @@ module npu_compute #(
     input  wire [ACT_ADDR_W-1:0]        cfg_act_base,   // Input activation base (word addr)
     input  wire [ACT_ADDR_W-1:0]        cfg_out_base,   // Output base (word addr in act SRAM)
     input  wire [31:0]                  cfg_pool_cfg,   // Pooling config register
+    input  wire [31:0]                  cfg_resize_cfg, // Resize config register
 
     // ─── Weight SRAM Port B (read-only) ───
     output reg                          wgt_rd_en,
@@ -174,7 +175,21 @@ module npu_compute #(
         S_ADD_PPU       = 6'd45,
         S_ADD_PPU_WAIT  = 6'd46,
         S_ADD_WB        = 6'd47,
-        S_ADD_NEXT      = 6'd48;
+        S_ADD_NEXT      = 6'd48,
+        // Resize states
+        S_RESIZE_SETUP    = 6'd49,
+        S_RESIZE_CH_SETUP = 6'd50,
+        S_RESIZE_COORD    = 6'd51,
+        S_RESIZE_READ0    = 6'd52,
+        S_RESIZE_READ1    = 6'd53,
+        S_RESIZE_READ2    = 6'd54,
+        S_RESIZE_READ3    = 6'd55,
+        S_RESIZE_INTERP   = 6'd56,
+        S_RESIZE_PPU      = 6'd57,
+        S_RESIZE_PPU_WAIT = 6'd58,
+        S_RESIZE_WB       = 6'd59,
+        S_RESIZE_PIX_NEXT = 6'd60,
+        S_RESIZE_CH_NEXT  = 6'd61;
 
     reg [5:0] state;
 
@@ -276,6 +291,7 @@ module npu_compute #(
     wire [3:0]  pool_cfg_sh   = cfg_pool_cfg[15:12];
     wire [3:0]  pool_cfg_sw   = cfg_pool_cfg[19:16];
     wire        global_pool   = cfg_pool_cfg[20];
+    wire        resize_mode   = cfg_resize_cfg[0];   // 0=nearest, 1=bilinear
     reg signed [ACC_W-1:0] pool_acc;     // Running sum or max
     reg [15:0]             pool_count;   // Valid element count (AvgPool)
     reg [3:0]              pool_fh, pool_fw; // Window position
@@ -302,6 +318,18 @@ module npu_compute #(
     reg [ACT_ADDR_W-1:0]  add_wb_addr;     // Writeback word address
     reg [1:0]             add_wb_bytesel;  // Writeback byte select
     reg [15:0]            add_wb_byte;     // PPU output to write
+
+    // ─── Resize state ───
+    reg [15:0]             rsz_oh, rsz_ow;
+    reg [15:0]             rsz_ch;
+    reg signed [ACC_W-1:0] rsz_v00, rsz_v01, rsz_v10, rsz_v11;
+    reg [7:0]              rsz_frac_h, rsz_frac_w;
+    reg [15:0]             rsz_ih0, rsz_iw0, rsz_ih1, rsz_iw1;
+    reg [1:0]              rsz_rd_phase;
+    reg [1:0]              rsz_wb_phase;
+    reg [ACT_ADDR_W-1:0]   rsz_wb_addr;
+    reg [1:0]              rsz_wb_bytesel;
+    reg [15:0]             rsz_wb_byte;
 
     integer i;
 
@@ -377,6 +405,13 @@ module npu_compute #(
             add_elem_cnt <= 0; add_total_elems <= 0;
             add_rd_phase <= 0; add_param_phase <= 0; add_param_idx <= 0;
             add_wb_phase <= 0; add_wb_addr <= 0; add_wb_bytesel <= 0; add_wb_byte <= 0;
+            // Resize resets
+            rsz_oh <= 0; rsz_ow <= 0; rsz_ch <= 0;
+            rsz_v00 <= 0; rsz_v01 <= 0; rsz_v10 <= 0; rsz_v11 <= 0;
+            rsz_frac_h <= 0; rsz_frac_w <= 0;
+            rsz_ih0 <= 0; rsz_iw0 <= 0; rsz_ih1 <= 0; rsz_iw1 <= 0;
+            rsz_rd_phase <= 0; rsz_wb_phase <= 0;
+            rsz_wb_addr <= 0; rsz_wb_bytesel <= 0; rsz_wb_byte <= 0;
             for (i = 0; i < ARRAY_SIZE; i = i + 1) begin
                 sa_wgt_data[i] <= 0;
                 sa_act_data[i] <= 0;
@@ -405,7 +440,7 @@ module npu_compute #(
             // ══════════════════════════════════════════════════════════════
             S_IDLE: begin
                 if (start) begin
-                    if (cfg_op_type == 8'd1 || cfg_op_type == 8'd3)
+                    if (cfg_op_type == 8'd1 || cfg_op_type == 8'd3 || cfg_op_type == 8'd5)
                         oc_groups_total <= cfg_out_c;
                     else
                         oc_groups_total <= (cfg_out_c + ARRAY_SIZE_16 - 1) / ARRAY_SIZE_16;
@@ -461,6 +496,8 @@ module npu_compute #(
                     state <= S_POOL_SETUP;
                 end else if (cfg_op_type == 8'd4) begin
                     state <= S_ADD_SETUP;
+                end else if (cfg_op_type == 8'd5) begin
+                    state <= S_RESIZE_SETUP;
                 end else begin
                     state <= S_OC_SETUP;
                 end
@@ -1022,6 +1059,11 @@ module npu_compute #(
                         dw_read_issued <= 1'b0;
                         dw_init_phase <= 2'd0;
                         state <= S_DW_WGT_LOAD;
+                    end else if (cfg_op_type == 8'd5) begin
+                        rsz_ch <= rsz_ch + 1;
+                        param_word_idx <= 0;
+                        param_read_issued <= 1'b0;
+                        state <= S_RESIZE_CH_SETUP;
                     end else begin
                         state <= S_OC_SETUP;
                     end
@@ -1826,6 +1868,374 @@ module npu_compute #(
                     add_elem_cnt <= add_elem_cnt + 1;
                     add_rd_phase <= 0;
                     state <= S_ADD_READ_A;
+                end
+            end
+
+            // ══════════════════════════════════════════════════════════════
+            // Resize Path (op_type=5)
+            // Flow: SETUP → CH_SETUP → COORD → READ0[/1/2/3] → INTERP → PPU → WB → PIX_NEXT → CH_NEXT
+            // ══════════════════════════════════════════════════════════════
+            S_RESIZE_SETUP: begin
+                rsz_ch <= 0;
+                rsz_oh <= 0;
+                rsz_ow <= 0;
+                param_word_idx <= 0;
+                param_read_issued <= 1'b0;
+                rsz_rd_phase <= 0;
+                state <= S_RESIZE_CH_SETUP;
+            end
+
+            S_RESIZE_CH_SETUP: begin
+                if (!param_read_issued) begin
+                    param_rd_en   <= 1'b1;
+                    param_rd_addr <= (rsz_ch * 4) + param_word_idx;
+                    param_read_issued <= 1'b1;
+                    act_read_issued <= 1'b0;
+                end else if (!act_read_issued) begin
+                    act_read_issued <= 1'b1;
+                end else begin
+                    param_buf[param_word_idx] <= param_rd_data;
+                    if (param_word_idx == 3'd3) begin
+                        ppu_mult_m     <= param_buf[0][14:0];
+                        ppu_shift_s    <= param_buf[0][21:16];
+                        ppu_zero_point <= $signed(param_buf[1][15:0]);
+                        ppu_bias       <= $signed({param_buf[3][15:0], param_buf[2],
+                                                   param_buf[1][31:16]});
+                        rsz_oh <= 0;
+                        rsz_ow <= 0;
+                        rsz_rd_phase <= 0;
+                        state <= S_RESIZE_COORD;
+                    end else begin
+                        param_word_idx <= param_word_idx + 1;
+                        param_read_issued <= 1'b0;
+                    end
+                end
+            end
+
+            S_RESIZE_COORD: begin
+                begin : rsz_coord_blk
+                    reg [31:0] src_h_q8, src_w_q8;
+                    reg [31:0] oh_global, ow_global;
+                    reg [15:0] ih_nearest, iw_nearest;
+                    oh_global = tile_oh_origin + rsz_oh;
+                    ow_global = tile_ow_origin + rsz_ow;
+
+                    if (!resize_mode) begin
+                        ih_nearest = (oh_global * cfg_in_h) / cfg_out_h;
+                        iw_nearest = (ow_global * cfg_in_w) / cfg_out_w;
+                        rsz_ih0 <= ih_nearest;
+                        rsz_iw0 <= iw_nearest;
+                        rsz_ih1 <= ih_nearest;
+                        rsz_iw1 <= iw_nearest;
+                        rsz_frac_h <= 0;
+                        rsz_frac_w <= 0;
+                    end else begin
+                        if (cfg_out_h > 1)
+                            src_h_q8 = (oh_global * ((cfg_in_h - 1) << 8)) / (cfg_out_h - 1);
+                        else
+                            src_h_q8 = 0;
+                        if (cfg_out_w > 1)
+                            src_w_q8 = (ow_global * ((cfg_in_w - 1) << 8)) / (cfg_out_w - 1);
+                        else
+                            src_w_q8 = 0;
+
+                        rsz_ih0 <= src_h_q8[31:8];
+                        rsz_iw0 <= src_w_q8[31:8];
+                        rsz_frac_h <= src_h_q8[7:0];
+                        rsz_frac_w <= src_w_q8[7:0];
+
+                        if (src_h_q8[31:8] + 1 >= cfg_in_h)
+                            rsz_ih1 <= cfg_in_h - 1;
+                        else
+                            rsz_ih1 <= src_h_q8[31:8] + 1;
+                        if (src_w_q8[31:8] + 1 >= cfg_in_w)
+                            rsz_iw1 <= cfg_in_w - 1;
+                        else
+                            rsz_iw1 <= src_w_q8[31:8] + 1;
+                    end
+                end
+                rsz_rd_phase <= 0;
+                state <= S_RESIZE_READ0;
+            end
+
+            S_RESIZE_READ0: begin
+                case (rsz_rd_phase)
+                2'd0: begin
+                    begin : rsz_read0_addr
+                        reg [31:0] elem_off;
+                        reg [31:0] byte_off;
+                        elem_off = (rsz_ih0 * cfg_in_w * cfg_in_c)
+                                 + (rsz_iw0 * cfg_in_c)
+                                 + rsz_ch;
+                        byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                        act_rd_en   <= 1'b1;
+                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_byte_sel <= byte_off[1:0];
+                    end
+                    rsz_rd_phase <= 2'd1;
+                end
+                2'd1: begin
+                    rsz_rd_phase <= 2'd2;
+                end
+                2'd2: begin
+                    begin : rsz_read0_cap
+                        reg signed [ACC_W-1:0] val;
+                        if (cfg_int16) begin
+                            case (act_byte_sel[1])
+                                1'b0: val = $signed(act_rd_data[15:0]);
+                                1'b1: val = $signed(act_rd_data[31:16]);
+                            endcase
+                        end else begin
+                            case (act_byte_sel)
+                                2'd0: val = {{(ACC_W-8){act_rd_data[7]}},  act_rd_data[7:0]};
+                                2'd1: val = {{(ACC_W-8){act_rd_data[15]}}, act_rd_data[15:8]};
+                                2'd2: val = {{(ACC_W-8){act_rd_data[23]}}, act_rd_data[23:16]};
+                                2'd3: val = {{(ACC_W-8){act_rd_data[31]}}, act_rd_data[31:24]};
+                            endcase
+                        end
+                        rsz_v00 <= val;
+                    end
+                    rsz_rd_phase <= 0;
+                    if (resize_mode)
+                        state <= S_RESIZE_READ1;
+                    else
+                        state <= S_RESIZE_PPU;
+                end
+                default: rsz_rd_phase <= 0;
+                endcase
+            end
+
+            S_RESIZE_READ1: begin
+                case (rsz_rd_phase)
+                2'd0: begin
+                    begin : rsz_read1_addr
+                        reg [31:0] elem_off;
+                        reg [31:0] byte_off;
+                        elem_off = (rsz_ih0 * cfg_in_w * cfg_in_c)
+                                 + (rsz_iw1 * cfg_in_c)
+                                 + rsz_ch;
+                        byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                        act_rd_en   <= 1'b1;
+                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_byte_sel <= byte_off[1:0];
+                    end
+                    rsz_rd_phase <= 2'd1;
+                end
+                2'd1: begin
+                    rsz_rd_phase <= 2'd2;
+                end
+                2'd2: begin
+                    begin : rsz_read1_cap
+                        reg signed [ACC_W-1:0] val;
+                        if (cfg_int16) begin
+                            case (act_byte_sel[1])
+                                1'b0: val = $signed(act_rd_data[15:0]);
+                                1'b1: val = $signed(act_rd_data[31:16]);
+                            endcase
+                        end else begin
+                            case (act_byte_sel)
+                                2'd0: val = {{(ACC_W-8){act_rd_data[7]}},  act_rd_data[7:0]};
+                                2'd1: val = {{(ACC_W-8){act_rd_data[15]}}, act_rd_data[15:8]};
+                                2'd2: val = {{(ACC_W-8){act_rd_data[23]}}, act_rd_data[23:16]};
+                                2'd3: val = {{(ACC_W-8){act_rd_data[31]}}, act_rd_data[31:24]};
+                            endcase
+                        end
+                        rsz_v01 <= val;
+                    end
+                    rsz_rd_phase <= 0;
+                    state <= S_RESIZE_READ2;
+                end
+                default: rsz_rd_phase <= 0;
+                endcase
+            end
+
+            S_RESIZE_READ2: begin
+                case (rsz_rd_phase)
+                2'd0: begin
+                    begin : rsz_read2_addr
+                        reg [31:0] elem_off;
+                        reg [31:0] byte_off;
+                        elem_off = (rsz_ih1 * cfg_in_w * cfg_in_c)
+                                 + (rsz_iw0 * cfg_in_c)
+                                 + rsz_ch;
+                        byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                        act_rd_en   <= 1'b1;
+                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_byte_sel <= byte_off[1:0];
+                    end
+                    rsz_rd_phase <= 2'd1;
+                end
+                2'd1: begin
+                    rsz_rd_phase <= 2'd2;
+                end
+                2'd2: begin
+                    begin : rsz_read2_cap
+                        reg signed [ACC_W-1:0] val;
+                        if (cfg_int16) begin
+                            case (act_byte_sel[1])
+                                1'b0: val = $signed(act_rd_data[15:0]);
+                                1'b1: val = $signed(act_rd_data[31:16]);
+                            endcase
+                        end else begin
+                            case (act_byte_sel)
+                                2'd0: val = {{(ACC_W-8){act_rd_data[7]}},  act_rd_data[7:0]};
+                                2'd1: val = {{(ACC_W-8){act_rd_data[15]}}, act_rd_data[15:8]};
+                                2'd2: val = {{(ACC_W-8){act_rd_data[23]}}, act_rd_data[23:16]};
+                                2'd3: val = {{(ACC_W-8){act_rd_data[31]}}, act_rd_data[31:24]};
+                            endcase
+                        end
+                        rsz_v10 <= val;
+                    end
+                    rsz_rd_phase <= 0;
+                    state <= S_RESIZE_READ3;
+                end
+                default: rsz_rd_phase <= 0;
+                endcase
+            end
+
+            S_RESIZE_READ3: begin
+                case (rsz_rd_phase)
+                2'd0: begin
+                    begin : rsz_read3_addr
+                        reg [31:0] elem_off;
+                        reg [31:0] byte_off;
+                        elem_off = (rsz_ih1 * cfg_in_w * cfg_in_c)
+                                 + (rsz_iw1 * cfg_in_c)
+                                 + rsz_ch;
+                        byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                        act_rd_en   <= 1'b1;
+                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_byte_sel <= byte_off[1:0];
+                    end
+                    rsz_rd_phase <= 2'd1;
+                end
+                2'd1: begin
+                    rsz_rd_phase <= 2'd2;
+                end
+                2'd2: begin
+                    begin : rsz_read3_cap
+                        reg signed [ACC_W-1:0] val;
+                        if (cfg_int16) begin
+                            case (act_byte_sel[1])
+                                1'b0: val = $signed(act_rd_data[15:0]);
+                                1'b1: val = $signed(act_rd_data[31:16]);
+                            endcase
+                        end else begin
+                            case (act_byte_sel)
+                                2'd0: val = {{(ACC_W-8){act_rd_data[7]}},  act_rd_data[7:0]};
+                                2'd1: val = {{(ACC_W-8){act_rd_data[15]}}, act_rd_data[15:8]};
+                                2'd2: val = {{(ACC_W-8){act_rd_data[23]}}, act_rd_data[23:16]};
+                                2'd3: val = {{(ACC_W-8){act_rd_data[31]}}, act_rd_data[31:24]};
+                            endcase
+                        end
+                        rsz_v11 <= val;
+                    end
+                    rsz_rd_phase <= 0;
+                    state <= S_RESIZE_INTERP;
+                end
+                default: rsz_rd_phase <= 0;
+                endcase
+            end
+
+            S_RESIZE_INTERP: begin
+                begin : rsz_interp_blk
+                    reg [8:0] one_minus_h, one_minus_w;
+                    reg signed [63:0] top, bot, val64;
+                    one_minus_h = 9'd256 - {1'b0, rsz_frac_h};
+                    one_minus_w = 9'd256 - {1'b0, rsz_frac_w};
+                    top = rsz_v00 * $signed({1'b0, one_minus_w})
+                        + rsz_v01 * $signed({1'b0, rsz_frac_w});
+                    bot = rsz_v10 * $signed({1'b0, one_minus_w})
+                        + rsz_v11 * $signed({1'b0, rsz_frac_w});
+                    val64 = top * $signed({1'b0, one_minus_h})
+                          + bot * $signed({1'b0, rsz_frac_h});
+                    ppu_acc_in <= $signed((val64 + 64'sd32768) >>> 16);
+                end
+                state <= S_RESIZE_PPU;
+            end
+
+            S_RESIZE_PPU: begin
+                if (!resize_mode)
+                    ppu_acc_in <= rsz_v00;
+                ppu_in_valid <= 1'b1;
+                state <= S_RESIZE_PPU_WAIT;
+            end
+
+            S_RESIZE_PPU_WAIT: begin
+                if (ppu_out_valid) begin
+                    begin : rsz_wb_addr_calc
+                        reg [31:0] elem_off;
+                        reg [31:0] byte_off;
+                        elem_off = (rsz_oh * out_tile_w + rsz_ow)
+                                 * cfg_out_c + rsz_ch;
+                        byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                        rsz_wb_addr    <= out_base + byte_off[ACT_ADDR_W+1:2];
+                        rsz_wb_bytesel <= byte_off[1:0];
+                    end
+                    rsz_wb_byte  <= ppu_out_data;
+                    rsz_wb_phase <= 2'd0;
+                    state <= S_RESIZE_WB;
+                end
+            end
+
+            S_RESIZE_WB: begin
+                case (rsz_wb_phase)
+                2'd0: begin
+                    act_rd_en   <= 1'b1;
+                    act_rd_addr <= rsz_wb_addr;
+                    rsz_wb_phase <= 2'd1;
+                end
+                2'd1: begin
+                    rsz_wb_phase <= 2'd2;
+                end
+                2'd2: begin
+                    begin : rsz_wb_merge
+                        reg [31:0] merged;
+                        merged = act_rd_data;
+                        if (cfg_int16) begin
+                            case (rsz_wb_bytesel[1])
+                                1'b0: merged[15:0]  = rsz_wb_byte;
+                                1'b1: merged[31:16] = rsz_wb_byte;
+                            endcase
+                        end else begin
+                            case (rsz_wb_bytesel)
+                                2'd0: merged[7:0]   = rsz_wb_byte[7:0];
+                                2'd1: merged[15:8]  = rsz_wb_byte[7:0];
+                                2'd2: merged[23:16] = rsz_wb_byte[7:0];
+                                2'd3: merged[31:24] = rsz_wb_byte[7:0];
+                            endcase
+                        end
+                        act_wr_en   <= 1'b1;
+                        act_wr_addr <= rsz_wb_addr;
+                        act_wr_data <= merged;
+                    end
+                    state <= S_RESIZE_PIX_NEXT;
+                end
+                default: rsz_wb_phase <= 2'd0;
+                endcase
+            end
+
+            S_RESIZE_PIX_NEXT: begin
+                rsz_rd_phase <= 0;
+                if (rsz_ow + 1 >= out_tile_w) begin
+                    rsz_ow <= 0;
+                    if (rsz_oh + 1 >= out_tile_h) begin
+                        state <= S_RESIZE_CH_NEXT;
+                    end else begin
+                        rsz_oh <= rsz_oh + 1;
+                        state <= S_RESIZE_COORD;
+                    end
+                end else begin
+                    rsz_ow <= rsz_ow + 1;
+                    state <= S_RESIZE_COORD;
+                end
+            end
+
+            S_RESIZE_CH_NEXT: begin
+                if (rsz_ch + 1 >= cfg_out_c) begin
+                    state <= S_TILE_NEXT;
+                end else begin
+                    state <= S_OC_NEXT;
                 end
             end
 
