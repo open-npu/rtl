@@ -431,12 +431,12 @@ module npu_top #(
     // Systolic array signals (driven by npu_compute)
     wire [1:0]                    sa_cmd;
     wire                          sa_cmd_valid;
-    wire signed [`DATA_WIDTH-1:0] sa_wgt_data  [0:ARRAY_SIZE-1];
+    wire [`DATA_WIDTH*ARRAY_SIZE-1:0] sa_wgt_data_flat;
     wire                          sa_wgt_valid;
-    wire signed [`DATA_WIDTH-1:0] sa_act_data  [0:ARRAY_SIZE-1];
+    wire [`DATA_WIDTH*ARRAY_SIZE-1:0] sa_act_data_flat;
     wire                          sa_act_valid;
     wire [$clog2(ARRAY_SIZE)-1:0] sa_drain_col_sel;
-    wire signed [`ACC_WIDTH-1:0]  sa_acc_out   [0:ARRAY_SIZE-1];
+    wire [`ACC_WIDTH*ARRAY_SIZE-1:0]  sa_acc_out_flat;
     wire                          sa_acc_out_valid;
     wire                          sa_busy, sa_ready;
 
@@ -450,12 +450,12 @@ module npu_top #(
         .rst_n          (rst_n),
         .cmd            (sa_cmd),
         .cmd_valid      (sa_cmd_valid),
-        .wgt_data       (sa_wgt_data),
+        .wgt_data_flat  (sa_wgt_data_flat),
         .wgt_valid      (sa_wgt_valid),
-        .act_data       (sa_act_data),
+        .act_data_flat  (sa_act_data_flat),
         .act_valid      (sa_act_valid),
         .drain_col_sel  (sa_drain_col_sel),
-        .acc_out        (sa_acc_out),
+        .acc_out_flat   (sa_acc_out_flat),
         .acc_out_valid  (sa_acc_out_valid),
         .busy           (sa_busy),
         .ready          (sa_ready)
@@ -600,12 +600,12 @@ module npu_top #(
         // Systolic
         .sa_cmd         (sa_cmd),
         .sa_cmd_valid   (sa_cmd_valid),
-        .sa_wgt_data    (sa_wgt_data),
+        .sa_wgt_data_flat(sa_wgt_data_flat),
         .sa_wgt_valid   (sa_wgt_valid),
-        .sa_act_data    (sa_act_data),
+        .sa_act_data_flat(sa_act_data_flat),
         .sa_act_valid   (sa_act_valid),
         .sa_drain_col_sel(sa_drain_col_sel),
-        .sa_acc_out     (sa_acc_out),
+        .sa_acc_out_flat (sa_acc_out_flat),
         .sa_acc_out_valid(sa_acc_out_valid),
         .sa_busy        (sa_busy),
         .sa_ready       (sa_ready),

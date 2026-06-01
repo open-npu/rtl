@@ -83,12 +83,12 @@ module npu_compute #(
     // ─── Systolic Array ───
     output reg  [1:0]                   sa_cmd,
     output reg                          sa_cmd_valid,
-    output reg  signed [DATA_W-1:0]    sa_wgt_data  [0:ARRAY_SIZE-1],
+    output wire [DATA_W*ARRAY_SIZE-1:0] sa_wgt_data_flat,
     output reg                          sa_wgt_valid,
-    output reg  signed [DATA_W-1:0]    sa_act_data  [0:ARRAY_SIZE-1],
+    output wire [DATA_W*ARRAY_SIZE-1:0] sa_act_data_flat,
     output reg                          sa_act_valid,
     output reg  [$clog2(ARRAY_SIZE)-1:0] sa_drain_col_sel,
-    input  wire signed [ACC_W-1:0]     sa_acc_out   [0:ARRAY_SIZE-1],
+    input  wire [ACC_W*ARRAY_SIZE-1:0]  sa_acc_out_flat,
     input  wire                         sa_acc_out_valid,
     input  wire                         sa_busy,
     input  wire                         sa_ready,
@@ -113,6 +113,19 @@ module npu_compute #(
     input  wire signed [DATA_W-1:0]    ppu_out_data,
     input  wire                         ppu_out_valid
 );
+
+    // ─── Internal unpacked arrays for systolic interface ───
+    reg  signed [DATA_W-1:0] sa_wgt_data [0:ARRAY_SIZE-1];
+    reg  signed [DATA_W-1:0] sa_act_data [0:ARRAY_SIZE-1];
+    wire signed [ACC_W-1:0]  sa_acc_out  [0:ARRAY_SIZE-1];
+    genvar gi;
+    generate
+        for (gi = 0; gi < ARRAY_SIZE; gi = gi + 1) begin : unpack_sa
+            assign sa_wgt_data_flat[DATA_W*gi +: DATA_W] = sa_wgt_data[gi];
+            assign sa_act_data_flat[DATA_W*gi +: DATA_W] = sa_act_data[gi];
+            assign sa_acc_out[gi] = sa_acc_out_flat[ACC_W*gi +: ACC_W];
+        end
+    endgenerate
 
     // ─── Systolic command encoding ───
     localparam MODE_IDLE     = 2'b00;
@@ -628,8 +641,9 @@ module npu_compute #(
                         if (wgt_byte_idx + elems_this_word >= k_pass_remain) begin
                             // All k_pass_remain elements loaded; zero-pad remaining rows
                             if (k_pass_remain < ARRAY_SIZE_16) begin
-                                for (i = k_pass_remain[COL_W-1:0]; i < ARRAY_SIZE; i = i + 1)
-                                    sa_wgt_data[i[COL_W-1:0]] <= 0;
+                                for (i = 0; i < ARRAY_SIZE; i = i + 1)
+                                    if (i[COL_W-1:0] >= k_pass_remain[COL_W-1:0])
+                                        sa_wgt_data[i[COL_W-1:0]] <= 0;
                             end
                             // Emit
                             state <= S_WGT_EMIT;
