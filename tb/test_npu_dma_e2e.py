@@ -662,7 +662,7 @@ async def test_dma_e2e_tiling_int16(dut):
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gen_dma_e2e_golden import gen_pooling_test, gen_add_test, gen_resize_test, gen_deconv_test
+from gen_dma_e2e_golden import gen_pooling_test, gen_add_test, gen_resize_test, gen_deconv_test, gen_concat_test
 
 
 # DDR addresses for operator tests
@@ -1472,3 +1472,137 @@ async def test_deconv_multichannel(dut):
             dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
     assert len(mismatches) == 0, f"Deconv multichannel: {len(mismatches)}/{n_words} mismatches"
     dut._log.info(f"Deconv multichannel PASSED: {n_words} words bit-exact")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Concat tests (op_type=7)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def program_concat_layer(wb, meta, data, out_base):
+    """Program CSR registers for a concat branch layer."""
+    # LAYER_MODE: op_type=7 | (data_type << 4)
+    await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
+
+    # Dimensions
+    await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
+    await wb.write(0x048, meta['in_c'])
+    await wb.write(0x04C, (meta['out_h'] << 16) | meta['out_w'])
+    await wb.write(0x050, meta['out_c'])
+
+    # Kernel, stride, padding (1x1, stride 1, no pad)
+    await wb.write(0x054, 1 | (1 << 8))
+    await wb.write(0x058, 1 | (1 << 8))
+    await wb.write(0x05C, 0)
+
+    # CONCAT_CFG register (0x06C)
+    await wb.write(0x06C, meta['concat_cfg'])
+
+    # Tiling: no tiling
+    await wb.write(0x070, 0)
+    await wb.write(0x074, (1 << 16) | 1)
+
+    # SRAM_BASE: act_base=0, out_base is shared across all branches
+    await wb.write(0x078, (out_base << 16) | 0)
+
+    # DMA addresses
+    await wb.write(0x100, POOL_IN_ADDR)     # Input from DDR
+    await wb.write(0x104, POOL_OUT_ADDR)    # Output to DDR
+    await wb.write(0x108, POOL_WGT_ADDR)    # No weights
+    await wb.write(0x10C, ADD_PARAM_ADDR)   # Concat params (1 word)
+
+    # DMA sizes
+    await wb.write(0x128, meta['dma_in_size'])
+    await wb.write(0x12C, 0)  # No weights
+    await wb.write(0x130, meta['dma_out_size'])
+
+    # Post-processing
+    await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x188, 1)  # param_count=1 (loads 4 words, only first 1 matters)
+
+    # No fusion
+    await wb.write(0x118, 0)
+
+
+async def run_concat_test(dut, branches, int16_mode, relu, seed, test_name):
+    """Generic concat test runner for N branches."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    branch_results, output_words, total_c = gen_concat_test(
+        h=4, w=4, branches=branches, relu=relu,
+        int16_mode=int16_mode, seed=seed
+    )
+
+    # Use a fixed out_base that won't overlap with any branch's input.
+    # Max input across branches determines the safe out_base.
+    max_input_words = max(meta['n_input_words'] for meta, _ in branch_results)
+    out_base = max_input_words  # Output starts after the largest input
+
+    # Run each branch as a separate layer
+    for br_idx, (meta, data) in enumerate(branch_results):
+        # Populate DDR: input + params
+        mem.populate(POOL_IN_ADDR, data['input_words'])
+        mem.populate(ADD_PARAM_ADDR, data['add_param_words'])
+
+        await program_concat_layer(wb, meta, data, out_base)
+        done = await run_layer_and_wait(wb, dut, timeout=300000)
+        assert done, f"Concat branch {br_idx} did not complete"
+
+    # Check final output (last DMA_OUT wrote the full combined output)
+    out_addr = POOL_OUT_ADDR
+    n_words = len(output_words)
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(output_words[i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, f"{test_name}: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"{test_name} PASSED: {n_words} words bit-exact")
+
+
+@cocotb.test()
+async def test_concat_passthrough(dut):
+    """Concat 2 branches (4ch + 4ch), INT8, with relu."""
+    await run_concat_test(dut,
+        branches=[{'in_c': 4}, {'in_c': 4}],
+        int16_mode=False, relu=True, seed=200,
+        test_name="Concat passthrough")
+
+
+@cocotb.test()
+async def test_concat_with_rescale(dut):
+    """Concat 2 branches (8ch + 4ch), INT8, with relu and rescale."""
+    await run_concat_test(dut,
+        branches=[{'in_c': 8}, {'in_c': 4}],
+        int16_mode=False, relu=True, seed=201,
+        test_name="Concat with rescale")
+
+
+@cocotb.test()
+async def test_concat_int16(dut):
+    """Concat 2 branches (4ch + 4ch), INT16, with relu."""
+    await run_concat_test(dut,
+        branches=[{'in_c': 4}, {'in_c': 4}],
+        int16_mode=True, relu=True, seed=202,
+        test_name="Concat INT16")
+
+
+@cocotb.test()
+async def test_concat_3branch(dut):
+    """Concat 3 branches (4ch + 4ch + 4ch), INT8, with relu."""
+    await run_concat_test(dut,
+        branches=[{'in_c': 4}, {'in_c': 4}, {'in_c': 4}],
+        int16_mode=False, relu=True, seed=203,
+        test_name="Concat 3-branch")

@@ -17,7 +17,7 @@
 //   - Spatial output count is handled by repeated compute passes
 //   - Weights reloaded per-pixel per-pass (correctness over efficiency)
 //
-// Op types: 0=Conv2D, 1=DWConv, 2=FC, 3=Pooling, 4=Add, 5=Resize, 6=Deconv
+// Op types: 0=Conv2D, 1=DWConv, 2=FC, 3=Pooling, 4=Add, 5=Resize, 6=Deconv, 7=Concat
 
 `include "npu_defines.vh"
 
@@ -60,6 +60,7 @@ module npu_compute #(
     input  wire [31:0]                  cfg_pool_cfg,   // Pooling config register
     input  wire [31:0]                  cfg_resize_cfg, // Resize config register
     input  wire [31:0]                  cfg_deconv_cfg, // Deconv config: [7:0]=INSERT_H, [15:8]=INSERT_W
+    input  wire [31:0]                  cfg_concat_cfg, // Concat config: [15:0]=OFFSET, [31:16]=TOTAL_C
 
     // ─── Weight SRAM Port B (read-only) ───
     output reg                          wgt_rd_en,
@@ -302,6 +303,10 @@ module npu_compute #(
     wire [8:0]  deconv_step_h = {1'b0, cfg_insert_h} + 9'd1; // ins_h + 1
     wire [8:0]  deconv_step_w = {1'b0, cfg_insert_w} + 9'd1; // ins_w + 1
     reg         deconv_skip;  // 1 = current (fh, fw) maps to zero-inserted position
+    // ─── Concat state ───
+    wire [15:0] concat_offset  = cfg_concat_cfg[15:0];
+    wire [15:0] concat_total_c = cfg_concat_cfg[31:16];
+    wire        is_concat      = (cfg_op_type == 8'd7);
     reg signed [ACC_W-1:0] pool_acc;     // Running sum or max
     reg [15:0]             pool_count;   // Valid element count (AvgPool)
     reg [3:0]              pool_fh, pool_fw; // Window position
@@ -504,7 +509,7 @@ module npu_compute #(
                     state <= S_DW_WGT_LOAD;
                 end else if (cfg_op_type == 8'd3) begin
                     state <= S_POOL_SETUP;
-                end else if (cfg_op_type == 8'd4) begin
+                end else if (cfg_op_type == 8'd4 || cfg_op_type == 8'd7) begin
                     state <= S_ADD_SETUP;
                 end else if (cfg_op_type == 8'd5) begin
                     state <= S_RESIZE_SETUP;
@@ -1773,8 +1778,14 @@ module npu_compute #(
                     if (add_param_idx == 0) begin
                         add_M_A <= param_rd_data[14:0];
                         add_S_A <= param_rd_data[21:16];
-                        add_param_idx <= 1;
-                        add_param_phase <= 0;
+                        if (is_concat) begin
+                            // Concat: only 1 param word needed
+                            add_rd_phase <= 0;
+                            state <= S_ADD_READ_A;
+                        end else begin
+                            add_param_idx <= 1;
+                            add_param_phase <= 0;
+                        end
                     end else begin
                         add_M_B <= param_rd_data[14:0];
                         add_S_B <= param_rd_data[21:16];
@@ -1813,7 +1824,7 @@ module npu_compute #(
                         endcase
                     end
                     add_rd_phase <= 0;
-                    state <= S_ADD_READ_B;
+                    state <= is_concat ? S_ADD_COMPUTE : S_ADD_READ_B;
                 end
             end
 
@@ -1856,16 +1867,21 @@ module npu_compute #(
                     reg signed [ACC_W-1:0] prod_a, prod_b;
                     reg signed [ACC_W-1:0] rescaled_a, rescaled_b;
                     prod_a = add_val_a * $signed({1'b0, add_M_A});
-                    prod_b = add_val_b * $signed({1'b0, add_M_B});
                     if (add_S_A > 0)
                         rescaled_a = (prod_a + (1 <<< (add_S_A - 1))) >>> add_S_A;
                     else
                         rescaled_a = prod_a;
-                    if (add_S_B > 0)
-                        rescaled_b = (prod_b + (1 <<< (add_S_B - 1))) >>> add_S_B;
-                    else
-                        rescaled_b = prod_b;
-                    ppu_acc_in <= rescaled_a + rescaled_b;
+                    if (is_concat) begin
+                        // Concat: single branch rescale only
+                        ppu_acc_in <= rescaled_a;
+                    end else begin
+                        prod_b = add_val_b * $signed({1'b0, add_M_B});
+                        if (add_S_B > 0)
+                            rescaled_b = (prod_b + (1 <<< (add_S_B - 1))) >>> add_S_B;
+                        else
+                            rescaled_b = prod_b;
+                        ppu_acc_in <= rescaled_a + rescaled_b;
+                    end
                 end
                 state <= S_ADD_PPU;
             end
@@ -1877,10 +1893,21 @@ module npu_compute #(
 
             S_ADD_PPU_WAIT: begin
                 if (ppu_out_valid) begin
-                    // Compute writeback address (overwrite B at out_base)
+                    // Compute writeback address
                     begin : add_wb_addr_calc
                         reg [31:0] byte_off;
-                        byte_off = cfg_int16 ? ({16'd0, add_elem_cnt} << 1) : {16'd0, add_elem_cnt};
+                        if (is_concat) begin
+                            // Concat: output[pixel * total_c + offset + ch]
+                            reg [31:0] pixel;
+                            reg [31:0] ch;
+                            pixel = {16'd0, add_elem_cnt} / {16'd0, cfg_out_c};
+                            ch    = {16'd0, add_elem_cnt} % {16'd0, cfg_out_c};
+                            byte_off = (pixel * {16'd0, concat_total_c} + {16'd0, concat_offset} + ch)
+                                       << (cfg_int16 ? 1 : 0);
+                        end else begin
+                            // Add: flat overwrite at out_base
+                            byte_off = cfg_int16 ? ({16'd0, add_elem_cnt} << 1) : {16'd0, add_elem_cnt};
+                        end
                         add_wb_addr    <= cfg_out_base + byte_off[ACT_ADDR_W+1:2];
                         add_wb_bytesel <= byte_off[1:0];
                     end
