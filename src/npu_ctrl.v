@@ -55,7 +55,11 @@ module npu_ctrl (
     input  wire [31:0]  cfg_dma_ctrl,        // sched_ctrl: [0]=DB_EN, [1]=FUSE_START, [2]=FUSE_MID, [3]=FUSE_END
     input  wire [31:0]  cfg_layer_mode,      // OP type + data type
     input  wire [15:0]  cfg_out_base,        // Output base address in SRAM (word addr)
-    input  wire [31:0]  cfg_dma_add_b_addr   // DDR address of Add Branch B data
+    input  wire [31:0]  cfg_dma_add_b_addr,  // DDR address of Add Branch B data
+
+    // ─── Auto-Restart Interface ───
+    input  wire         ctrl_auto_next,      // AUTO_NEXT latch from CSR
+    input  wire [7:0]   cfg_layer_count      // Total layer count for auto-next
 );
 
     // ─── FSM States ───
@@ -76,6 +80,7 @@ module npu_ctrl (
     localparam S_WAIT_ADD_B = 4'd14;
 
     reg [3:0] state;
+    reg       aborted;  // Latched abort flag — prevents auto-restart in S_DONE
 
     // Per-channel param size: 4 words (16 bytes) per channel
     wire [15:0] param_words = cfg_param_count * 4;
@@ -104,6 +109,7 @@ module npu_ctrl (
             hw_error      <= 1'b0;
             hw_error_code <= 4'd0;
             hw_curr_layer <= 8'd0;
+            aborted       <= 1'b0;
             dma_start     <= 1'b0;
             dma_dir       <= 1'b0;
             dma_ext_addr  <= 32'd0;
@@ -116,6 +122,7 @@ module npu_ctrl (
             hw_done       <= 1'b0;
             hw_error      <= 1'b0;
             hw_error_code <= 4'd0;
+            aborted       <= 1'b0;
             dma_start     <= 1'b0;
             compute_start <= 1'b0;
         end else begin
@@ -124,6 +131,10 @@ module npu_ctrl (
             hw_error      <= 1'b0;
             dma_start     <= 1'b0;
             compute_start <= 1'b0;
+
+            // Latch abort while busy (prevents auto-restart in S_DONE)
+            if (ctrl_abort && hw_busy)
+                aborted <= 1'b1;
 
             case (state)
                 S_IDLE: begin
@@ -283,10 +294,17 @@ module npu_ctrl (
 
                 // ─── Done ───
                 S_DONE: begin
-                    hw_busy       <= 1'b0;
                     hw_done       <= 1'b1;
                     hw_curr_layer <= hw_curr_layer + 1;
-                    state         <= S_IDLE;
+                    if (!aborted && ctrl_auto_next && (hw_curr_layer + 1 < cfg_layer_count)) begin
+                        // Auto-restart: stay busy, start next layer
+                        state <= S_LOAD_WGT;
+                    end else begin
+                        // Normal: deassert busy, return to idle
+                        hw_busy <= 1'b0;
+                        aborted <= 1'b0;
+                        state   <= S_IDLE;
+                    end
                 end
 
                 S_ERROR: begin

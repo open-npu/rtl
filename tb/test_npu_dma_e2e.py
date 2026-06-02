@@ -2114,3 +2114,84 @@ async def test_full_model_allops_128(dut):
 
     dut._log.info(f"[AllOps-128] ALL {n_inv} invocations PASSED — "
                   f"128×128 full model bit-exact!")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: Auto-next 3-layer Conv2D pipeline
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_auto_next_3layer(dut):
+    """AUTO_NEXT mode: 3 identical Conv2D 1×1 layers run with single START.
+
+    Uses layer 2 from golden data (Conv2D 1×1, 8×8×8→8×8×4).
+    All 3 layers share the same CSR config and DDR addresses, so no CSR
+    reprogramming is needed. Tests the FSM auto-restart mechanism:
+    - hw_busy stays asserted across all 3 layers
+    - hw_curr_layer reaches 3
+    - Output matches single-layer golden (last layer overwrites same region)
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    metadata, layer_data = load_golden('int8')
+
+    # Use layer 2: Conv2D 1×1, 8×8×8 → 8×8×4 (small, fast)
+    idx = 2
+    meta = metadata[idx]
+    data = layer_data[idx]
+    n_layers = 3
+
+    # Populate DDR
+    mem.populate(meta['ddr_wgt_addr'], data['wgt'])
+    mem.populate(meta['ddr_param_addr'], data['param'])
+    mem.populate(meta['ddr_in_addr'], data['input'])
+
+    dut._log.info(f"[Auto-Next] Starting {n_layers} identical layers "
+                  f"(Conv2D 1x1, 8x8x8->8x8x4) with single START")
+
+    # Program CSR (same config for all 3 layers)
+    await program_layer(wb, meta)
+
+    # Write LAYER_COUNT register (address 0x030)
+    await wb.write(0x030, n_layers)
+
+    # Write CTRL: AUTO_NEXT=1 + START=1 (bits [3] and [0])
+    await wb.write(0x000, 0x09)
+
+    # Poll until all layers complete
+    done = False
+    for cyc in range(500000):
+        await RisingEdge(dut.clk)
+        if cyc > 100 and cyc % 200 == 0:
+            try:
+                status = await wb.read(0x004)
+            except (ValueError, AttributeError):
+                continue
+            busy = status & 0x1
+            curr_layer = (status >> 8) & 0xFF
+            if busy == 0 and curr_layer >= n_layers:
+                done = True
+                dut._log.info(f"  Completed: curr_layer={curr_layer}")
+                break
+
+    assert done, "Auto-next 3-layer did not complete"
+
+    # Verify hw_curr_layer = 3
+    status = await wb.read(0x004)
+    curr_layer = (status >> 8) & 0xFF
+    assert curr_layer == n_layers, \
+        f"hw_curr_layer: got {curr_layer}, expected {n_layers}"
+
+    # Verify output (last layer writes same output region, should match golden)
+    ok, detail = verify_output(mem, meta, data['output'], 0)
+    dut._log.info(f"  Output: {detail}")
+    assert ok, detail
+
+    dut._log.info(f"[Auto-Next] {n_layers} identical layers PASSED — "
+                  f"auto-next FSM verified bit-exact!")

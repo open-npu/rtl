@@ -60,6 +60,7 @@ module npu_top #(
 
     // --- CSR ↔ Controller ---
     wire        ctrl_start, ctrl_abort, ctrl_soft_rst, ctrl_auto_next;
+    wire [7:0]  reg_layer_count;
     wire        hw_busy, hw_done, hw_error;
     wire [3:0]  hw_error_code;
     wire [7:0]  hw_curr_layer;
@@ -145,6 +146,7 @@ module npu_top #(
         .ctrl_abort     (ctrl_abort),
         .ctrl_soft_rst  (ctrl_soft_rst),
         .ctrl_auto_next (ctrl_auto_next),
+        .reg_layer_count(reg_layer_count),
         .irq_o          (irq_o),
         // Layer parameters
         .reg_layer_mode (reg_layer_mode),
@@ -225,7 +227,10 @@ module npu_top #(
         .cfg_dma_ctrl       (reg_dma_ctrl),
         .cfg_layer_mode     (reg_layer_mode),
         .cfg_out_base       ({3'd0, reg_sram_base[ACT_ADDR_W+16-1:16]}),
-        .cfg_dma_add_b_addr (reg_dma_add_b_addr)
+        .cfg_dma_add_b_addr (reg_dma_add_b_addr),
+        // Auto-restart
+        .ctrl_auto_next  (ctrl_auto_next),
+        .cfg_layer_count (reg_layer_count)
     );
 
     // ════════════════════════════════════════════════════════════════════
