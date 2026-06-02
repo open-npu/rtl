@@ -56,6 +56,9 @@ module npu_csr #(
     output wire                 ctrl_soft_rst,  // Soft reset pulse
     output wire                 ctrl_auto_next, // AUTO_NEXT mode
 
+    // ─── Layer Count Output ───
+    output wire [7:0]           reg_layer_count, // Total layer count for auto-next
+
     // ─── Interrupt Output ───
     output wire                 irq_o,
 
@@ -107,6 +110,7 @@ module npu_csr #(
 
     // ─── Group 0: Control & Status Registers ───
     reg [DATA_W-1:0] r_ctrl;           // 0x000 — self-clearing bits
+    reg [DATA_W-1:0] r_layer_count;   // 0x030 — total layer count for auto-next
     reg [DATA_W-1:0] r_irq_en;        // 0x008
     reg [DATA_W-1:0] r_irq_status;    // 0x00C — W1C
 
@@ -205,6 +209,7 @@ module npu_csr #(
     assign ctrl_abort     = r_ctrl[1];
     assign ctrl_soft_rst  = r_ctrl[2];
     assign ctrl_auto_next = r_ctrl[3];
+    assign reg_layer_count = r_layer_count[7:0];
 
     // ─── Register outputs ───
     assign reg_layer_mode       = r_layer_mode;
@@ -256,6 +261,7 @@ module npu_csr #(
             wb_ack_o     <= 1'b0;
             wb_dat_o     <= 32'd0;
             r_ctrl       <= 32'd0;
+            r_layer_count<= 32'd0;
             r_irq_en     <= 32'd0;
             r_irq_status <= 32'd0;
             r_layer_mode <= 32'd0;
@@ -313,6 +319,7 @@ module npu_csr #(
                         // Group 0: Control & Status
                         12'h000: r_ctrl    <= wb_dat_i;  // bits [0:2] self-clear next cycle
                         12'h008: r_irq_en  <= wb_dat_i;
+                        12'h030: r_layer_count <= wb_dat_i;
                         12'h00C: r_irq_status <= r_irq_status & ~wb_dat_i; // W1C
 
                         // Group 1: Layer Parameters
@@ -378,6 +385,7 @@ module npu_csr #(
                         12'h024: wb_dat_o <= hw_serial_lo;
                         12'h028: wb_dat_o <= hw_serial_hi;
                         12'h02C: wb_dat_o <= hw_vendor_id;
+                        12'h030: wb_dat_o <= r_layer_count;
 
                         // Group 1: Layer Parameters
                         12'h040: wb_dat_o <= r_layer_mode;
