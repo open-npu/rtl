@@ -101,15 +101,26 @@ module npu_top #(
     wire [15:0] dma_sram_addr_o;
     wire [31:0] dma_sram_wdata, dma_sram_rdata;
 
-    // --- Performance counters (stub) ---
+    // --- Performance counters ---
     reg  [31:0] perf_cycle_cnt;
-    wire [31:0] mac_cnt = 32'd0;  // TODO: real MAC counter
+    reg  [31:0] mac_cnt;
 
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
+        if (!rst_n) begin
             perf_cycle_cnt <= 32'd0;
-        else if (hw_busy)
+            mac_cnt        <= 32'd0;
+        end else if (ctrl_soft_rst) begin
+            perf_cycle_cnt <= 32'd0;
+            mac_cnt        <= 32'd0;
+        end else if (hw_busy) begin
             perf_cycle_cnt <= perf_cycle_cnt + 1;
+            // Conv2D: ARRAY_SIZE MACs per sa_act_valid pulse
+            // DW Conv: 1 MAC per dw_in_valid pulse
+            if (sa_act_valid)
+                mac_cnt <= mac_cnt + ARRAY_SIZE;
+            else if (dw_in_valid)
+                mac_cnt <= mac_cnt + 1;
+        end
     end
 
     // ════════════════════════════════════════════════════════════════════
