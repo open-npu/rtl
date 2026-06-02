@@ -2195,3 +2195,180 @@ async def test_auto_next_3layer(dut):
 
     dut._log.info(f"[Auto-Next] {n_layers} identical layers PASSED — "
                   f"auto-next FSM verified bit-exact!")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: IRQ E2E — interrupt-driven completion with bit-exact verify
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_irq_e2e(dut):
+    """IRQ E2E: Conv2D layer with IRQ-driven completion instead of STATUS poll.
+
+    Uses the same Conv2D 1×1 golden data (layer 2, INT8).
+    Enables DONE_EN, starts layer, waits for irq_o assertion,
+    verifies W1C clearing, then checks bit-exact output.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    metadata, layer_data = load_golden('int8')
+
+    # Use layer 2: Conv2D 1×1, 8×8×8 → 8×8×4
+    idx = 2
+    meta = metadata[idx]
+    data = layer_data[idx]
+
+    # Populate DDR
+    mem.populate(meta['ddr_wgt_addr'], data['wgt'])
+    mem.populate(meta['ddr_param_addr'], data['param'])
+    mem.populate(meta['ddr_in_addr'], data['input'])
+
+    # Enable DONE IRQ (bit 0)
+    await wb.write(0x008, 0x01)
+
+    # Verify irq_o is low before start
+    await ReadOnly()
+    assert int(dut.irq_o.value) == 0, "irq_o should be 0 before START"
+    await Timer(1, unit="step")
+
+    # Program CSR and START
+    await program_layer(wb, meta)
+    await wb.write(0x000, 0x01)  # START
+
+    # Wait for irq_o assertion (instead of polling STATUS)
+    irq_fired = False
+    for cyc in range(500000):
+        await RisingEdge(dut.clk)
+        try:
+            if int(dut.irq_o.value) == 1:
+                irq_fired = True
+                dut._log.info(f"  irq_o asserted at cycle {cyc}")
+                break
+        except ValueError:
+            continue
+
+    assert irq_fired, "irq_o never asserted — layer may not have completed"
+
+    # Verify IRQ_STATUS[0] (DONE) is set
+    irq_status = await wb.read(0x00C)
+    assert (irq_status & 0x01) == 1, \
+        f"IRQ_STATUS[0] should be 1, got 0x{irq_status:08X}"
+
+    # W1C: clear all pending IRQ bits
+    await wb.write(0x00C, 0x07)
+    await RisingEdge(dut.clk)
+
+    # Verify irq_o returns to 0
+    await ReadOnly()
+    irq_val = int(dut.irq_o.value)
+    await Timer(1, unit="step")
+    assert irq_val == 0, f"irq_o should be 0 after W1C, got {irq_val}"
+
+    # Verify output is bit-exact
+    ok, detail = verify_output(mem, meta, data['output'], idx)
+    dut._log.info(f"  Output: {detail}")
+    assert ok, detail
+
+    dut._log.info("[IRQ E2E] Conv2D with IRQ-driven completion PASSED — "
+                  "irq_o assertion, W1C clearing, bit-exact output verified!")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: IRQ E2E — interrupt-driven completion with bit-exact output
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_irq_e2e(dut):
+    """IRQ E2E: Run Conv2D 1x1 with DONE_EN, wait for irq_o, verify W1C + output.
+
+    Uses golden layer 2 (Conv2D 1×1, 8×8×8→8×8×4).
+    Instead of polling STATUS for busy=0, waits for irq_o assertion.
+    Then verifies W1C clearing and bit-exact output.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    metadata, layer_data = load_golden('int8')
+
+    # Use layer 2: Conv2D 1×1, 8×8×8 → 8×8×4
+    idx = 2
+    meta = metadata[idx]
+    data = layer_data[idx]
+
+    # Populate DDR
+    mem.populate(meta['ddr_wgt_addr'], data['wgt'])
+    mem.populate(meta['ddr_param_addr'], data['param'])
+    mem.populate(meta['ddr_in_addr'], data['input'])
+
+    dut._log.info("[IRQ E2E] Starting Conv2D 1x1 with IRQ-driven completion")
+
+    # Program CSR
+    await program_layer(wb, meta)
+
+    # Enable DONE IRQ
+    await wb.write(0x008, 0x01)  # IRQ_EN[0] = DONE_EN
+
+    # Verify irq_o is low before start
+    await ReadOnly()
+    assert dut.irq_o.value == 0, "IRQ should be low before start"
+    await Timer(1, unit="step")
+
+    # Start layer
+    await wb.write(0x000, 0x01)
+
+    # Wait for irq_o to assert (instead of polling STATUS)
+    irq_fired = False
+    for cyc in range(500000):
+        await RisingEdge(dut.clk)
+        if cyc > 100 and cyc % 50 == 0:
+            await ReadOnly()
+            try:
+                irq_val = int(dut.irq_o.value)
+            except ValueError:
+                irq_val = 0
+            await Timer(1, unit="step")
+            if irq_val == 1:
+                irq_fired = True
+                dut._log.info(f"  irq_o asserted at cycle ~{cyc}")
+                break
+
+    assert irq_fired, "irq_o never asserted — layer may not have completed"
+
+    # Read IRQ_STATUS — DONE bit should be set
+    irq_status = await wb.read(0x00C)
+    assert (irq_status & 0x01) == 1, \
+        f"IRQ_STATUS[0] should be 1, got 0x{irq_status:08X}"
+    dut._log.info(f"  IRQ_STATUS = 0x{irq_status:08X} (DONE set)")
+
+    # W1C clear DONE
+    await wb.write(0x00C, 0x01)
+    await RisingEdge(dut.clk)
+
+    # irq_o should be low after W1C
+    await ReadOnly()
+    irq_val = int(dut.irq_o.value)
+    await Timer(1, unit="step")
+    assert irq_val == 0, f"irq_o should be 0 after W1C, got {irq_val}"
+
+    # IRQ_STATUS should read 0 (or only non-DONE bits)
+    irq_status2 = await wb.read(0x00C)
+    assert (irq_status2 & 0x01) == 0, \
+        f"IRQ_STATUS[0] should be 0 after W1C, got 0x{irq_status2:08X}"
+
+    # Verify output is bit-exact
+    ok, detail = verify_output(mem, meta, data['output'], idx)
+    dut._log.info(f"  Output: {detail}")
+    assert ok, detail
+
+    dut._log.info("[IRQ E2E] PASSED — IRQ-driven completion + W1C + bit-exact!")

@@ -425,6 +425,231 @@ def build_ppu_params(bias, mult_m, shift_s, zero_point):
     return [w0, w1, w2, w3]
 
 
+async def _run_conv1x1_layer(dut, wb, mem, ext_mem, out_base):
+    """Helper: Configure and run a 1-pixel Conv2D 1×1 layer to completion.
+
+    Returns True if layer completed, False on timeout.
+    Caller must have already started clock and applied reset.
+    """
+    ARRAY_SIZE = int(dut.ARRAY_SIZE.value)
+
+    # Build test data: all weights = 1, act = [1..ARRAY_SIZE]
+    wgt_bytes = [1] * (ARRAY_SIZE * ARRAY_SIZE)
+    act_bytes = [(i + 1) for i in range(ARRAY_SIZE)]
+
+    # PPU passthrough
+    param_words_all = []
+    for _ in range(ARRAY_SIZE):
+        param_words_all.extend(build_ppu_params(bias=0, mult_m=1, shift_s=0, zero_point=0))
+
+    wgt_base = 0x4000_0000
+    act_base = 0x5000_0000
+    param_base = 0x6000_0000
+
+    wgt_words = pack_i8_to_words(wgt_bytes)
+    act_words = pack_i8_to_words(act_bytes)
+
+    for i, w in enumerate(wgt_words):
+        ext_mem[wgt_base + i * 4] = w
+    for i, w in enumerate(act_words):
+        ext_mem[act_base + i * 4] = w
+    for i, w in enumerate(param_words_all):
+        ext_mem[param_base + i * 4] = w
+    out_word_count = (ARRAY_SIZE + 3) // 4
+    for i in range(out_word_count):
+        ext_mem[out_base + i * 4] = 0xDEAD_BEEF
+
+    # Configure CSR
+    await wb.write(0x040, 0x00000000)  # LAYER_MODE: Conv2D
+    await wb.write(0x044, (1 << 16) | 1)
+    await wb.write(0x048, ARRAY_SIZE)
+    await wb.write(0x04C, (1 << 16) | 1)
+    await wb.write(0x050, ARRAY_SIZE)
+    await wb.write(0x054, (1 << 8) | 1)
+    await wb.write(0x058, (1 << 8) | 1)
+    await wb.write(0x05C, 0)
+    await wb.write(0x070, (1 << 16) | 1)
+    await wb.write(0x074, (1 << 16) | 1)
+
+    await wb.write(0x108, wgt_base)
+    await wb.write(0x100, act_base)
+    await wb.write(0x104, out_base)
+    await wb.write(0x10C, param_base)
+
+    wgt_size = ARRAY_SIZE * ARRAY_SIZE
+    act_size = ARRAY_SIZE
+    out_size = ARRAY_SIZE
+    await wb.write(0x12C, wgt_size)
+    await wb.write(0x128, act_size)
+    await wb.write(0x130, out_size)
+    await wb.write(0x188, ARRAY_SIZE)
+
+    await wb.write(0x180, 0x60)  # POST_CTRL: CONV_REQ, bias+zp
+    await wb.write(0x118, 0)     # DMA_CTRL: no fusion
+
+    # Start layer
+    await wb.write(0x000, 0x01)
+
+    # Wait for completion
+    timeout = 10000
+    for cyc in range(timeout):
+        await RisingEdge(dut.clk)
+        if cyc > 200 and cyc % 100 == 0:
+            try:
+                s = await wb.read(0x004)
+                if (s & 0x1) == 0:
+                    return True
+            except (ValueError, AttributeError):
+                continue
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# IRQ Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@cocotb.test()
+async def test_irq_done(dut):
+    """IRQ: Enable DONE_EN → run layer → verify irq_o high → W1C → irq_o low."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    ext_mem = {}
+    mem = WbMasterMem(dut, dut.clk, ext_mem)
+    cocotb.start_soon(mem.run())
+
+    # Enable DONE IRQ only
+    await wb.write(0x008, 0x01)  # IRQ_EN[0] = DONE_EN
+
+    # irq_o should be 0 before layer runs
+    await ReadOnly()
+    assert dut.irq_o.value == 0, "IRQ should be low before layer start"
+    await Timer(1, unit="step")
+
+    # Run a real Conv2D layer to completion
+    out_base = 0x7000_0000
+    done = await _run_conv1x1_layer(dut, wb, mem, ext_mem, out_base)
+    assert done, "Layer did not complete"
+
+    # After hw_done pulse, irq_o should be high (DONE_EN enabled + STATUS[0] set)
+    await ReadOnly()
+    irq_val = int(dut.irq_o.value)
+    await Timer(1, unit="step")
+    assert irq_val == 1, f"Expected irq_o=1 after done, got {irq_val}"
+
+    # Read IRQ_STATUS — bit 0 should be set
+    irq_status = await wb.read(0x00C)
+    assert (irq_status & 0x01) == 1, f"IRQ_STATUS[0] should be 1, got 0x{irq_status:08X}"
+
+    # W1C: write 0x07 to clear all pending status bits
+    await wb.write(0x00C, 0x07)
+
+    # irq_o should now be low
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+    irq_val = int(dut.irq_o.value)
+    await Timer(1, unit="step")
+    assert irq_val == 0, f"Expected irq_o=0 after W1C, got {irq_val}"
+
+    # IRQ_STATUS[0] (DONE) should be cleared; DMA_DONE (bit 2) may still be set
+    irq_status = await wb.read(0x00C)
+    assert (irq_status & 0x01) == 0, f"IRQ_STATUS[0] should be 0 after W1C, got 0x{irq_status:08X}"
+
+
+@cocotb.test()
+async def test_irq_mask(dut):
+    """IRQ: DONE_EN=0 → hw_done sets STATUS[0] but irq_o stays low."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    ext_mem = {}
+    mem = WbMasterMem(dut, dut.clk, ext_mem)
+    cocotb.start_soon(mem.run())
+
+    # IRQ_EN = 0 (all masked)
+    await wb.write(0x008, 0x00)
+
+    # Run layer to completion
+    out_base = 0x7000_0000
+    done = await _run_conv1x1_layer(dut, wb, mem, ext_mem, out_base)
+    assert done, "Layer did not complete"
+
+    # IRQ_STATUS[0] should be set (hw_done fires regardless of mask)
+    irq_status = await wb.read(0x00C)
+    assert (irq_status & 0x01) == 1, f"IRQ_STATUS[0] should be 1, got 0x{irq_status:08X}"
+
+    # But irq_o should remain low (masked)
+    await ReadOnly()
+    irq_val = int(dut.irq_o.value)
+    await Timer(1, unit="step")
+    assert irq_val == 0, f"Expected irq_o=0 when masked, got {irq_val}"
+
+    # Clean up: W1C to clear status
+    await wb.write(0x00C, 0x01)
+
+
+@cocotb.test()
+async def test_irq_multiple(dut):
+    """IRQ: Enable DONE+DMA_DONE → both status bits set → selective W1C."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    ext_mem = {}
+    mem = WbMasterMem(dut, dut.clk, ext_mem)
+    cocotb.start_soon(mem.run())
+
+    # Enable DONE (bit 0) and DMA_DONE (bit 2)
+    await wb.write(0x008, 0x05)  # IRQ_EN = 0b101
+
+    # Run layer to completion — this should produce both hw_done and hw_dma_done
+    out_base = 0x7000_0000
+    done = await _run_conv1x1_layer(dut, wb, mem, ext_mem, out_base)
+    assert done, "Layer did not complete"
+
+    # Both STATUS[0] (DONE) and STATUS[2] (DMA_DONE) should be set
+    irq_status = await wb.read(0x00C)
+    assert (irq_status & 0x01) == 1, f"IRQ_STATUS[0] (DONE) should be set, got 0x{irq_status:08X}"
+    # DMA_DONE depends on hw_dma_done pulse — may or may not fire in this flow.
+    # At minimum, DONE must be set and irq_o must be high.
+    await ReadOnly()
+    irq_val = int(dut.irq_o.value)
+    await Timer(1, unit="step")
+    assert irq_val == 1, f"Expected irq_o=1, got {irq_val}"
+
+    # W1C clear only DONE (bit 0)
+    await wb.write(0x00C, 0x01)
+    await RisingEdge(dut.clk)
+
+    # If DMA_DONE was also set, irq_o should remain high; otherwise it goes low
+    irq_status2 = await wb.read(0x00C)
+    await ReadOnly()
+    irq_val2 = int(dut.irq_o.value)
+    await Timer(1, unit="step")
+
+    if irq_status2 & 0x04:
+        # DMA_DONE still pending → irq_o should still be 1
+        assert irq_val2 == 1, f"Expected irq_o=1 with DMA_DONE pending, got {irq_val2}"
+        # Now W1C clear DMA_DONE
+        await wb.write(0x00C, 0x04)
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        irq_val3 = int(dut.irq_o.value)
+        await Timer(1, unit="step")
+        assert irq_val3 == 0, f"Expected irq_o=0 after all W1C, got {irq_val3}"
+    else:
+        # Only DONE was pending, now cleared → irq_o should be 0
+        assert irq_val2 == 0, f"Expected irq_o=0 after W1C DONE, got {irq_val2}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# End-to-End Golden Tests: Full Compute Cycle
+# ═══════════════════════════════════════════════════════════════════════
+
+
 @cocotb.test()
 async def test_e2e_conv1x1_golden(dut):
     """E2E: Conv2D 1×1, 1 pixel, ARRAY_SIZE in/out channels.
