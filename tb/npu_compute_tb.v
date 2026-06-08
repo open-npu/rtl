@@ -15,6 +15,7 @@ module npu_compute_tb #(
     // Controller interface
     input  wire        start,
     output wire        done,
+    output wire        tile_done,
 
     // Configuration
     input  wire [7:0]  cfg_op_type,
@@ -138,7 +139,7 @@ module npu_compute_tb #(
         .ACC_W        (ACC_W)
     ) u_compute (
         .clk(clk), .rst_n(rst_n),
-        .start(start), .done(done),
+        .start(start), .done(done), .tile_done(tile_done),
         .cfg_op_type(cfg_op_type),
         .cfg_int16(cfg_int16),
         .cfg_in_c(cfg_in_c), .cfg_out_h(cfg_out_h), .cfg_out_w(cfg_out_w),
