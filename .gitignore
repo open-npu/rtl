@@ -3,3 +3,10 @@ tb/sim_build/
 tb/results*.xml
 tb/__pycache__/
 tb/dump.vcd
+tb/coverage.dat
+tb/coverage_annotate/
+tb/unit/__pycache__/
+tb/integration/__pycache__/
+tb/e2e/__pycache__/
+tb/robustness/__pycache__/
+tb/golden/__pycache__/

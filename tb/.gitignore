@@ -3,3 +3,5 @@ sim_build/
 results.xml
 *.vcd
 *.lxt
+coverage.dat
+coverage_annotate/
