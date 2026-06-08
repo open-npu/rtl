@@ -252,6 +252,7 @@ module npu_compute #(
     // ─── Writeback state ───
     reg [$clog2(ARRAY_SIZE):0] wb_cnt;   // output bytes collected
     reg [31:0] wb_pack;                   // pack buffer
+    reg [1:0]  wb_pos;                    // byte position within current word (0-3 for INT8)
     reg [ACT_ADDR_W-1:0] wb_addr;
 
     // ─── Address bases ───
@@ -560,6 +561,10 @@ module npu_compute #(
                 // Reset spatial coords for first pixel
                 sp_oh <= 0;
                 sp_ow <= 0;
+
+                // Reset writeback packing state for this OC group
+                wb_pack <= 0;
+                wb_pos  <= 2'd0;
 
                 wgt_col_idx <= 0;
                 state <= S_WGT_CMD;
@@ -982,18 +987,18 @@ module npu_compute #(
 
             // ══════════════════════════════════════════════════════════════
             // WRITEBACK: pack output bytes and write SRAM words
-            // Output NHWC layout: byte at (sp_oh*out_tile_w + sp_ow)*out_c + oc
-            // Since oc_group*ARRAY_SIZE and ARRAY_SIZE are multiples of 4,
-            // drain_col[1:0] directly gives byte position within SRAM word.
+            // Output NHWC layout: contiguous bytes across pixels.
+            // wb_pos tracks byte position within the current 32-bit word,
+            // persisting across pixels to support OUT_C not a multiple of 4.
             // ══════════════════════════════════════════════════════════════
             S_WRITEBACK: begin
-                // Pack output elements into wb_pack and write SRAM words
-                // INT8: 4 channels per word; INT16: 2 channels per word
+                // Address for the current word (same formula, correct for all OUT_C)
+                // Pack output elements into wb_pack using wb_pos for byte position
                 if (cfg_int16) begin
-                    case (drain_col[0])
+                    case (wb_pos[0])
                         1'b0: wb_pack[15:0] <= ppu_out_data;
                         1'b1: begin
-                            // Write full word (2 output channels)
+                            // Write full word (2 elements accumulated)
                             act_wr_en   <= 1'b1;
                             act_wr_addr <= out_base +
                                 (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
@@ -1002,13 +1007,14 @@ module npu_compute #(
                             act_wr_data <= {ppu_out_data, wb_pack[15:0]};
                         end
                     endcase
+                    wb_pos <= {1'b0, ~wb_pos[0]};  // toggle: 0->1->0->1...
                 end else begin
-                    case (drain_col[1:0])
+                    case (wb_pos)
                         2'd0: wb_pack[7:0]   <= ppu_out_data[7:0];
                         2'd1: wb_pack[15:8]  <= ppu_out_data[7:0];
                         2'd2: wb_pack[23:16] <= ppu_out_data[7:0];
                         2'd3: begin
-                            // Write full word (4 output channels)
+                            // Write full word (4 bytes accumulated)
                             act_wr_en   <= 1'b1;
                             act_wr_addr <= out_base +
                                 (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
@@ -1017,28 +1023,43 @@ module npu_compute #(
                             act_wr_data <= {ppu_out_data[7:0], wb_pack[23:0]};
                         end
                     endcase
+                    wb_pos <= wb_pos + 2'd1;
                 end
 
                 // Advance to next channel or finish pixel
                 if (drain_col == col_last) begin
-                    // Flush remaining partial word
-                    if (cfg_int16) begin
-                        if (drain_col[0] != 1'b1) begin
-                            act_wr_en   <= 1'b1;
-                            act_wr_addr <= out_base +
-                                (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
-                                  + oc_group * ARRAY_SIZE_16
-                                  + ({12'd0, drain_col} & ~16'd1)) >> 1);
-                            act_wr_data <= wb_pack;
-                        end
-                    end else begin
-                        if (drain_col[1:0] != 2'd3) begin
-                            act_wr_en   <= 1'b1;
-                            act_wr_addr <= out_base +
-                                (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
-                                  + oc_group * ARRAY_SIZE_16
-                                  + ({12'd0, drain_col} & ~16'd3)) >> 2);
-                            act_wr_data <= wb_pack;
+                    // Last channel of this pixel — check if we need partial flush
+                    // Flush only when this is the LAST pixel of the tile
+                    // (next pixel will be in same word if OUT_C not word-aligned)
+                    if (sp_ow + 1 >= out_tile_w && sp_oh + 1 >= out_tile_h) begin
+                        // Last pixel — flush any partial word
+                        if (cfg_int16) begin
+                            if (wb_pos[0] != 1'b1) begin
+                                act_wr_en   <= 1'b1;
+                                act_wr_addr <= out_base +
+                                    (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
+                                      + oc_group * ARRAY_SIZE_16
+                                      + ({12'd0, drain_col} & ~16'd1)) >> 1);
+                                act_wr_data <= {16'd0, ppu_out_data};
+                            end
+                        end else begin
+                            if (wb_pos != 2'd3) begin
+                                act_wr_en   <= 1'b1;
+                                // Use (drain_col - wb_pos) instead of (drain_col & ~3)
+                                // to correctly compute the start-of-word byte offset
+                                // when wb_pack carries over bytes from previous pixels
+                                // for non-word-aligned OUT_C.
+                                act_wr_addr <= out_base +
+                                    (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
+                                      + oc_group * ARRAY_SIZE_16
+                                      + ({14'd0, drain_col} - {14'd0, wb_pos})) >> 2);
+                                case (wb_pos)
+                                    2'd0: act_wr_data <= {24'd0, ppu_out_data[7:0]};
+                                    2'd1: act_wr_data <= {16'd0, ppu_out_data[7:0], wb_pack[7:0]};
+                                    2'd2: act_wr_data <= {8'd0,  ppu_out_data[7:0], wb_pack[15:0]};
+                                    default: act_wr_data <= 32'd0; // unreachable
+                                endcase
+                            end
                         end
                     end
                     state <= S_PIXEL_NEXT;
@@ -1095,7 +1116,7 @@ module npu_compute #(
 
                 conv_elem_cnt <= 0;
                 drain_col <= 0;
-                wb_pack <= 0;
+                // Note: wb_pack and wb_pos persist across pixels for non-aligned OUT_C
                 // Clear partial_sum on first pass of new pixel
                 if (k_pass == 0) begin
                     for (i = 0; i < ARRAY_SIZE; i = i + 1)
