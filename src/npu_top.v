@@ -66,6 +66,11 @@ module npu_top #(
     wire [3:0]  hw_error_code;
     wire [7:0]  hw_curr_layer;
 
+    // --- DB_EN (Double-Buffer) wires ---
+    wire        ping_pong_flag;
+    wire        tile_done;
+    wire        db_en_is_active = reg_dma_ctrl[0] && hw_busy;
+
     // --- CSR Layer Config outputs ---
     wire [31:0] reg_layer_mode, reg_in_dim_hw, reg_in_dim_c;
     wire [31:0] reg_out_dim_hw, reg_out_dim_c, reg_kernel_size;
@@ -240,6 +245,10 @@ module npu_top #(
         .cfg_layer_mode     (reg_layer_mode),
         .cfg_out_base       ({3'd0, reg_sram_base[ACT_ADDR_W+16-1:16]}),
         .cfg_dma_add_b_addr (reg_dma_add_b_addr),
+        // Double-Buffer
+        .ping_pong_flag     (ping_pong_flag),
+        .tile_done          (tile_done),
+        .cfg_act_bank_offset({1'b0, ACT_DEPTH[15:1]}),  // ACT_DEPTH/2 as 16-bit word offset
         // Auto-restart
         .ctrl_auto_next  (ctrl_auto_next),
         .cfg_layer_count (reg_layer_count)
@@ -562,6 +571,12 @@ module npu_top #(
     // Compute engine handles full pipeline (compute + PPU + writeback) internally
     assign compute_done = compute_done_w;
 
+    // When DB_EN active, add bank offset (ACT_DEPTH/2) to compute's act_base
+    // based on ping_pong_flag. out_base is NOT offset.
+    wire [ACT_ADDR_W-1:0] effective_act_base = db_en_is_active ?
+        (reg_sram_base[ACT_ADDR_W-1:0] + {ping_pong_flag, {(ACT_ADDR_W-1){1'b0}}}) :
+        reg_sram_base[ACT_ADDR_W-1:0];
+
     npu_compute #(
         .ARRAY_SIZE   (ARRAY_SIZE),
         .ACT_ADDR_W   (ACT_ADDR_W),
@@ -593,7 +608,7 @@ module npu_top #(
         .cfg_tile_num_w (reg_tile_count[31:16]),
         .cfg_in_w       (reg_in_dim_hw[15:0]),
         .cfg_in_h       (reg_in_dim_hw[31:16]),
-        .cfg_act_base   (reg_sram_base[ACT_ADDR_W-1:0]),
+        .cfg_act_base   (effective_act_base),
         .cfg_out_base   (reg_sram_base[ACT_ADDR_W+16-1:16]),
         .cfg_pool_cfg   (reg_pool_cfg),
         .cfg_resize_cfg (reg_resize_cfg),
@@ -643,7 +658,9 @@ module npu_top #(
         .ppu_shift_s    (ppu_shift_s),
         .ppu_zero_point (ppu_zero_point),
         .ppu_out_data   (ppu_out_data),
-        .ppu_out_valid  (ppu_out_valid)
+        .ppu_out_valid  (ppu_out_valid),
+        // DB_EN
+        .tile_done      (tile_done)
     );
 
     // ─── SRAM Port B connections (compute engine) ───

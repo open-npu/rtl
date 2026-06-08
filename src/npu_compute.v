@@ -35,6 +35,7 @@ module npu_compute #(
     // ─── Controller handshake ───
     input  wire                         start,
     output reg                          done,
+    output wire                         tile_done,  // 1-cycle pulse at non-final tile boundary
 
     // ─── Layer configuration (from CSR) ───
     input  wire [7:0]                   cfg_op_type,
@@ -210,6 +211,8 @@ module npu_compute #(
 
     // ─── Tile iteration ───
     reg [15:0] tile_y, tile_x;
+    reg        tile_done_r;
+    assign tile_done = tile_done_r;
     reg [15:0] oc_group;
 
     // ─── Latched config ───
@@ -370,6 +373,7 @@ module npu_compute #(
         if (!rst_n) begin
             state <= S_IDLE;
             done  <= 1'b0;
+            tile_done_r <= 1'b0;
             // All outputs idle
             sa_cmd       <= MODE_IDLE;
             sa_cmd_valid <= 1'b0;
@@ -452,6 +456,7 @@ module npu_compute #(
         end else begin
             // ─── Default pulse deassertion ───
             done         <= 1'b0;
+            tile_done_r  <= 1'b0;
             sa_cmd_valid <= 1'b0;
             sa_wgt_valid <= 1'b0;
             sa_act_valid <= 1'b0;
@@ -1182,14 +1187,16 @@ module npu_compute #(
                     state <= S_DONE;
                 end else if (tile_x + 1 >= cfg_tile_num_w) begin
                     if (tile_y + 1 >= cfg_tile_num_h) begin
-                        state <= S_DONE;
+                        state <= S_DONE;  // Final tile — no pulse, done handles it
                     end else begin
                         tile_x <= 0;
                         tile_y <= tile_y + 1;
+                        tile_done_r <= 1'b1;  // PULSE: more tiles coming
                         state <= S_TILE_SETUP;
                     end
                 end else begin
                     tile_x <= tile_x + 1;
+                    tile_done_r <= 1'b1;  // PULSE: more tiles coming
                     state <= S_TILE_SETUP;
                 end
             end
