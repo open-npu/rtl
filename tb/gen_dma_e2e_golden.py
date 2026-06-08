@@ -699,6 +699,89 @@ def save_golden(output_dir, int16_mode=False):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Conv1x1 partial-OC test generator (OUT_C not multiple of 4/2)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def gen_conv1x1_partial_oc_test(in_h=2, in_w=2, in_c=4, out_c=2,
+                                 int16_mode=False, seed=42):
+    """Generate Conv2D 1x1 test with arbitrary OUT_C (for partial word flush testing).
+
+    Uses identity requantize (M=16384, S=14, bias=0, zp=0) so output = clamp(acc).
+    Returns (meta, data) suitable for program_layer() + verify.
+    """
+    np.random.seed(seed)
+
+    if int16_mode:
+        dtype_act = np.int16
+        dtype_wgt = np.int16
+        clamp_min, clamp_max = -32768, 32767
+        elems_per_word = 2
+    else:
+        dtype_act = np.int8
+        dtype_wgt = np.int8
+        clamp_min, clamp_max = -128, 127
+        elems_per_word = 4
+
+    # Small random input and weights
+    input_nhwc = np.random.randint(-10, 11, (in_h, in_w, in_c), dtype=dtype_act)
+    weight_ohwi = np.random.randint(-5, 6, (out_c, 1, 1, in_c), dtype=dtype_wgt)
+
+    cfg = {
+        'op_type': 0,  # Conv2D
+        'data_type': 1 if int16_mode else 0,
+        'in_h': in_h, 'in_w': in_w, 'in_c': in_c,
+        'out_h': in_h, 'out_w': in_w, 'out_c': out_c,
+        'kernel_h': 1, 'kernel_w': 1,
+        'stride_h': 1, 'stride_w': 1,
+        'pad_top': 0, 'pad_left': 0,
+        'k_depth': in_c,
+    }
+
+    # Compute golden: identity requant (M=16384, S=14 => scale=1.0)
+    M_arr = np.full(out_c, 16384, dtype=np.uint16)
+    S_arr = np.full(out_c, 14, dtype=np.uint8)
+    bias_arr = np.zeros(out_c, dtype=np.int64)
+    zp_arr = np.zeros(out_c, dtype=np.int16)
+
+    acc = ref_conv2d(input_nhwc, weight_ohwi, cfg)
+    out = ref_postproc(acc, M_arr, S_arr, bias_arr, zp_arr,
+                       relu6=False, clamp_min=clamp_min, clamp_max=clamp_max)
+
+    # Pack data
+    if int16_mode:
+        wgt_words = pack_conv_weights_i16(weight_ohwi, out_c, in_c)
+        input_words = pack_i16_to_words(input_nhwc)
+        output_words = pack_i16_to_words(out)
+    else:
+        wgt_words = pack_conv_weights_i8(weight_ohwi, out_c, in_c)
+        input_words = pack_i8_to_words(input_nhwc)
+        output_words = pack_i8_to_words(out)
+    param_words = pack_params_for_sram(M_arr, S_arr, bias_arr, zp_arr, out_c)
+
+    # Metadata (same format as program_layer expects)
+    meta = dict(cfg)
+    meta['n_input_words'] = len(input_words)
+    meta['n_wgt_words'] = len(wgt_words)
+    meta['n_param_words'] = len(param_words)
+    meta['n_output_words'] = len(output_words)
+    meta['dma_in_size'] = len(input_words) * 4
+    meta['dma_wgt_size'] = len(wgt_words) * 4
+    meta['dma_out_size'] = len(output_words) * 4
+    meta['dma_param_count'] = out_c
+    # POST_CTRL: CONV_REQ mode, no relu, bias_en + zp_en
+    meta['post_ctrl'] = 0x60 | (0x80 if int16_mode else 0)
+
+    data = {
+        'wgt_words': wgt_words,
+        'param_words': param_words,
+        'input_words': input_words,
+        'output_words': output_words,
+    }
+    return meta, data
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Pooling + Add standalone test generators
 # ═══════════════════════════════════════════════════════════════════════
 

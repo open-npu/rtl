@@ -662,7 +662,7 @@ async def test_dma_e2e_tiling_int16(dut):
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gen_dma_e2e_golden import gen_pooling_test, gen_add_test, gen_resize_test, gen_deconv_test, gen_concat_test
+from gen_dma_e2e_golden import gen_pooling_test, gen_add_test, gen_resize_test, gen_deconv_test, gen_concat_test, gen_conv1x1_partial_oc_test
 
 
 # DDR addresses for operator tests
@@ -1642,6 +1642,146 @@ async def test_concat_int16(dut):
         branches=[{'in_c': 4}, {'in_c': 4}],
         int16_mode=True, relu=True, seed=202,
         test_name="Concat INT16")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Conv1x1 Partial-OC tests (OUT_C not multiple of 4/2)
+# Verifies fix for partial word flush NBA race condition
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def program_conv1x1_layer(wb, meta):
+    """Program CSR registers for Conv2D 1x1 (no tiling, no padding)."""
+    await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
+    await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
+    await wb.write(0x048, meta['in_c'])
+    await wb.write(0x04C, (meta['out_h'] << 16) | meta['out_w'])
+    await wb.write(0x050, meta['out_c'])
+    await wb.write(0x054, 1 | (1 << 8))   # kernel 1x1
+    await wb.write(0x058, 1 | (1 << 8))   # stride 1x1
+    await wb.write(0x05C, 0)               # no padding
+    await wb.write(0x070, 0)               # no tiling
+    await wb.write(0x074, (1 << 16) | 1)   # tile_num 1x1
+    out_base = meta['n_input_words']
+    await wb.write(0x078, (out_base << 16) | 0)
+    await wb.write(0x100, POOL_IN_ADDR)
+    await wb.write(0x104, POOL_OUT_ADDR)
+    await wb.write(0x108, POOL_WGT_ADDR)
+    await wb.write(0x10C, POOL_PARAM_ADDR)
+    await wb.write(0x128, meta['dma_in_size'])
+    await wb.write(0x12C, meta['dma_wgt_size'])
+    await wb.write(0x130, meta['dma_out_size'])
+    await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x188, meta['dma_param_count'])
+    await wb.write(0x118, 0)  # no fusion
+
+
+async def run_conv1x1_partial_oc_test(dut, in_h, in_w, in_c, out_c,
+                                       int16_mode, seed, test_name):
+    """Run a Conv1x1 partial-OC test and verify output."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_conv1x1_partial_oc_test(
+        in_h=in_h, in_w=in_w, in_c=in_c, out_c=out_c,
+        int16_mode=int16_mode, seed=seed)
+
+    mem.populate(POOL_WGT_ADDR, data['wgt_words'])
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_conv1x1_layer(wb, meta)
+    done = await run_layer_and_wait(wb, dut, timeout=300000)
+    assert done, f"{test_name} did not complete"
+
+    out_addr = POOL_OUT_ADDR
+    n_words = meta['n_output_words']
+    mismatches = []
+    for i in range(n_words):
+        got = mem.mem.get(out_addr + i * 4, None)
+        exp = int(data['output_words'][i])
+        if got is None:
+            mismatches.append((i, exp, 'NOT_WRITTEN'))
+        elif got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        for idx_m, exp, got in mismatches[:10]:
+            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} "
+                           f"got={'NOT_WRITTEN' if got == 'NOT_WRITTEN' else f'0x{got:08X}'}")
+    assert len(mismatches) == 0, \
+        f"{test_name}: {len(mismatches)}/{n_words} mismatches"
+    dut._log.info(f"{test_name} PASSED: {n_words} words bit-exact")
+
+
+@cocotb.test()
+async def test_conv1x1_outc1(dut):
+    """Conv1x1 INT8 OUT_C=1: minimal partial word (1 byte)."""
+    await run_conv1x1_partial_oc_test(dut, in_h=2, in_w=2, in_c=4, out_c=1,
+                                       int16_mode=False, seed=300,
+                                       test_name="Conv1x1 OC=1 INT8")
+
+
+@cocotb.test()
+async def test_conv1x1_outc2(dut):
+    """Conv1x1 INT8 OUT_C=2: partial word (2 bytes)."""
+    await run_conv1x1_partial_oc_test(dut, in_h=2, in_w=2, in_c=4, out_c=2,
+                                       int16_mode=False, seed=301,
+                                       test_name="Conv1x1 OC=2 INT8")
+
+
+@cocotb.test()
+async def test_conv1x1_outc3(dut):
+    """Conv1x1 INT8 OUT_C=3: partial word (3 bytes)."""
+    await run_conv1x1_partial_oc_test(dut, in_h=2, in_w=2, in_c=4, out_c=3,
+                                       int16_mode=False, seed=302,
+                                       test_name="Conv1x1 OC=3 INT8")
+
+
+@cocotb.test()
+async def test_conv1x1_outc5(dut):
+    """Conv1x1 INT8 OUT_C=5: crosses OC group (full word + partial word)."""
+    await run_conv1x1_partial_oc_test(dut, in_h=2, in_w=2, in_c=4, out_c=5,
+                                       int16_mode=False, seed=303,
+                                       test_name="Conv1x1 OC=5 INT8")
+
+
+@cocotb.test()
+async def test_conv1x1_outc1_int16(dut):
+    """Conv1x1 INT16 OUT_C=1: partial word (1 element)."""
+    await run_conv1x1_partial_oc_test(dut, in_h=2, in_w=2, in_c=4, out_c=1,
+                                       int16_mode=True, seed=310,
+                                       test_name="Conv1x1 OC=1 INT16")
+
+
+@cocotb.test()
+async def test_conv1x1_outc3_int16(dut):
+    """Conv1x1 INT16 OUT_C=3: crosses OC group (full word + partial word)."""
+    await run_conv1x1_partial_oc_test(dut, in_h=2, in_w=2, in_c=4, out_c=3,
+                                       int16_mode=True, seed=311,
+                                       test_name="Conv1x1 OC=3 INT16")
+
+
+@cocotb.test()
+async def test_conv1x1_outc3_3wide(dut):
+    """Conv1x1 INT8 OUT_C=3 1x3: multi-pixel non-word-aligned flush (9 bytes).
+       Triggers partial flush address bug when OUT_C % 4 != 0 across pixels."""
+    await run_conv1x1_partial_oc_test(dut, in_h=1, in_w=3, in_c=4, out_c=3,
+                                       int16_mode=False, seed=320,
+                                       test_name="Conv1x1 OC=3 1x3 INT8")
+
+
+@cocotb.test()
+async def test_conv1x1_outc3_3x3(dut):
+    """Conv1x1 INT8 OUT_C=3 3x3: multi-pixel non-word-aligned flush (27 bytes).
+       Heavier test of partial flush address with wb_pack carry-over."""
+    await run_conv1x1_partial_oc_test(dut, in_h=3, in_w=3, in_c=4, out_c=3,
+                                       int16_mode=False, seed=321,
+                                       test_name="Conv1x1 OC=3 3x3 INT8")
 
 
 @cocotb.test()
