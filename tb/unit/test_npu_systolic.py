@@ -3,10 +3,6 @@
 #
 # ARRAY_SIZE is read dynamically from the RTL parameter.
 
-import sys
-import os
-sys.path.insert(0, os.path.dirname(__file__))
-
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge

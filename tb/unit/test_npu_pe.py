@@ -1,10 +1,6 @@
 # Open-NPU RTL — cocotb Tests for npu_pe
 # SPDX-License-Identifier: Apache-2.0
 
-import sys
-import os
-sys.path.insert(0, os.path.dirname(__file__))
-
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, Timer

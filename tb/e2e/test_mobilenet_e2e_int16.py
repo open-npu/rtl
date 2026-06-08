@@ -18,7 +18,7 @@ from cocotb.triggers import RisingEdge, ReadOnly
 
 
 GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          'golden_mobilenet_int16')
+                          '..', 'golden', 'golden_mobilenet_int16')
 
 
 def get_array_size(dut):

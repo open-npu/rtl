@@ -137,7 +137,7 @@ async def reset(dut):
 # ═══════════════════════════════════════════════════════════════════════
 
 GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          'golden_dma_e2e')
+                          '..', 'golden', 'golden_dma_e2e')
 
 
 def load_golden(mode='int8'):
@@ -508,7 +508,7 @@ async def test_dma_e2e_mobilenet_int16(dut):
 # ═══════════════════════════════════════════════════════════════════════
 
 TILING_GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  'golden_dma_e2e_tiling')
+                                  '..', 'golden', 'golden_dma_e2e_tiling')
 
 
 def load_golden_tiling(mode='int8'):
@@ -661,7 +661,7 @@ async def test_dma_e2e_tiling_int16(dut):
 # ═══════════════════════════════════════════════════════════════════════
 
 import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'golden'))
 from gen_dma_e2e_golden import gen_pooling_test, gen_add_test, gen_resize_test, gen_deconv_test, gen_concat_test, gen_conv1x1_partial_oc_test
 
 
@@ -1799,7 +1799,7 @@ async def test_concat_3branch(dut):
 
 
 FULL_MODEL_GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                      'golden_full_model')
+                                      '..', 'golden', 'golden_full_model')
 
 
 def load_golden_full_model(mode='int8'):

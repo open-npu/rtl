@@ -5,11 +5,8 @@ import cocotb
 from cocotb.triggers import RisingEdge, Timer
 from cocotb.clock import Clock
 
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
-from wishbone import WishboneMaster
-from clock_reset import clock_reset
+from utils.wishbone import WishboneMaster
+from utils.clock_reset import clock_reset
 
 
 async def init_dut(dut):

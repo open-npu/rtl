@@ -21,7 +21,7 @@ import json
 import numpy as np
 
 # Add tools to path
-TOOLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tools')
+TOOLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'tools')
 sys.path.insert(0, TOOLS_DIR)
 
 from model_packer import (
@@ -33,7 +33,7 @@ from model_packer import (
 )
 
 CSIM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          '..', '..', 'csim', 'npu_sim')
+                          '..', '..', '..', 'csim', 'npu_sim')
 
 
 def compute_ms(eff_scale):
