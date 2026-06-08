@@ -22,10 +22,11 @@
 module npu_top #(
     parameter ARRAY_SIZE = `ARRAY_SIZE,
     parameter SPAD_KB    = `SPAD_KB,
-    // SRAM depths (words)
-    parameter ACT_DEPTH   = 8192,   // 32KB / 4B = 8K words
-    parameter WGT_DEPTH   = 16384,  // 64KB / 4B = 16K words
-    parameter PARAM_DEPTH = 2048    // 8KB / 4B = 2K words
+    // SRAM depths (words) — derived from SPAD_KB
+    // Allocation: Act=SPAD/4, Wgt=SPAD/2, Param=SPAD/16 (SPAD/16 unused for future)
+    parameter ACT_DEPTH   = SPAD_KB * 64,     // SPAD_KB * 1024 / 4 bytes / 4 B/word
+    parameter WGT_DEPTH   = SPAD_KB * 128,    // SPAD_KB * 1024 / 2 bytes / 4 B/word
+    parameter PARAM_DEPTH = SPAD_KB * 16      // SPAD_KB * 1024 / 16 bytes / 4 B/word
 )(
     input  wire         clk,
     input  wire         rst_n,

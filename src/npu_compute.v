@@ -23,9 +23,9 @@
 
 module npu_compute #(
     parameter ARRAY_SIZE   = `ARRAY_SIZE,
-    parameter ACT_ADDR_W   = 13,
-    parameter WGT_ADDR_W   = 14,
-    parameter PARAM_ADDR_W = 11,
+    parameter ACT_ADDR_W   = 13,  // $clog2(SPAD_KB*64) for SPAD_KB=128 → $clog2(8192)=13
+    parameter WGT_ADDR_W   = 14,  // $clog2(SPAD_KB*128) for SPAD_KB=128 → $clog2(16384)=14
+    parameter PARAM_ADDR_W = 11,  // $clog2(SPAD_KB*16) for SPAD_KB=128 → $clog2(2048)=11
     parameter DATA_W       = `DATA_WIDTH,
     parameter ACC_W        = `ACC_WIDTH
 )(

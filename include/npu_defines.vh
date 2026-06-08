@@ -19,9 +19,10 @@
 `define NUM_PES        (`ARRAY_SIZE * `ARRAY_SIZE)
 `define DW_CHANNELS    `ARRAY_SIZE
 
-// SRAM sizes (bytes)
-`define ACT_BANK_SIZE  (`SPAD_KB * 1024 / 4)   // Each act bank = SPAD/4
-`define WEIGHT_BUF_SIZE (`SPAD_KB * 1024 / 2)  // Weight buffer = SPAD/2
+// SRAM sizes (bytes) — for reference; actual depths derived in npu_top.v from SPAD_KB
+`define ACT_BANK_SIZE  (`SPAD_KB * 1024 / 4)   // Act SRAM = SPAD/4
+`define WEIGHT_BUF_SIZE (`SPAD_KB * 1024 / 2)  // Weight SRAM = SPAD/2
+`define PARAM_BUF_SIZE (`SPAD_KB * 1024 / 16)  // Param SRAM = SPAD/16
 
 // ─── Data widths ───
 `define DATA_WIDTH     16     // Data port width (always 16-bit; INT8 sign-extends)
