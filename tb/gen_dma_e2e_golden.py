@@ -365,7 +365,7 @@ def pack_dw_weights_i8(weight_chw, n_ch):
 
 def pack_conv_weights_i16(weight_ohwi, out_c, k_depth):
     """Pack Conv2D INT16 weights: [out_c][kh][kw][in_c] -> uint32 words."""
-    flat = weight_ohwi.reshape(out_c * k_depth).astype(np.int16)
+    flat = weight_ohwi.flatten().astype(np.int16)
     return pack_i16_to_words(flat)
 
 
@@ -890,6 +890,107 @@ def gen_dwconv_test(in_h=8, in_w=8, in_c=8,
 # ═══════════════════════════════════════════════════════════════════════
 # FC (Fully Connected) standalone test generator
 # ═══════════════════════════════════════════════════════════════════════
+
+
+def gen_conv2d_test(in_h=8, in_w=8, in_c=8, out_c=4, kernel_h=3, kernel_w=3,
+                    stride=1, pad=1, relu6=True, int16_mode=False, seed=500):
+    """Generate one Conv2D test layer (weights + input + params + expected output).
+
+    Conv2D uses op_type=0, dispatched to systolic array with arbitrary spatial dims.
+    Weight layout: [out_c][kh][kw][in_c] packed with pack_conv_weights_i8/i16.
+
+    Returns (meta, raw_data) dict with packed uint32 word arrays.
+    """
+    np.random.seed(seed)
+
+    if int16_mode:
+        wgt_range = (-64, 65)
+        act_range = (-500, 500)
+        clamp_min, clamp_max = -32768, 32767
+        dtype_act = np.int16
+        dtype_wgt = np.int16
+    else:
+        wgt_range = (-8, 9)
+        act_range = (-64, 64)
+        clamp_min, clamp_max = -128, 127
+        dtype_act = np.int8
+        dtype_wgt = np.int8
+
+    out_h = (in_h + 2 * pad - kernel_h) // stride + 1
+    out_w = (in_w + 2 * pad - kernel_w) // stride + 1
+
+    # Input: shape [in_h, in_w, in_c]
+    input_nhwc = np.random.randint(act_range[0], act_range[1],
+                                   (in_h, in_w, in_c), dtype=dtype_act)
+    # Weights: shape [out_c, kernel_h, kernel_w, in_c]
+    weight_ohwi = np.random.randint(wgt_range[0], wgt_range[1],
+                                    (out_c, kernel_h, kernel_w, in_c), dtype=dtype_wgt)
+
+    cfg = {
+        'in_h': in_h, 'in_w': in_w, 'in_c': in_c,
+        'out_h': out_h, 'out_w': out_w, 'out_c': out_c,
+        'kernel_h': kernel_h, 'kernel_w': kernel_w,
+        'stride_h': stride, 'stride_w': stride,
+        'pad_top': pad, 'pad_left': pad,
+        'k_depth': in_c,
+    }
+
+    # Compute golden with ref_conv2d
+    acc = ref_conv2d(input_nhwc, weight_ohwi, cfg)
+
+    # Per-channel PPU params
+    s_w = 1.0 / 64.0
+    eff_scale = s_w
+    M_arr = np.zeros(out_c, dtype=np.uint16)
+    S_arr = np.zeros(out_c, dtype=np.uint8)
+    bias_arr = np.random.randint(-50, 50, (out_c,), dtype=np.int64)
+    zp_arr = np.zeros(out_c, dtype=np.int16)
+    for c in range(out_c):
+        M_arr[c], S_arr[c] = compute_ms(eff_scale * (0.8 + 0.4 * np.random.rand()))
+
+    out = ref_postproc(acc, M_arr, S_arr, bias_arr, zp_arr,
+                       relu6=relu6, clamp_min=clamp_min, clamp_max=clamp_max)
+
+    # Pack data — Conv2D uses Conv2D weight packing
+    if int16_mode:
+        wgt_words = pack_conv_weights_i16(weight_ohwi, out_c, in_c)
+        input_words = pack_i16_to_words(input_nhwc)
+        output_words = pack_i16_to_words(out)
+    else:
+        wgt_words = pack_conv_weights_i8(weight_ohwi, out_c, in_c)
+        input_words = pack_i8_to_words(input_nhwc)
+        output_words = pack_i8_to_words(out)
+    param_words = pack_params_for_sram(M_arr, S_arr, bias_arr, zp_arr, out_c)
+
+    # POST_CTRL: mode=CONV_REQ(00), relu6, bias_en, zp_en
+    post_ctrl = 0x64  # bias_en + zp_en + relu_en
+    if int16_mode:
+        post_ctrl |= 0x80
+
+    meta = {
+        'op_type': 0,  # Conv2D
+        'data_type': 1 if int16_mode else 0,
+        'in_h': in_h, 'in_w': in_w, 'in_c': in_c,
+        'out_h': out_h, 'out_w': out_w, 'out_c': out_c,
+        'kernel_h': kernel_h, 'kernel_w': kernel_w,
+        'stride_h': stride, 'stride_w': stride,
+        'pad_top': pad, 'pad_left': pad,
+        'post_ctrl': post_ctrl,
+        'dma_param_count': out_c,
+        'dma_in_size': len(input_words) * 4,
+        'dma_wgt_size': len(wgt_words) * 4,
+        'dma_out_size': len(output_words) * 4,
+        'n_input_words': len(input_words),
+        'n_output_words': len(output_words),
+        'n_param_words': len(param_words),
+    }
+
+    return meta, {
+        'wgt_words': wgt_words,
+        'param_words': param_words,
+        'input_words': input_words,
+        'output_words': output_words,
+    }
 
 
 def gen_fc_test(in_c=8, out_c=4, relu6=True, int16_mode=False, seed=400):
