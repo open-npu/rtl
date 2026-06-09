@@ -3,15 +3,17 @@
 Generate DMA E2E golden data for 32×32 Medium-Scale Tiling Test.
 
 Model: MobileNetV2-style, 6 layers, 32×32 input, real channel widths (32/48).
-Three variants:
-  - int8:       INT8, no tiling (all layers fit in SRAM)
-  - int8_tiled: INT8 with spatial tiling (same model, tiling enabled)
-  - int16:      INT16 with spatial tiling (required for layers 2,3)
+Four variants:
+  - int8:            INT8, no tiling (all layers fit in SRAM)
+  - int8_tiled:      INT8 with spatial tiling (same model, tiling enabled)
+  - int16:           INT16 with spatial tiling (required for layers 2,3)
+  - int8_tiled_db_en: INT8 with spatial tiling + DB_EN (max 32ch, bank-constrained)
 
 SRAM constraints:
   - ACT SRAM: 8192 words (32KB), holds input + output
   - WGT SRAM: 16384 words (64KB)
   - PARAM SRAM: 2048 words (8KB)
+  - DB_EN: ACT SRAM split into two banks of 4096 words each
 
 SPDX-License-Identifier: Apache-2.0
 """
@@ -228,12 +230,14 @@ def compute_tile_params(in_words, out_words, out_h, out_w, out_c,
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def build_model_32x32(int16_mode=False, force_tiling=False):
+def build_model_32x32(int16_mode=False, force_tiling=False, db_en=False):
     """Build 32×32 medium-scale model.
 
     Args:
         int16_mode: Use INT16 data path.
         force_tiling: Force tiling even when SRAM fits (for INT8 tiled test).
+        db_en: Use DB_EN-compatible channel widths (max 32ch) so that
+               n_input_words + n_output_words <= ACT_DEPTH/2 per layer.
 
     Returns:
         layers, layer_data, input_nhwc
@@ -452,12 +456,14 @@ def build_model_32x32(int16_mode=False, force_tiling=False):
         return out_h, out_w, ch
 
     # ─── 6-layer model: 32×32 input ───
+    # DB_EN: max 32ch so n_input+n_output <= ACT_DEPTH/2=4096 words
+    ch_mid = 32 if db_en else 48
     h, w, c = 32, 32, 3
     h, w, c = add_conv(current, h, w, c, 32, kernel=3, stride=2, relu6=True)  # L0: [32x32x3]->[16x16x32]
     h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                  # L1: [16x16x32]->[16x16x32]
-    h, w, c = add_conv(current, h, w, c, 48, kernel=1, stride=1, relu6=True)  # L2: [16x16x32]->[16x16x48]
-    h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                  # L3: [16x16x48]->[16x16x48]
-    h, w, c = add_conv(current, h, w, c, 16, kernel=1, stride=1, relu6=False) # L4: [16x16x48]->[16x16x16]
+    h, w, c = add_conv(current, h, w, c, ch_mid, kernel=1, stride=1, relu6=True)  # L2: [16x16x32]->[16x16xch_mid]
+    h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                  # L3: [16x16xch_mid]->[16x16xch_mid]
+    h, w, c = add_conv(current, h, w, c, 16, kernel=1, stride=1, relu6=False) # L4: [16x16xch_mid]->[16x16x16]
     h, w, c = add_conv(current, h, w, c, 32, kernel=1, stride=1, relu6=True)  # L5: [16x16x16]->[16x16x32]
 
     return layers, layer_data, input_nhwc
@@ -487,15 +493,16 @@ def get_ddr_addrs(layer_idx):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def save_golden(output_dir, int16_mode=False, force_tiling=False):
+def save_golden(output_dir, int16_mode=False, force_tiling=False, db_en=False):
     mode_str = "INT16" if int16_mode else "INT8"
     tile_str = " (tiled)" if force_tiling else ""
+    db_str = " (DB_EN)" if db_en else ""
     print(f"\n{'='*60}")
-    print(f"Generating 32x32 tiling golden — {mode_str}{tile_str}")
+    print(f"Generating 32x32 tiling golden — {mode_str}{tile_str}{db_str}")
     print(f"{'='*60}")
 
     layers, layer_data, input_nhwc = build_model_32x32(
-        int16_mode=int16_mode, force_tiling=force_tiling)
+        int16_mode=int16_mode, force_tiling=force_tiling, db_en=db_en)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -587,6 +594,10 @@ if __name__ == '__main__':
     # Variant C: INT16, auto tiling (required for some layers)
     save_golden(os.path.join(base_dir, 'int16'),
                 int16_mode=True, force_tiling=False)
+
+    # Variant D: INT8, forced tiling + DB_EN (max 32ch, bank-constrained)
+    save_golden(os.path.join(base_dir, 'int8_tiled_db_en'),
+                int16_mode=False, force_tiling=True, db_en=True)
 
     print(f"\n{'='*60}")
     print("DONE. Golden data ready for 32x32 tiling DMA E2E tests.")

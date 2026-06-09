@@ -657,6 +657,114 @@ async def test_dma_e2e_tiling_int16(dut):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Test: 32x32 Medium-Scale — INT8, With Tiling + DB_EN (Double-Buffer)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def program_layer_db_en(wb, meta):
+    """Program all CSR registers for one layer with DB_EN=1 (double-buffer).
+
+    DB_EN constraint: with ping-pong, ACT SRAM is split into
+      Bank[0] = [0, ACT_DEPTH/2)  and  Bank[1] = [ACT_DEPTH/2, ACT_DEPTH).
+    Input occupies one bank; output must also fit within the same bank
+    without crossing the boundary.  The int8_tiled_db_en golden data
+    guarantees n_input_words + n_output_words <= ACT_DEPTH/2.
+    """
+    # LAYER_MODE: op_type | (data_type << 4)
+    await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
+
+    # Dimensions
+    await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])     # IN_DIM_HW
+    await wb.write(0x048, meta['in_c'])                             # IN_DIM_C
+    await wb.write(0x04C, (meta['out_h'] << 16) | meta['out_w'])   # OUT_DIM_HW
+    await wb.write(0x050, meta['out_c'])                            # OUT_DIM_C
+
+    # Kernel & stride & padding
+    await wb.write(0x054, meta['kernel_h'] | (meta['kernel_w'] << 8))  # KERNEL_SIZE
+    await wb.write(0x058, meta['stride_h'] | (meta['stride_w'] << 8))  # STRIDE
+    await wb.write(0x05C, meta['pad_top'] | (meta['pad_left'] << 8))   # PADDING
+
+    # Tiling config
+    tile_h = meta.get('tile_h', 0)
+    tile_w = meta.get('tile_w', 0)
+    tile_num_h = meta.get('tile_num_h', 1)
+    tile_num_w = meta.get('tile_num_w', 1)
+    await wb.write(0x070, tile_h | (tile_w << 16))
+    await wb.write(0x074, tile_num_h | (tile_num_w << 16))
+
+    # SRAM_BASE: act_base=0, out_base after input
+    # DB_EN golden data guarantees output fits in the same bank.
+    out_base = meta['n_input_words']
+    await wb.write(0x078, (out_base << 16) | 0)
+
+    # DMA addresses
+    await wb.write(0x100, meta['ddr_in_addr'])
+    await wb.write(0x104, meta['ddr_out_addr'])
+    await wb.write(0x108, meta['ddr_wgt_addr'])
+    await wb.write(0x10C, meta['ddr_param_addr'])
+
+    # DMA_IN_STRIDE: bytes between consecutive tile inputs in DDR
+    if tile_h > 0:
+        await wb.write(0x110, meta['dma_in_size'])  # stride = one tile's input size
+
+    # DMA sizes (bytes)
+    await wb.write(0x128, meta['dma_in_size'])
+    await wb.write(0x12C, meta['dma_wgt_size'])
+    await wb.write(0x130, meta['dma_out_size'])
+
+    # Post-processing
+    await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x188, meta['dma_param_count'])
+
+    # DB_EN=1 (bit[0]) — enable double-buffer ping-pong prefetch
+    await wb.write(0x118, 0x01)
+
+
+@cocotb.test()
+async def test_dma_e2e_tiling_int8_db_en(dut):
+    """32x32 6-layer INT8 with spatial tiling + DB_EN double-buffering.
+
+    Uses int8_tiled_db_en golden data (max 32ch) so output fits within
+    one ACT SRAM bank per layer.  DB_EN overlaps DMA prefetch of the
+    next tile's input with compute on the current tile.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    metadata, layer_data = load_golden_tiling('int8_tiled_db_en')
+
+    for idx, (meta, data) in enumerate(zip(metadata, layer_data)):
+        mem.populate(meta['ddr_wgt_addr'], data['wgt'])
+        mem.populate(meta['ddr_param_addr'], data['param'])
+
+    mem.populate(metadata[0]['ddr_in_addr'], layer_data[0]['input'])
+
+    for idx, (meta, data) in enumerate(zip(metadata, layer_data)):
+        tile_info = (f" tile={meta['tile_h']}x{meta['tile_w']}"
+                     f" ({meta['tile_num_h']}x{meta['tile_num_w']})"
+                     if meta['tile_h'] > 0 else "")
+        dut._log.info(f"[INT8 DB_EN] Layer {idx}: "
+                      f"{'Conv2D' if meta['op_type']==0 else 'DWConv'} "
+                      f"[{meta['in_h']}x{meta['in_w']}x{meta['in_c']}] -> "
+                      f"[{meta['out_h']}x{meta['out_w']}x{meta['out_c']}]"
+                      f"{tile_info}")
+
+        await program_layer_db_en(wb, meta)
+        done = await run_layer_and_wait(wb, dut, timeout=2000000)
+        assert done, f"Layer {idx} did not complete within timeout"
+
+        ok, detail = verify_output(mem, meta, data['output'], idx)
+        dut._log.info(f"  {detail}")
+        assert ok, detail
+
+    dut._log.info("[INT8 32x32 DB_EN] All 6 layers PASSED - double-buffer verified!")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Pooling + Add test imports
 # ═══════════════════════════════════════════════════════════════════════
 
