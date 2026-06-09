@@ -48,6 +48,8 @@ async def init_dut(dut):
     dut.sram_addr.value = 0
     dut.xfer_len.value = 0
     dut.burst_cfg.value = 0
+    dut.cfg_in_stride.value = 0
+    dut.cfg_out_stride.value = 0
     dut.wb_ack_i.value = 0
     dut.wb_dat_i.value = 0
     dut.sram_rdata.value = 0
@@ -394,3 +396,110 @@ async def test_address_increment(dut):
     unique_addrs = sorted(set(wb_addrs))
     expected = [base + i * 4 for i in range(N)]
     assert unique_addrs == expected, f"WB addrs: {[hex(a) for a in unique_addrs]}, expected {[hex(a) for a in expected]}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 9: LOAD with non-zero stride
+# ─────────────────────────────────────────────────────────────────────────────
+@cocotb.test()
+async def test_load_stride(dut):
+    """DMA loads words with cfg_in_stride=8 (every other word in external mem)."""
+    wb_mem = await init_dut(dut)
+    N = 4
+    base = 0xA000
+    for i in range(N):
+        wb_mem.mem[base + i * 8] = 0xF000 + i  # stride=8: data at +0, +8, +16, +24
+
+    # Monitor WB addresses
+    wb_addrs = []
+
+    async def wb_addr_monitor():
+        while True:
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            if int(dut.wb_cyc_o.value) and int(dut.wb_stb_o.value) and int(dut.wb_ack_i.value):
+                wb_addrs.append(int(dut.wb_adr_o.value))
+            await Timer(1, unit="step")
+
+    cocotb.start_soon(wb_addr_monitor())
+
+    dut.dir.value = 0
+    dut.ext_addr.value = base
+    dut.sram_addr.value = 0
+    dut.xfer_len.value = N
+    dut.cfg_in_stride.value = 8  # stride=8 bytes
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    for _ in range(50):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.done_pulse.value):
+            break
+        await Timer(1, unit="step")
+
+    await Timer(1, unit="step")
+    # Verify addresses: should be base, base+8, base+16, base+24
+    expected_addrs = [base + i * 8 for i in range(N)]
+    assert wb_addrs == expected_addrs, \
+        f"WB addrs with stride=8: {[hex(a) for a in wb_addrs]}, expected {[hex(a) for a in expected_addrs]}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 10: STORE with non-zero stride
+# ─────────────────────────────────────────────────────────────────────────────
+@cocotb.test()
+async def test_store_stride(dut):
+    """DMA stores words with cfg_out_stride=16 (every 16th byte in external mem)."""
+    wb_mem = await init_dut(dut)
+    N = 3
+    sram_data = 0xBEEF_0000
+
+    async def sram_responder():
+        while True:
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            if int(dut.sram_en.value) and not int(dut.sram_we.value):
+                await Timer(1, unit="step")
+                addr = int(dut.sram_addr_o.value)
+                dut.sram_rdata.value = sram_data + addr
+
+    cocotb.start_soon(sram_responder())
+
+    # Monitor WB addresses + data
+    wb_writes = []
+
+    async def wb_write_monitor():
+        while True:
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            if int(dut.wb_cyc_o.value) and int(dut.wb_stb_o.value) and int(dut.wb_we_o.value) and int(dut.wb_ack_i.value):
+                wb_writes.append((int(dut.wb_adr_o.value), int(dut.wb_dat_o.value)))
+            await Timer(1, unit="step")
+
+    cocotb.start_soon(wb_write_monitor())
+
+    dut.dir.value = 1
+    dut.ext_addr.value = 0xB000
+    dut.sram_addr.value = 0
+    dut.xfer_len.value = N
+    dut.cfg_out_stride.value = 16  # stride=16 bytes
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    for _ in range(50):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.done_pulse.value):
+            break
+        await Timer(1, unit="step")
+
+    await Timer(1, unit="step")
+    # Verify addresses: B000, B010, B020
+    expected = [(0xB000 + i * 16, sram_data + i) for i in range(N)]
+    assert wb_writes == expected, \
+        f"WB writes with stride=16: {wb_writes}, expected {expected}"

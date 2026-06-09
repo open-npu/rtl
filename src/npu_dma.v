@@ -6,7 +6,8 @@
 //
 // Features:
 //   - Configurable source address, destination address, transfer length
-//   - Auto-increment addressing
+//   - Configurable external address stride (load/store)
+//   - Auto-increment SRAM addressing
 //   - Configurable burst length (4/8/16/32 words)
 //   - Direction: MEM→SRAM (load) or SRAM→MEM (store)
 //   - Busy/done status signals
@@ -14,6 +15,11 @@
 //
 // The DMA operates on 32-bit words. For byte-level transfers,
 // the controller module handles packing/unpacking.
+//
+// Stride behavior:
+//   in_stride (load path):  external address advances by in_stride bytes per word
+//   out_stride (store path): external address advances by out_stride bytes per word
+//   If stride == 0, defaults to 4 (word-aligned linear access).
 
 `include "npu_defines.vh"
 
@@ -33,6 +39,8 @@ module npu_dma #(
     input  wire [SRAM_ADDR_W-1:0] sram_addr,   // Internal SRAM start address
     input  wire [15:0]         xfer_len,       // Transfer length (words)
     input  wire [1:0]          burst_cfg,      // Burst: 0=4, 1=8, 2=16, 3=32
+    input  wire [31:0]         cfg_in_stride,  // External address stride for load (bytes)
+    input  wire [31:0]         cfg_out_stride, // External address stride for store (bytes)
 
     // ─── Status Outputs ───
     output reg                  busy,
@@ -74,6 +82,7 @@ module npu_dma #(
     reg [15:0]            r_xfer_len;
     reg                   r_dir;
     reg [DATA_W-1:0]      r_data_buf;  // temporary data buffer
+    reg [ADDR_W-1:0]      r_stride;    // latched stride value for current direction
 
     // Burst length decode (not used for now — single-beat transfers)
     // wire [5:0] burst_len = (burst_cfg == 2'd0) ? 6'd4 :
@@ -100,6 +109,7 @@ module npu_dma #(
             r_xfer_len <= 16'd0;
             r_dir      <= 1'b0;
             r_data_buf <= {DATA_W{1'b0}};
+            r_stride   <= {ADDR_W{1'b0}};
         end else begin
             done_pulse <= 1'b0;  // default: clear pulse
             sram_en    <= 1'b0;  // default: SRAM idle
@@ -113,6 +123,8 @@ module npu_dma #(
                         r_sram_addr<= sram_addr;
                         r_xfer_len <= xfer_len;
                         r_dir      <= dir;
+                        // Latch stride for this transfer direction
+                        r_stride   <= dir ? cfg_out_stride : cfg_in_stride;
                         xfer_count <= 16'd0;
                         if (!dir)
                             state <= S_LOAD;
@@ -149,7 +161,8 @@ module npu_dma #(
                     sram_addr_o <= r_sram_addr;
                     sram_wdata  <= r_data_buf;
                     // Advance pointers
-                    r_ext_addr  <= r_ext_addr + 4;
+                    //   external: advance by stride (or 4 if stride==0 for linear)
+                    r_ext_addr  <= r_ext_addr + (r_stride != 0 ? r_stride : 32'd4);
                     r_sram_addr <= r_sram_addr + 1;
                     xfer_count  <= xfer_count + 1;
                     if (xfer_count + 1 >= r_xfer_len)
@@ -186,7 +199,9 @@ module npu_dma #(
                         if (wb_ack_i) begin
                             wb_cyc_o    <= 1'b0;
                             wb_stb_o    <= 1'b0;
-                            r_ext_addr  <= r_ext_addr + 4;
+                            // Advance pointers
+                            //   external: advance by stride (or 4 if stride==0 for linear)
+                            r_ext_addr  <= r_ext_addr + (r_stride != 0 ? r_stride : 32'd4);
                             r_sram_addr <= r_sram_addr + 1;
                             xfer_count  <= xfer_count + 1;
                             if (xfer_count + 1 >= r_xfer_len)
