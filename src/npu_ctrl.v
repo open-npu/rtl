@@ -260,14 +260,14 @@ module npu_ctrl (
                         // input is already in SRAM, no DDR load or prefetch needed.
                         if (db_en) begin
                             if (!skip_act_load) begin
-                                ping_pong_flag     <= 1'b0;  // Tile 0: compute reads Bank[0]
+                                ping_pong_flag     <= 1'b0;  // Tile 0: reads Bank[0]
                                 prefetch_active    <= 1'b0;
                                 prefetch_pending   <= 1'b0;
                                 next_tile_ddr_addr <= cfg_dma_in_addr + cfg_dma_in_size;
-                                next_sram_offset   <= cfg_act_bank_offset;  // Prefetch to Bank[1]
+                                next_sram_offset   <= cfg_act_bank_offset;  // Prefetch tile 1 to Bank[1]
                             end else begin
                                 // Fused: input is contiguous in SRAM, no prefetch
-                                ping_pong_flag     <= 1'b0;  // Input in Bank[0] (out_base < bank_half)
+                                ping_pong_flag     <= 1'b0;
                                 prefetch_active    <= 1'b0;
                                 prefetch_pending   <= 1'b0;
                             end
@@ -297,6 +297,12 @@ module npu_ctrl (
                         end
 
                         // ─── Prefetch DMA completion: flip ping_pong_flag ───
+                        // NOTE: ping_pong flips on dma_done, not tile_done.
+                        // For DB_EN non-fused tiled layers, this means the compute
+                        // may start the next tile before prefetch completes and
+                        // read from the wrong bank. Proper fix requires per-tile
+                        // DDR data layout in golden generators and per-tile DMA
+                        // loading in the controller.
                         if (dma_done && prefetch_active) begin
                             prefetch_active <= 1'b0;
                             if (prefetch_pending) begin
