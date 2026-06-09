@@ -3,11 +3,12 @@
 Generate DMA E2E golden data for 32×32 Medium-Scale Tiling Test.
 
 Model: MobileNetV2-style, 6 layers, 32×32 input, real channel widths (32/48).
-Four variants:
-  - int8:            INT8, no tiling (all layers fit in SRAM)
-  - int8_tiled:      INT8 with spatial tiling (same model, tiling enabled)
-  - int16:           INT16 with spatial tiling (required for layers 2,3)
-  - int8_tiled_db_en: INT8 with spatial tiling + DB_EN (max 32ch, bank-constrained)
+Five variants:
+  - int8:              INT8, no tiling (all layers fit in SRAM)
+  - int8_tiled:        INT8 with spatial tiling (same model, tiling enabled)
+  - int16:             INT16 with spatial tiling (required for layers 2,3)
+  - int8_tiled_db_en:  INT8 with spatial tiling + DB_EN (max 32ch, bank-constrained)
+  - int16_tiled_db_en: INT16 with spatial tiling + DB_EN (max 16ch, bank-constrained)
 
 SRAM constraints:
   - ACT SRAM: 8192 words (32KB), holds input + output
@@ -456,15 +457,28 @@ def build_model_32x32(int16_mode=False, force_tiling=False, db_en=False):
         return out_h, out_w, ch
 
     # ─── 6-layer model: 32×32 input ───
-    # DB_EN: max 32ch so n_input+n_output <= ACT_DEPTH/2=4096 words
-    ch_mid = 32 if db_en else 48
+    # DB_EN: ACT SRAM split into Bank[0]=[0,4096), Bank[1]=[4096,8192)
+    #   n_input_words + n_output_words <= 4096 per layer
+    #   INT8: 4 elems/word → max 32ch (16×16×32=8192 elem=2048 words)
+    #   INT16: 2 elems/word → max 16ch (16×16×16=4096 elem=2048 words)
     h, w, c = 32, 32, 3
-    h, w, c = add_conv(current, h, w, c, 32, kernel=3, stride=2, relu6=True)  # L0: [32x32x3]->[16x16x32]
-    h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                  # L1: [16x16x32]->[16x16x32]
-    h, w, c = add_conv(current, h, w, c, ch_mid, kernel=1, stride=1, relu6=True)  # L2: [16x16x32]->[16x16xch_mid]
-    h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                  # L3: [16x16xch_mid]->[16x16xch_mid]
-    h, w, c = add_conv(current, h, w, c, 16, kernel=1, stride=1, relu6=False) # L4: [16x16xch_mid]->[16x16x16]
-    h, w, c = add_conv(current, h, w, c, 32, kernel=1, stride=1, relu6=True)  # L5: [16x16x16]->[16x16x32]
+    if db_en:
+        # DB_EN-constrained model: all layers use the same conservative channel width
+        out_ch = 16 if int16_mode else 32
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=3, stride=2, relu6=True)  # L0
+        h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                      # L1
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L2
+        h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                      # L3
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=False) # L4
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L5
+    else:
+        # Original model: varied channel widths (non-DB_EN)
+        h, w, c = add_conv(current, h, w, c, 32, kernel=3, stride=2, relu6=True)  # L0: [32x32x3]->[16x16x32]
+        h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                  # L1: [16x16x32]->[16x16x32]
+        h, w, c = add_conv(current, h, w, c, 48, kernel=1, stride=1, relu6=True)  # L2: [16x16x32]->[16x16x48]
+        h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                  # L3: [16x16x48]->[16x16x48]
+        h, w, c = add_conv(current, h, w, c, 16, kernel=1, stride=1, relu6=False) # L4: [16x16x48]->[16x16x16]
+        h, w, c = add_conv(current, h, w, c, 32, kernel=1, stride=1, relu6=True)  # L5: [16x16x16]->[16x16x32]
 
     return layers, layer_data, input_nhwc
 
@@ -598,6 +612,10 @@ if __name__ == '__main__':
     # Variant D: INT8, forced tiling + DB_EN (max 32ch, bank-constrained)
     save_golden(os.path.join(base_dir, 'int8_tiled_db_en'),
                 int16_mode=False, force_tiling=True, db_en=True)
+
+    # Variant E: INT16, forced tiling + DB_EN (max 16ch, bank-constrained)
+    save_golden(os.path.join(base_dir, 'int16_tiled_db_en'),
+                int16_mode=True, force_tiling=True, db_en=True)
 
     print(f"\n{'='*60}")
     print("DONE. Golden data ready for 32x32 tiling DMA E2E tests.")
