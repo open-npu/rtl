@@ -54,6 +54,8 @@ module npu_ctrl (
     input  wire [31:0]  cfg_dma_out_size,    // in bytes
     input  wire [15:0]  cfg_param_count,     // number of output channels
     input  wire [31:0]  cfg_dma_ctrl,        // sched_ctrl: [0]=DB_EN, [1]=FUSE_START, [2]=FUSE_MID, [3]=FUSE_END
+    input  wire [31:0]  cfg_dma_in_stride,   // external address stride for load (bytes)
+    input  wire [31:0]  cfg_dma_out_stride,  // external address stride for store (bytes)
     input  wire [31:0]  cfg_layer_mode,      // OP type + data type
     input  wire [15:0]  cfg_out_base,        // Output base address in SRAM (word addr)
     input  wire [31:0]  cfg_dma_add_b_addr,  // DDR address of Add Branch B data

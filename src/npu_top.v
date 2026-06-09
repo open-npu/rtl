@@ -242,6 +242,8 @@ module npu_top #(
         .cfg_dma_out_size   (reg_dma_out_size),
         .cfg_param_count    (reg_post_param_count[15:0]),
         .cfg_dma_ctrl       (reg_dma_ctrl),
+        .cfg_dma_in_stride  (reg_dma_in_stride),
+        .cfg_dma_out_stride (reg_dma_out_stride),
         .cfg_layer_mode     (reg_layer_mode),
         .cfg_out_base       ({3'd0, reg_sram_base[ACT_ADDR_W+16-1:16]}),
         .cfg_dma_add_b_addr (reg_dma_add_b_addr),
@@ -273,6 +275,8 @@ module npu_top #(
         .sram_addr      (dma_sram_addr),
         .xfer_len       (dma_xfer_len),
         .burst_cfg      (reg_dma_ctrl[5:4]),
+        .cfg_in_stride  (reg_dma_in_stride),
+        .cfg_out_stride (reg_dma_out_stride),
         // Status
         .busy           (dma_busy),
         .done_pulse     (dma_done),

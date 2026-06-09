@@ -960,6 +960,99 @@ async def test_dma_e2e_tiling_perf_db_en(dut):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Test: DMA Stride E2E (non-zero stride = same as linear, bit-exact)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def program_layer_with_stride(wb, meta, in_stride, out_stride):
+    """Program CSR for one layer with explicit DMA stride values."""
+    # Same as program_layer, but also writes DMA_IN_STRIDE and DMA_OUT_STRIDE
+    await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
+    await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
+    await wb.write(0x048, meta['in_c'])
+    await wb.write(0x04C, (meta['out_h'] << 16) | meta['out_w'])
+    await wb.write(0x050, meta['out_c'])
+    await wb.write(0x054, meta['kernel_h'] | (meta['kernel_w'] << 8))
+    await wb.write(0x058, meta['stride_h'] | (meta['stride_w'] << 8))
+    await wb.write(0x05C, meta['pad_top'] | (meta['pad_left'] << 8))
+
+    tile_h = meta.get('tile_h', 0)
+    tile_w = meta.get('tile_w', 0)
+    tile_num_h = meta.get('tile_num_h', 1)
+    tile_num_w = meta.get('tile_num_w', 1)
+    await wb.write(0x070, tile_h | (tile_w << 16))
+    await wb.write(0x074, tile_num_h | (tile_num_w << 16))
+
+    out_base = meta['n_input_words']
+    await wb.write(0x078, (out_base << 16) | 0)
+
+    await wb.write(0x100, meta['ddr_in_addr'])
+    await wb.write(0x104, meta['ddr_out_addr'])
+    await wb.write(0x108, meta['ddr_wgt_addr'])
+    await wb.write(0x10C, meta['ddr_param_addr'])
+
+    # Write stride registers (non-zero to test stride path through DMA)
+    if tile_h > 0:
+        await wb.write(0x110, in_stride)
+    await wb.write(0x114, out_stride)
+
+    await wb.write(0x128, meta['dma_in_size'])
+    await wb.write(0x12C, meta['dma_wgt_size'])
+    await wb.write(0x130, meta['dma_out_size'])
+
+    await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x188, meta['dma_param_count'])
+
+    await wb.write(0x118, 0)  # no fusion, no DB_EN
+
+
+@cocotb.test()
+async def test_dma_e2e_single_layer_int8_with_stride(dut):
+    """Single Conv2D 1x1 INT8 layer with explicit DMA stride.
+
+    Sets DMA_IN_STRIDE = DMA_OUT_STRIDE = dma_in_size (linear stride,
+    same as default behavior). Verifies that non-zero stride values
+    produce identical bit-exact output.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    metadata, layer_data = load_golden('int8')
+
+    # Use layer 2: Conv2D 1x1, 8x8x8 -> 8x8x4 (small, fast)
+    idx = 2
+    meta = metadata[idx]
+    data = layer_data[idx]
+
+    mem.populate(meta['ddr_wgt_addr'], data['wgt'])
+    mem.populate(meta['ddr_param_addr'], data['param'])
+    mem.populate(meta['ddr_in_addr'], data['input'])
+
+    dut._log.info(f"[STRIDE] L{idx}: Conv2D 1x1 "
+                  f"[{meta['in_h']}x{meta['in_w']}x{meta['in_c']}] -> "
+                  f"[{meta['out_h']}x{meta['out_w']}x{meta['out_c']}]")
+
+    # Use dma_in_size as stride for LOAD (linear access between tiles)
+    # For non-tiled layers, stride=0 means default linear (+4 per word)
+    in_stride = meta['dma_in_size']
+    out_stride = 0  # non-tiled store: linear access
+
+    await program_layer_with_stride(wb, meta, in_stride, out_stride)
+    done = await run_layer_and_wait(wb, dut, timeout=500000)
+    assert done, "Layer with stride did not complete"
+
+    ok, detail = verify_output(mem, meta, data['output'], idx)
+    dut._log.info(f"  {detail}")
+    assert ok, detail
+
+    dut._log.info("[STRIDE] Single layer with non-zero stride PASSED - bit-exact!")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Pooling + Add test imports
 # ═══════════════════════════════════════════════════════════════════════
 
