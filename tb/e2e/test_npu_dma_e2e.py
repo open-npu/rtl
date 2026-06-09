@@ -992,8 +992,14 @@ async def program_layer_with_stride(wb, meta, in_stride, out_stride):
     await wb.write(0x10C, meta['ddr_param_addr'])
 
     # Write stride registers (non-zero to test stride path through DMA)
+    # NOTE: DMA_IN_STRIDE (0x110) is only meaningful for tiled layers where
+    # the controller's prefetch logic uses it between tiles. For non-tiled
+    # layers, the single-shot DMA transfer always reads contiguous words.
+    # We write it anyway to verify the CSR path and RTL connectivity.
     if tile_h > 0:
         await wb.write(0x110, in_stride)
+    else:
+        await wb.write(0x110, in_stride)  # still write it even for non-tiled
     await wb.write(0x114, out_stride)
 
     await wb.write(0x128, meta['dma_in_size'])
@@ -1050,6 +1056,163 @@ async def test_dma_e2e_single_layer_int8_with_stride(dut):
     assert ok, detail
 
     dut._log.info("[STRIDE] Single layer with non-zero stride PASSED - bit-exact!")
+
+
+@cocotb.test()
+async def test_dma_e2e_noncontiguous_load_stride(dut):
+    """Non-contiguous load: DDR input data spaced by stride > word size.
+
+    Tests a single Conv2D layer where the DDR input data is packed with
+    gap words between valid data (stride=8). We use a custom DDR layout:
+    - Weight and param data are placed contiguously at base addresses
+    - Input data is placed at stride=8 (every other word)
+    - The DMA must correctly skip gap words during input load
+
+    NOTE: cfg_in_stride affects ALL DMA load transfers for this layer
+    (weight, param, and input). To keep weight/param correct, we must
+    also lay them out with the same stride. This test uses stride=4
+    (contiguous) for weight/param, then overrides the input DDR layout
+    separately. Since the RTL uses a single stride per layer, we instead
+    use a tiled golden where the stride only applies to the act load
+    in the prefetch phase. For the non-tiled case, we set stride=4
+    (= no gap) but use the stride CSR to verify the RTL path works.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    metadata, layer_data = load_golden('int8')
+
+    # Use layer 2: Conv2D 1x1, 8x8x8 -> 8x8x4 (small, fast)
+    idx = 2
+    meta = metadata[idx]
+    data = layer_data[idx]
+
+    # Populate weight and param with stride=8 (every other word)
+    # to match the RTL stride that applies to all load transfers
+    stride_bytes = 8
+    for addr_base, words in [
+        (meta['ddr_wgt_addr'], data['wgt']),
+        (meta['ddr_param_addr'], data['param']),
+    ]:
+        for i, w in enumerate(words):
+            mem.mem[addr_base + i * stride_bytes] = int(w)
+            # Fill the gap
+            if i * stride_bytes + 4 < addr_base + len(words) * stride_bytes:
+                mem.mem[addr_base + i * stride_bytes + 4] = 0xA5A5A5A5
+
+    # Populate input with stride=8 (every other word)
+    in_addr = meta['ddr_in_addr']
+    for i, w in enumerate(data['input']):
+        mem.mem[in_addr + i * stride_bytes] = int(w)
+        if i * stride_bytes + 4 < in_addr + len(data['input']) * stride_bytes:
+            mem.mem[in_addr + i * stride_bytes + 4] = 0xDEADBEEF
+
+    dut._log.info(f"[NONCONTIG LOAD] L{idx}: stride={stride_bytes}B, "
+                  f"{len(data['input'])} words loaded with gaps")
+
+    in_stride = stride_bytes
+    out_stride = 0
+
+    await program_layer_with_stride(wb, meta, in_stride, out_stride)
+    done = await run_layer_and_wait(wb, dut, timeout=500000)
+    assert done, "Non-contiguous load layer did not complete"
+
+    ok, detail = verify_output(mem, meta, data['output'], idx)
+    dut._log.info(f"  {detail}")
+    assert ok, detail
+
+    dut._log.info("[NONCONTIG LOAD] Non-contiguous stride load PASSED - bit-exact!")
+
+
+@cocotb.test()
+async def test_dma_e2e_noncontiguous_store_stride(dut):
+    """Non-contiguous store: output data written to DDR with stride > 4.
+
+    After compute, the DMA stores output to DDR at every other word
+    (stride=8). Verifies that output words appear at the correct DDR
+    addresses with gap words left untouched.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    metadata, layer_data = load_golden('int8')
+
+    # Use layer 2: Conv2D 1x1, 8x8x8 -> 8x8x4 (small, fast)
+    idx = 2
+    meta = metadata[idx]
+    data = layer_data[idx]
+
+    mem.populate(meta['ddr_wgt_addr'], data['wgt'])
+    mem.populate(meta['ddr_param_addr'], data['param'])
+    mem.populate(meta['ddr_in_addr'], data['input'])
+
+    # Pre-fill output DDR region with a pattern to verify gaps are NOT written
+    stride_bytes = 8
+    gap_fill = 0xCAFEBABE
+    out_addr = meta['ddr_out_addr']
+    n_out_words = meta['n_output_words']
+    # Fill the entire span that store could cover
+    span = n_out_words * stride_bytes
+    for offset in range(0, span, 4):
+        mem.mem[out_addr + offset] = gap_fill
+
+    dut._log.info(f"[NONCONTIG STORE] L{idx}: stride={stride_bytes}B, "
+                  f"gap_fill=0x{gap_fill:08X}, "
+                  f"{n_out_words} words stored with gaps")
+
+    in_stride = 0   # load is linear
+    out_stride = stride_bytes
+
+    await program_layer_with_stride(wb, meta, in_stride, out_stride)
+    done = await run_layer_and_wait(wb, dut, timeout=500000)
+    assert done, "Non-contiguous store layer did not complete"
+
+    # Verify output: valid words at correct addresses, gaps still have gap_fill
+    mismatches = []
+    for i in range(n_out_words):
+        addr = out_addr + i * stride_bytes
+        got = mem.mem.get(addr, None)
+        exp = int(data['output'][i])
+        if got != exp:
+            mismatches.append((i, exp, got))
+
+    if mismatches:
+        detail = (f"[NONCONTIG STORE] {len(mismatches)}/{n_out_words} "
+                  f"mismatches in valid words")
+        for idx_m, exp, got in mismatches[:5]:
+            detail += f"\n  word[{idx_m}]: exp 0x{exp:08X}, got 0x{got:08X}"
+        dut._log.error(detail)
+        assert False, detail
+    else:
+        dut._log.info(f"  {n_out_words} valid words at stride=8: PASS")
+
+    # Verify gap words still have gap_fill
+    gap_mismatches = []
+    for i in range(n_out_words):
+        gap_addr = out_addr + i * stride_bytes + 4  # the gap between valid words
+        if gap_addr < out_addr + n_out_words * stride_bytes:
+            got = mem.mem.get(gap_addr, None)
+            if got != gap_fill:
+                gap_mismatches.append((i, gap_fill, got))
+
+    if gap_mismatches:
+        detail = (f"[NONCONTIG STORE] {len(gap_mismatches)} gap words corrupted")
+        for idx_m, exp, got in gap_mismatches[:5]:
+            detail += f"\n  gap[{idx_m}]: exp 0x{exp:08X}, got 0x{got:08X}"
+        dut._log.error(detail)
+        assert False, detail
+    else:
+        dut._log.info(f"  Gap words (stride+4) still have gap_fill: PASS")
+
+    dut._log.info("[NONCONTIG STORE] Non-contiguous stride store PASSED!")
 
 
 # ═══════════════════════════════════════════════════════════════════════
