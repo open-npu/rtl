@@ -1381,7 +1381,7 @@ module npu_compute #(
                                      + oc_group;
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_rd_en   <= 1'b1;
-                            act_rd_addr <= byte_off[ACT_ADDR_W+1:2];
+                            act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
                             act_byte_sel <= byte_off[1:0];
                         end
                         dw_read_issued <= 1'b1;

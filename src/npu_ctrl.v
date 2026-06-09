@@ -256,12 +256,21 @@ module npu_ctrl (
                         compute_start <= 1'b1;
                         state         <= S_WAIT_COMP;
                         // DB_EN: initialize for first tile (no prefetch for tile 0)
+                        // For fused MID/END layers, skip_act_load is asserted:
+                        // input is already in SRAM, no DDR load or prefetch needed.
                         if (db_en) begin
-                            ping_pong_flag     <= 1'b0;  // Tile 0: compute reads Bank[0]
-                            prefetch_active    <= 1'b0;
-                            prefetch_pending   <= 1'b0;
-                            next_tile_ddr_addr <= cfg_dma_in_addr + cfg_dma_in_size;
-                            next_sram_offset   <= cfg_act_bank_offset;  // Prefetch to Bank[1]
+                            if (!skip_act_load) begin
+                                ping_pong_flag     <= 1'b0;  // Tile 0: compute reads Bank[0]
+                                prefetch_active    <= 1'b0;
+                                prefetch_pending   <= 1'b0;
+                                next_tile_ddr_addr <= cfg_dma_in_addr + cfg_dma_in_size;
+                                next_sram_offset   <= cfg_act_bank_offset;  // Prefetch to Bank[1]
+                            end else begin
+                                // Fused: input is contiguous in SRAM, no prefetch
+                                ping_pong_flag     <= 1'b0;  // Input in Bank[0] (out_base < bank_half)
+                                prefetch_active    <= 1'b0;
+                                prefetch_pending   <= 1'b0;
+                            end
                         end
                     end
                 end
@@ -271,7 +280,8 @@ module npu_ctrl (
                         state <= S_DONE;
                     end else begin
                         // ─── Prefetch trigger: fire DMA on tile_done ───
-                        if (db_en && tile_done && !prefetch_active) begin
+                        // skip_act_load: no prefetch needed (fused MID/END)
+                        if (db_en && tile_done && !prefetch_active && !skip_act_load) begin
                             dma_start      <= 1'b1;
                             dma_dir        <= 1'b0;  // load
                             dma_ext_addr   <= next_tile_ddr_addr;

@@ -812,12 +812,19 @@ async def test_dma_e2e_tiling_int16_db_en(dut):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-async def program_layer_fused_db_en(wb, meta, sched_ctrl, out_base=None):
-    """Program CSR for a layer with DB_EN and fusion sched_ctrl.
+async def program_layer_fused_db_en(wb, meta, sched_ctrl, out_base=None, db_en=True, act_base=0,
+                                     tile_h=None, tile_w=None, tile_num_h=None, tile_num_w=None):
+    """Program CSR for a layer with fusion sched_ctrl and optional DB_EN.
 
     Args:
         sched_ctrl: 0x02=FUSE_START, 0x04=FUSE_MID, 0x08=FUSE_END
-        out_base: override SRAM out_base (for fusion, only last layer stores)
+        out_base: SRAM output base (override). Default = n_input_words.
+        db_en: enable double-buffer ping-pong (default True)
+               Only FUSE_START should enable DB_EN; FUSE_MID/FUSE_END should not.
+        act_base: SRAM activation base (where to read input from).
+                  For FUSE_START: 0 (input loaded by DMA at addr 0).
+                  For FUSE_MID/END: previous layer's out_base (input already in SRAM).
+        tile_h/w/num_h/num_w: override tiling (None = use meta defaults).
     """
     await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
     await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
@@ -837,7 +844,7 @@ async def program_layer_fused_db_en(wb, meta, sched_ctrl, out_base=None):
 
     if out_base is None:
         out_base = meta['n_input_words']
-    await wb.write(0x078, (out_base << 16) | 0)
+    await wb.write(0x078, (out_base << 16) | act_base)
 
     await wb.write(0x100, meta['ddr_in_addr'])
     await wb.write(0x104, meta['ddr_out_addr'])
@@ -854,9 +861,79 @@ async def program_layer_fused_db_en(wb, meta, sched_ctrl, out_base=None):
     await wb.write(0x180, meta['post_ctrl'])
     await wb.write(0x188, meta['dma_param_count'])
 
-    # sched_ctrl: DB_EN=bit[0] always on for FUSE_START
-    # FUSE_START(bit1), FUSE_MID(bit2), FUSE_END(bit3)
-    await wb.write(0x118, 0x01 | sched_ctrl)
+    # sched_ctrl: DB_EN=bit[0] (for FUSE_START), FUSE_START(bit1), FUSE_MID(bit2), FUSE_END(bit3)
+    dma_ctrl = sched_ctrl | (0x01 if db_en else 0x00)
+    await wb.write(0x118, dma_ctrl)
+
+
+@cocotb.test()
+async def test_dma_e2e_tiling_int8_db_en_fused(dut):
+    """Fused block (Conv1x1->DW->Conv1x1) with DB_EN on FUSE_START only.
+    No tiling to simplify debugging.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    metadata, layer_data = load_golden_tiling('int8_tiled_db_en')
+    fuse_start, fuse_mid, fuse_end = 2, 3, 4
+
+    for idx in (fuse_start, fuse_mid, fuse_end):
+        mem.populate(metadata[idx]['ddr_wgt_addr'], layer_data[idx]['wgt'])
+        mem.populate(metadata[idx]['ddr_param_addr'], layer_data[idx]['param'])
+    mem.populate(metadata[fuse_start]['ddr_in_addr'], layer_data[fuse_start]['input'])
+
+    dut._log.info("[FUSED DB_EN] 3-layer block (no tiling)")
+
+    async def prog(meta, sched, db, act, out):
+        await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
+        await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
+        await wb.write(0x048, meta['in_c'])
+        await wb.write(0x04C, (meta['out_h'] << 16) | meta['out_w'])
+        await wb.write(0x050, meta['out_c'])
+        await wb.write(0x054, meta['kernel_h'] | (meta['kernel_w'] << 8))
+        await wb.write(0x058, meta['stride_h'] | (meta['stride_w'] << 8))
+        await wb.write(0x05C, meta['pad_top'] | (meta['pad_left'] << 8))
+        await wb.write(0x070, 0)  # no tiling
+        await wb.write(0x074, (1 << 16) | 1)
+        await wb.write(0x078, (out << 16) | act)
+        await wb.write(0x100, meta['ddr_in_addr'])
+        await wb.write(0x104, meta['ddr_out_addr'])
+        await wb.write(0x108, meta['ddr_wgt_addr'])
+        await wb.write(0x10C, meta['ddr_param_addr'])
+        await wb.write(0x128, meta['dma_in_size'])
+        await wb.write(0x12C, meta['dma_wgt_size'])
+        await wb.write(0x130, meta['dma_out_size'])
+        await wb.write(0x180, meta['post_ctrl'])
+        await wb.write(0x188, meta['dma_param_count'])
+        await wb.write(0x118, sched | (0x01 if db else 0))
+
+    meta_s = metadata[fuse_start]
+    await prog(meta_s, 0x02, True, 0, meta_s['n_input_words'])
+    done = await run_layer_and_wait(wb, dut, timeout=2000000)
+    assert done, "L2 FUSE_START did not complete"
+    dut._log.info("  L2 FUSE_START+DB_EN done")
+
+    meta_m = metadata[fuse_mid]
+    await prog(meta_m, 0x04, False, meta_s['n_input_words'], 0)
+    done = await run_layer_and_wait(wb, dut, timeout=2000000)
+    assert done, "L3 FUSE_MID did not complete"
+    dut._log.info("  L3 FUSE_MID done")
+
+    meta_e = metadata[fuse_end]
+    await prog(meta_e, 0x08, False, 0, meta_e['n_input_words'])
+    done = await run_layer_and_wait(wb, dut, timeout=2000000)
+    assert done, "L4 FUSE_END did not complete"
+    dut._log.info("  L4 FUSE_END done")
+
+    ok, detail = verify_output(mem, meta_e, layer_data[fuse_end]['output'], fuse_end)
+    dut._log.info(f"  FUSE_END output: {detail}")
+    assert ok, detail
+    dut._log.info("[FUSED DB_EN] Block L2+L3+L4 PASSED - no tiling!")
+
 
 
 # ═══════════════════════════════════════════════════════════════════════
