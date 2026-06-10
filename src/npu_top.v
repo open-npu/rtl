@@ -69,6 +69,7 @@ module npu_top #(
     // --- DB_EN (Double-Buffer) wires ---
     wire        ping_pong_flag;
     wire        tile_done;
+    wire        db_prefetch_done;
     wire        db_en_is_active = reg_dma_ctrl[0] && hw_busy;
 
     // --- CSR Layer Config outputs ---
@@ -86,6 +87,7 @@ module npu_top #(
     wire [31:0] reg_dma_add_param_addr;
     wire [31:0] reg_dma_in_size, reg_dma_wgt_size;
     wire [31:0] reg_dma_out_size;
+    wire [31:0] reg_dma_tile_in_size;
 
     // --- CSR Post-Processing Config outputs ---
     wire [31:0] reg_post_ctrl, reg_post_param_addr;
@@ -194,6 +196,7 @@ module npu_top #(
         .reg_dma_in_size    (reg_dma_in_size),
         .reg_dma_wgt_size   (reg_dma_wgt_size),
         .reg_dma_out_size   (reg_dma_out_size),
+        .reg_dma_tile_in_size(reg_dma_tile_in_size),
         // Post-processing config
         .reg_post_ctrl          (reg_post_ctrl),
         .reg_post_param_addr    (reg_post_param_addr),
@@ -240,6 +243,7 @@ module npu_top #(
         .cfg_dma_in_size    (reg_dma_in_size),
         .cfg_dma_wgt_size   (reg_dma_wgt_size),
         .cfg_dma_out_size   (reg_dma_out_size),
+        .cfg_tile_in_size   (reg_dma_tile_in_size),
         .cfg_param_count    (reg_post_param_count[15:0]),
         .cfg_dma_ctrl       (reg_dma_ctrl),
         .cfg_dma_in_stride  (reg_dma_in_stride),
@@ -249,6 +253,7 @@ module npu_top #(
         .cfg_dma_add_b_addr (reg_dma_add_b_addr),
         // Double-Buffer
         .ping_pong_flag     (ping_pong_flag),
+        .db_prefetch_done   (db_prefetch_done),
         .tile_done          (tile_done),
         .cfg_act_bank_offset({1'b0, ACT_DEPTH[15:1]}),  // ACT_DEPTH/2 as 16-bit word offset
         // Auto-restart
@@ -664,7 +669,8 @@ module npu_top #(
         .ppu_out_data   (ppu_out_data),
         .ppu_out_valid  (ppu_out_valid),
         // DB_EN
-        .tile_done      (tile_done)
+        .tile_done          (tile_done),
+        .db_prefetch_done   (db_prefetch_done)
     );
 
     // ─── SRAM Port B connections (compute engine) ───

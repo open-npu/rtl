@@ -36,6 +36,7 @@ module npu_compute #(
     input  wire                         start,
     output reg                          done,
     output wire                         tile_done,  // 1-cycle pulse at non-final tile boundary
+    input  wire                         db_prefetch_done,  // DB_EN: prefetch complete, safe to start next tile
 
     // ─── Layer configuration (from CSR) ───
     input  wire [7:0]                   cfg_op_type,
@@ -205,13 +206,15 @@ module npu_compute #(
         S_RESIZE_PPU_WAIT = 6'd58,
         S_RESIZE_WB       = 6'd59,
         S_RESIZE_PIX_NEXT = 6'd60,
-        S_RESIZE_CH_NEXT  = 6'd61;
+        S_RESIZE_CH_NEXT  = 6'd61,
+        S_TILE_WAIT_DB    = 6'd62;  // Wait for DB_EN prefetch before next tile
 
     reg [5:0] state;
 
     // ─── Tile iteration ───
     reg [15:0] tile_y, tile_x;
     reg        tile_done_r;
+    reg        tile_wait_delay;  // DB_EN wait: skip 1 cycle, then wait for prefetch
     assign tile_done = tile_done_r;
     reg [15:0] oc_group;
 
@@ -374,6 +377,7 @@ module npu_compute #(
             state <= S_IDLE;
             done  <= 1'b0;
             tile_done_r <= 1'b0;
+            tile_wait_delay <= 1'b0;
             // All outputs idle
             sa_cmd       <= MODE_IDLE;
             sa_cmd_valid <= 1'b0;
@@ -1192,12 +1196,28 @@ module npu_compute #(
                         tile_x <= 0;
                         tile_y <= tile_y + 1;
                         tile_done_r <= 1'b1;  // PULSE: more tiles coming
-                        state <= S_TILE_SETUP;
+                        state <= S_TILE_WAIT_DB;
                     end
                 end else begin
                     tile_x <= tile_x + 1;
                     tile_done_r <= 1'b1;  // PULSE: more tiles coming
-                    state <= S_TILE_SETUP;
+                    state <= S_TILE_WAIT_DB;
+                end
+            end
+
+            // Wait for DB_EN prefetch to complete before starting next tile.
+            // On entry, db_prefetch_done might still be deasserting (1 cycle lag
+            // from controller). Skip one cycle, then check:
+            //   - If db_prefetch_done=1 (no DB_EN or prefetch already done): go
+            //   - If db_prefetch_done=0 (prefetch in flight): wait for reassert
+            S_TILE_WAIT_DB: begin
+                if (tile_wait_delay) begin
+                    if (db_prefetch_done) begin
+                        tile_wait_delay <= 1'b0;
+                        state <= S_TILE_SETUP;
+                    end
+                end else begin
+                    tile_wait_delay <= 1'b1;
                 end
             end
 

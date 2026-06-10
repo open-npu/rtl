@@ -703,9 +703,10 @@ async def program_layer_db_en(wb, meta):
     await wb.write(0x108, meta['ddr_wgt_addr'])
     await wb.write(0x10C, meta['ddr_param_addr'])
 
-    # DMA_IN_STRIDE: bytes between consecutive tile inputs in DDR
-    if tile_h > 0:
-        await wb.write(0x110, meta['dma_in_size'])  # stride = one tile's input size
+    # DMA strides: 0 = contiguous (default 4-byte word-aligned).
+    # DB_EN tiles are contiguous in DDR — no stride needed.
+    await wb.write(0x110, 0)
+    await wb.write(0x114, 0)
 
     # DMA sizes (bytes)
     await wb.write(0x128, meta['dma_in_size'])
@@ -718,6 +719,9 @@ async def program_layer_db_en(wb, meta):
 
     # DB_EN=1 (bit[0]) — enable double-buffer ping-pong prefetch
     await wb.write(0x118, 0x01)
+
+    # TILE_IN_SIZE: per-tile input size in bytes (for DB_EN prefetch)
+    await wb.write(0x134, meta.get('tile_in_size', 0))
 
 
 @cocotb.test()
@@ -851,8 +855,9 @@ async def program_layer_fused_db_en(wb, meta, sched_ctrl, out_base=None, db_en=T
     await wb.write(0x108, meta['ddr_wgt_addr'])
     await wb.write(0x10C, meta['ddr_param_addr'])
 
-    if tile_h > 0:
-        await wb.write(0x110, meta['dma_in_size'])
+    # DMA strides: 0 = contiguous
+    await wb.write(0x110, 0)
+    await wb.write(0x114, 0)
 
     await wb.write(0x128, meta['dma_in_size'])
     await wb.write(0x12C, meta['dma_wgt_size'])
