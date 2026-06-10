@@ -52,6 +52,7 @@ module npu_ctrl (
     input  wire [31:0]  cfg_dma_in_size,     // in bytes
     input  wire [31:0]  cfg_dma_wgt_size,    // in bytes
     input  wire [31:0]  cfg_dma_out_size,    // in bytes
+    input  wire [31:0]  cfg_tile_in_size,    // per-tile input size (bytes), 0=use full in_size
     input  wire [15:0]  cfg_param_count,     // number of output channels
     input  wire [31:0]  cfg_dma_ctrl,        // sched_ctrl: [0]=DB_EN, [1]=FUSE_START, [2]=FUSE_MID, [3]=FUSE_END
     input  wire [31:0]  cfg_dma_in_stride,   // external address stride for load (bytes)
@@ -62,6 +63,7 @@ module npu_ctrl (
 
     // ─── Double-Buffer Interface ───
     output reg          ping_pong_flag,      // 0=compute reads lower half, 1=upper half
+    output reg          db_prefetch_done,    // Prefetch complete; compute may start next tile
     input  wire         tile_done,           // Compute finished a non-final tile
     input  wire [15:0]  cfg_act_bank_offset, // ACT_DEPTH/2 word offset, from npu_top
 
@@ -100,6 +102,11 @@ module npu_ctrl (
     // Input words = in_size / 4
     wire [15:0] in_words = cfg_dma_in_size[17:2];
 
+    // Per-tile input words (for DB_EN): use tile_in_size when non-zero, else full in_words
+    wire [15:0] tile_in_words = (db_en && cfg_tile_in_size[17:2] != 0)
+                                ? cfg_tile_in_size[17:2]
+                                : in_words;
+
     // Output words = out_size / 4
     wire [15:0] out_words = cfg_dma_out_size[17:2];
 
@@ -117,6 +124,7 @@ module npu_ctrl (
     reg        prefetch_pending;    // Flag flip pending after prefetch completes
     reg [31:0] next_tile_ddr_addr;  // Running DDR address for next tile's input
     reg [15:0] next_sram_offset;    // SRAM offset for prefetch target bank
+    reg [15:0] next_tile_word_off;  // Next tile's word offset within full tensor
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -136,8 +144,10 @@ module npu_ctrl (
             ping_pong_flag   <= 1'b0;
             prefetch_active  <= 1'b0;
             prefetch_pending <= 1'b0;
+            db_prefetch_done <= 1'b1;
             next_tile_ddr_addr <= 32'd0;
             next_sram_offset <= 16'd0;
+            next_tile_word_off <= 16'd0;
         end else if (ctrl_soft_rst) begin
             state            <= S_IDLE;
             hw_busy          <= 1'b0;
@@ -150,6 +160,8 @@ module npu_ctrl (
             ping_pong_flag   <= 1'b0;
             prefetch_active  <= 1'b0;
             prefetch_pending <= 1'b0;
+            db_prefetch_done <= 1'b1;
+            next_tile_word_off <= 16'd0;
         end else begin
             // Default: clear single-cycle pulses
             hw_done       <= 1'b0;
@@ -208,7 +220,7 @@ module npu_ctrl (
                         dma_dir       <= 1'b0;
                         dma_ext_addr  <= cfg_dma_in_addr;
                         dma_sram_addr <= 16'd0;  // First tile always loads to Bank[0]
-                        dma_xfer_len  <= in_words;
+                        dma_xfer_len  <= tile_in_words;  // per-tile when DB_EN, full when not
                         state         <= S_WAIT_ACT;
                     end
                 end
@@ -263,8 +275,13 @@ module npu_ctrl (
                                 ping_pong_flag     <= 1'b0;  // Tile 0: reads Bank[0]
                                 prefetch_active    <= 1'b0;
                                 prefetch_pending   <= 1'b0;
-                                next_tile_ddr_addr <= cfg_dma_in_addr + cfg_dma_in_size;
-                                next_sram_offset   <= cfg_act_bank_offset;  // Prefetch tile 1 to Bank[1]
+                                // Advance by tile_in_size when DB_EN active (per-tile), else full in_size
+                                next_tile_ddr_addr <= cfg_dma_in_addr
+                                    + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                                // Prefetch tile 1 to Bank[1] + tile_word_offset
+                                // Tile 1's word offset within the full tensor = tile_in_words
+                                next_sram_offset   <= cfg_act_bank_offset + tile_in_words;
+                                next_tile_word_off <= tile_in_words + tile_in_words;  // Tile 2's offset
                             end else begin
                                 // Fused: input is contiguous in SRAM, no prefetch
                                 ping_pong_flag     <= 1'b0;
@@ -286,25 +303,26 @@ module npu_ctrl (
                             dma_dir        <= 1'b0;  // load
                             dma_ext_addr   <= next_tile_ddr_addr;
                             dma_sram_addr  <= next_sram_offset;
-                            dma_xfer_len   <= in_words;
+                            dma_xfer_len   <= tile_in_words;
                             prefetch_active  <= 1'b1;
                             prefetch_pending <= 1'b1;
+                            db_prefetch_done <= 1'b0;  // Block compute until prefetch done
                             // Advance DDR address for the tile after next
-                            next_tile_ddr_addr <= next_tile_ddr_addr + cfg_dma_in_size;
-                            // Toggle target bank for the NEXT prefetch
-                            next_sram_offset <= (next_sram_offset == 16'd0) ?
-                                                cfg_act_bank_offset : 16'd0;
+                            next_tile_ddr_addr <= next_tile_ddr_addr
+                                + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                            // Toggle target bank + include next tile's word offset
+                            next_sram_offset <= ((next_sram_offset >= cfg_act_bank_offset) ?
+                                                16'd0 : cfg_act_bank_offset)
+                                                + next_tile_word_off;
+                            next_tile_word_off <= next_tile_word_off + tile_in_words;
                         end
 
                         // ─── Prefetch DMA completion: flip ping_pong_flag ───
-                        // NOTE: ping_pong flips on dma_done, not tile_done.
-                        // For DB_EN non-fused tiled layers, this means the compute
-                        // may start the next tile before prefetch completes and
-                        // read from the wrong bank. Proper fix requires per-tile
-                        // DDR data layout in golden generators and per-tile DMA
-                        // loading in the controller.
+                        // ping_pong flips on dma_done so compute reads the newly
+                        // prefetched bank on the next tile.
                         if (dma_done && prefetch_active) begin
-                            prefetch_active <= 1'b0;
+                            prefetch_active  <= 1'b0;
+                            db_prefetch_done <= 1'b1;  // Unblock compute for next tile
                             if (prefetch_pending) begin
                                 ping_pong_flag  <= ~ping_pong_flag;
                                 prefetch_pending <= 1'b0;
@@ -331,7 +349,8 @@ module npu_ctrl (
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else if (dma_done && prefetch_active) begin
-                        prefetch_active <= 1'b0;
+                        prefetch_active  <= 1'b0;
+                        db_prefetch_done <= 1'b1;
                         if (prefetch_pending) begin
                             ping_pong_flag  <= ~ping_pong_flag;
                             prefetch_pending <= 1'b0;
@@ -376,7 +395,7 @@ module npu_ctrl (
                         dma_dir       <= 1'b0;  // load
                         dma_ext_addr  <= cfg_dma_add_b_addr;
                         dma_sram_addr <= cfg_out_base;
-                        dma_xfer_len  <= in_words;
+                        dma_xfer_len  <= tile_in_words;  // per-tile when DB_EN, full when not
                         state         <= S_WAIT_ADD_B;
                     end else begin
                         state <= S_LOAD_PARAM;

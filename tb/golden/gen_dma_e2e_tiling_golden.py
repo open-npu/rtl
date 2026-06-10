@@ -463,12 +463,15 @@ def build_model_32x32(int16_mode=False, force_tiling=False, db_en=False):
     #   INT16: 2 elems/word → max 16ch (16×16×16=4096 elem=2048 words)
     h, w, c = 32, 32, 3
     if db_en:
-        # DB_EN-constrained model: all layers use the same conservative channel width
-        out_ch = 16 if int16_mode else 32
-        h, w, c = add_conv(current, h, w, c, out_ch, kernel=3, stride=2, relu6=True)  # L0
-        h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                      # L1
+        # DB_EN tiling requires non-overlapping tiles (no halos = no padding).
+        # Use Conv1x1 stride=1 pad=0 only. 16ch so per-tile n_in+n_out <= 4096.
+        # With 32×32 spatial, tile_h=16 → per tile = 16×32×16 = 2048 words.
+        out_ch = 8 if int16_mode else 16
+        # All layers: Conv1x1, same spatial size
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L0
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L1
         h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L2
-        h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                      # L3
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L3
         h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=False) # L4
         h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L5
     else:
@@ -559,6 +562,8 @@ def save_golden(output_dir, int16_mode=False, force_tiling=False, db_en=False):
             'dma_wgt_size': cfg['dma_wgt_size'],
             'dma_in_size': cfg['dma_in_size'],
             'dma_out_size': cfg['dma_out_size'],
+            'tile_in_size': cfg['dma_in_size'] // (cfg['tile_num_h'] * cfg['tile_num_w'])
+                           if (db_en and cfg['tile_h'] > 0) else 0,
             'dma_param_count': cfg['dma_param_count'],
             'tile_h': cfg['tile_h'],
             'tile_w': cfg['tile_w'],

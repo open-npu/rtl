@@ -29,6 +29,7 @@ async def reset_dut(dut):
     dut.ppu_out_data.value = 0
     dut.dw_out_valid.value = 0
     dut.dw_acc_out.value = 0
+    dut.db_prefetch_done.value = 1  # No DB_EN in unit tests — always ready
     for _ in range(5):
         await RisingEdge(dut.clk)
     dut.rst_n.value = 1
