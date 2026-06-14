@@ -212,8 +212,9 @@ async def program_layer(wb, meta):
     await wb.write(0x180, meta['post_ctrl'])       # POST_CTRL
     await wb.write(0x188, meta['dma_param_count']) # POST_PARAM_COUNT
 
-    # No fusion
-    await wb.write(0x118, 0)                       # DMA_CTRL
+    # DMA control: DB_EN bit[0], fusion bits[1:3] from sched_ctrl
+    sched = meta.get('sched_ctrl', 0)
+    await wb.write(0x118, sched)                   # DMA_CTRL: DB_EN[0]+fusion
 
 
 async def run_layer_and_wait(wb, dut, timeout=500000):
