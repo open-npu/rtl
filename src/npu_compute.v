@@ -106,7 +106,7 @@ module npu_compute #(
     input  wire                         dw_out_valid,
 
     // ─── PPU ───
-    output reg  signed [ACC_W-1:0]     ppu_acc_in,
+    output reg  signed [ACC_W-1:0]     ppu_acc_in /* verilator public */,
     output reg                          ppu_in_valid,
     output reg  signed [ACC_W-1:0]     ppu_bias,
     output reg  [14:0]                  ppu_mult_m,
@@ -247,6 +247,10 @@ module npu_compute #(
     // ─── PPU state ───
     reg [$clog2(ARRAY_SIZE):0] ppu_feed_cnt;  // how many acc values fed to PPU
     reg [15:0]                  ppu_wait_cnt;   // PPU flush wait counter
+    reg signed [ACC_W-1:0]      last_ppu_acc /* verilator public */;  // Last PPU acc (debug)
+    reg [15:0]                  last_drain_col /* verilator public */; // Channel index in OC group
+    reg [15:0]                  last_tile_x /* verilator public */;
+    reg [15:0]                  last_tile_y /* verilator public */;
     reg signed [ACC_W-1:0]     acc_buf [0:ARRAY_SIZE-1];
 
     // ─── Param read state ───
@@ -510,18 +514,9 @@ module npu_compute #(
                 act_base <= cfg_act_base;
                 tile_oh_origin <= tile_y * out_tile_h;
                 tile_ow_origin <= tile_x * out_tile_w;
-                // Output base includes tile offset
-                if (cfg_int16) begin
-                    out_base <= cfg_out_base
-                               + ((tile_y * out_tile_h * cfg_out_w
-                                  * cfg_out_c * 16'd2
-                                 + tile_x * out_tile_w * cfg_out_c * 16'd2) >> 2);
-                end else begin
-                    out_base <= cfg_out_base
-                               + ((tile_y * out_tile_h * cfg_out_w
-                                  * cfg_out_c
-                                 + tile_x * out_tile_w * cfg_out_c) >> 2);
-                end
+                // Output base: all tiles write to cfg_out_base
+                // (tile offset not needed — DMA reads from cfg_out_base for DB_EN)
+                out_base <= cfg_out_base;
 
                 oc_group <= 0;
 
@@ -984,6 +979,12 @@ module npu_compute #(
             S_PPU_FEED: begin
                 ppu_acc_in   <= dot_buf[drain_col];
                 ppu_in_valid <= 1'b1;
+                // Capture channel 0 accumulator for debug
+                if (drain_col == 0) begin
+                    last_ppu_acc <= dot_buf[drain_col];
+                    last_tile_x <= tile_x;
+                    last_tile_y <= tile_y;
+                end
                 state        <= S_PPU_WAIT;
             end
 
