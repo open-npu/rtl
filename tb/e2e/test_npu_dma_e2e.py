@@ -188,7 +188,6 @@ async def program_layer(wb, meta):
     await wb.write(0x074, tile_num_h | (tile_num_w << 16))  # [15:0]=NUM_H,  [31:16]=NUM_W
 
     # SRAM_BASE: act_base=0, out_base=after input data
-    # out_base in upper 16 bits, act_base in lower 16 bits
     out_base = meta['n_input_words']  # output starts after input in SRAM
     await wb.write(0x078, (out_base << 16) | 0)
 
