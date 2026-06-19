@@ -532,8 +532,9 @@ module npu_compute #(
                 if (out_tile_h > cfg_out_h - tile_y * out_tile_h)
                     out_tile_h <= cfg_out_h - tile_y * out_tile_h;
                 // Compute input tile dimensions (including halo)
-                tile_in_h <= out_tile_h * cfg_stride_h + kw_eff - cfg_stride_h;
-                tile_in_w <= out_tile_w * cfg_stride_w + kw_eff - cfg_stride_w;
+                // tile_in_h/w must match DMA stride (max tile dims), not clipped dims
+                tile_in_h <= cfg_tile_h * cfg_stride_h + kw_eff - cfg_stride_h;
+                tile_in_w <= cfg_tile_w * cfg_stride_w + kw_eff - cfg_stride_w;
                 // Output base: all tiles write to cfg_out_base
                 // (tile offset not needed — DMA reads from cfg_out_base for DB_EN)
                 out_base <= cfg_out_base;
