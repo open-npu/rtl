@@ -88,6 +88,7 @@ module npu_top #(
     wire [31:0] reg_dma_in_size, reg_dma_wgt_size;
     wire [31:0] reg_dma_out_size;
     wire [31:0] reg_dma_tile_in_size;
+    wire [31:0] reg_tile_in_hw;
 
     // --- CSR Post-Processing Config outputs ---
     wire [31:0] reg_post_ctrl, reg_post_param_addr;
@@ -197,6 +198,7 @@ module npu_top #(
         .reg_dma_wgt_size   (reg_dma_wgt_size),
         .reg_dma_out_size   (reg_dma_out_size),
         .reg_dma_tile_in_size(reg_dma_tile_in_size),
+        .reg_tile_in_hw      (reg_tile_in_hw),
         // Post-processing config
         .reg_post_ctrl          (reg_post_ctrl),
         .reg_post_param_addr    (reg_post_param_addr),
@@ -677,5 +679,45 @@ module npu_top #(
     // Activation SRAM Port B: needs both read and write for compute
     assign act_b_en   = act_b_rd_en | act_b_wr_en;
     assign act_b_addr = act_b_wr_en ? act_b_wr_addr : act_b_rd_addr;
+
+`ifdef VCD_TRACE
+// Focused VCD: only dot_buf[0:15] + drain_col during last tile
+reg [31:0] vcd_cycle;
+initial begin
+    vcd_cycle = 0;
+    $dumpfile("/tmp/npu_focused.vcd");
+    $dumpvars(0, npu_top.u_compute.dot_buf[0]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[1]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[2]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[3]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[4]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[5]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[6]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[7]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[8]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[9]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[10]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[11]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[12]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[13]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[14]);
+    $dumpvars(0, npu_top.u_compute.dot_buf[15]);
+    $dumpvars(0, npu_top.u_compute.drain_col);
+    $dumpvars(0, npu_top.u_compute.sp_oh);
+    $dumpvars(0, npu_top.u_compute.sp_ow);
+    $dumpvars(0, npu_top.u_compute.tile_x);
+    $dumpvars(0, npu_top.u_compute.tile_y);
+    $dumpvars(0, npu_top.u_compute.k_pass);
+    $dumpvars(0, npu_top.u_compute.state);
+    $dumpoff;
+end
+always @(posedge clk) begin
+    vcd_cycle <= vcd_cycle + 1;
+    // Enable VCD at tile(6,3) pixel(0,0): ~t=227M ns = 22.7M cycles
+    if (vcd_cycle == 22700000) $dumpon;
+    // Disable after ~2M cycles  
+    if (vcd_cycle == 25000000) $dumpoff;
+end
+`endif
 
 endmodule
