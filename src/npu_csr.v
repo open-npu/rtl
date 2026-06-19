@@ -93,6 +93,7 @@ module npu_csr #(
     output wire [DATA_W-1:0]   reg_dma_wgt_size,
     output wire [DATA_W-1:0]   reg_dma_out_size,
     output wire [DATA_W-1:0]   reg_dma_tile_in_size,
+    output wire [DATA_W-1:0]   reg_tile_in_hw,
 
     // ─── Post-Processing Config Outputs ───
     output wire [DATA_W-1:0]   reg_post_ctrl,
@@ -139,6 +140,7 @@ module npu_csr #(
     reg [DATA_W-1:0] r_dma_param_addr;// 0x10C (dual-mapped w/ 0x184)
     reg [DATA_W-1:0] r_dma_in_stride; // 0x110
     reg [DATA_W-1:0] r_dma_out_stride;// 0x114
+    reg [DATA_W-1:0] r_tile_in_hw;    // 0x13C: [31:16]=tile_in_h, [15:0]=tile_in_w
     reg [DATA_W-1:0] r_dma_ctrl;      // 0x118
     reg [DATA_W-1:0] r_dma_add_b_addr;// 0x120 (dual-mapped w/ 0x198)
     reg [DATA_W-1:0] r_dma_add_param; // 0x124 (dual-mapped w/ 0x194)
@@ -242,6 +244,7 @@ module npu_csr #(
     assign reg_dma_wgt_size     = r_dma_wgt_size;
     assign reg_dma_out_size     = r_dma_out_size;
     assign reg_dma_tile_in_size = r_dma_tile_in_size;
+    assign reg_tile_in_hw       = r_tile_in_hw;
     assign reg_post_ctrl        = r_post_ctrl;
     assign reg_post_param_addr  = r_dma_param_addr; // dual-mapped
     assign reg_post_param_count = r_post_param_count;
@@ -295,6 +298,7 @@ module npu_csr #(
             r_dma_wgt_size  <= 32'd0;
             r_dma_out_size  <= 32'd0;
             r_dma_tile_in_size <= 32'd0;
+            r_tile_in_hw       <= 32'd0;
             r_post_ctrl     <= 32'd0;
             r_post_param_count <= 32'd0;
             r_post_clamp    <= 32'd0;
@@ -357,6 +361,7 @@ module npu_csr #(
                         12'h12C: r_dma_wgt_size  <= wb_dat_i;
                         12'h130: r_dma_out_size  <= wb_dat_i;
                         12'h134: r_dma_tile_in_size <= wb_dat_i;
+                        12'h13C: r_tile_in_hw       <= wb_dat_i;
 
                         // Group 3: Post-Processing Configuration
                         12'h180: r_post_ctrl        <= wb_dat_i;
@@ -424,6 +429,7 @@ module npu_csr #(
                         12'h12C: wb_dat_o <= r_dma_wgt_size;
                         12'h130: wb_dat_o <= r_dma_out_size;
                         12'h134: wb_dat_o <= r_dma_tile_in_size;
+                        12'h13C: wb_dat_o <= r_tile_in_hw;
 
                         // Group 3: Post-Processing Configuration
                         12'h180: wb_dat_o <= r_post_ctrl;

@@ -289,6 +289,8 @@ module npu_compute #(
     // ─── Spatial pixel loop (Conv2D Plan A) ───
     reg [15:0] sp_oh, sp_ow;                  // Current output pixel coordinates (tile-local)
     reg [15:0] tile_oh_origin, tile_ow_origin; // Global origin of current tile
+    reg [15:0] tile_in_h, tile_in_w;           // Input tile dimensions (including halo)
+    reg [15:0] kw_eff;                         // Effective kernel width: (kw-1)*dw+1
     reg signed [ACC_W-1:0] dot_acc;           // Reduction accumulator
     reg [$clog2(ARRAY_SIZE):0] reduce_cnt;    // Reduction counter
     reg [ACT_ADDR_W-1:0] pixel_act_base;     // Per-pixel activation base address
@@ -298,6 +300,16 @@ module npu_compute #(
     reg [15:0] k_pass;           // Current pass index (0-based)
     reg [15:0] k_pass_max;       // Total passes - 1
     reg [15:0] k_pass_remain;    // Elements in current pass
+`ifdef DBG_DOTBUF
+    integer dbg_fh;
+    integer dbg_trace_fh;
+    reg signed [ACC_W-1:0] dbg_prev_db9;
+    initial begin
+        dbg_fh = $fopen("/tmp/rtl_dotbuf.log", "w");
+        dbg_trace_fh = $fopen("/tmp/rtl_db9_trace.log", "w");
+        dbg_prev_db9 = 0;
+    end
+`endif
 
     // ─── Conv2D kernel window iteration ───
     reg [7:0]  conv_fh, conv_fw;             // Current filter position
@@ -488,6 +500,7 @@ module npu_compute #(
                         oc_groups_total <= (cfg_out_c + ARRAY_SIZE_16 - 1) / ARRAY_SIZE_16;
 
                     k_depth <= {8'd0, cfg_kernel_h} * {8'd0, cfg_kernel_w} * cfg_in_c;
+                    kw_eff  <= cfg_kernel_w;
 
                     if (cfg_tile_h == 16'd0) begin
                         out_tile_h <= cfg_out_h;
@@ -510,10 +523,17 @@ module npu_compute #(
                 param_base <= 0;
                 // Input: always use cfg_act_base; tile offset is folded into
                 // conv_ih_base/conv_iw_base via tile_oh_origin/tile_ow_origin
-                // so the padding check and address calc use global coordinates.
                 act_base <= cfg_act_base;
                 tile_oh_origin <= tile_y * out_tile_h;
                 tile_ow_origin <= tile_x * out_tile_w;
+                // Clip tile dimensions to image boundary
+                if (out_tile_w > cfg_out_w - tile_x * out_tile_w)
+                    out_tile_w <= cfg_out_w - tile_x * out_tile_w;
+                if (out_tile_h > cfg_out_h - tile_y * out_tile_h)
+                    out_tile_h <= cfg_out_h - tile_y * out_tile_h;
+                // Compute input tile dimensions (including halo)
+                tile_in_h <= out_tile_h * cfg_stride_h + kw_eff - cfg_stride_h;
+                tile_in_w <= out_tile_w * cfg_stride_w + kw_eff - cfg_stride_w;
                 // Output base: all tiles write to cfg_out_base
                 // (tile offset not needed — DMA reads from cfg_out_base for DB_EN)
                 out_base <= cfg_out_base;
@@ -739,8 +759,9 @@ module npu_compute #(
                             conv_is_pad <= (ih < 0) || (ih >= $signed({1'b0, cfg_in_h}))
                                         || (iw < 0) || (iw >= $signed({1'b0, cfg_in_w}));
                             deconv_skip <= 1'b0;
-                            elem_off = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c
-                                     + conv_ch_cnt;
+                            // Tile-local address: use row/col within input tile
+                            elem_off = ({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh}) * tile_in_w
+                                     + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw};
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_word_addr <= {2'd0, act_base} + byte_off[15:2];
                             act_byte_sel <= byte_off[1:0];
@@ -921,6 +942,13 @@ module npu_compute #(
                     // Accumulate reduced dot product into dot_buf[drain_col]
                     dot_buf[drain_col] <= dot_buf[drain_col]
                         + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
+`ifdef DBG_DOTBUF
+                    if (drain_col == 9)
+                        $fwrite(dbg_fh, "[RTL_DB] t=%0d col=9 pass=%0d kpr=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d\n",
+                                $time, k_pass, k_pass_remain,
+                                dot_acc, acc_buf[reduce_cnt[COL_W-1:0]],
+                                dot_buf[drain_col] + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]]);
+`endif
                     // Next column or decide next step
                     if (drain_col == COL_MAX) begin
                         // All columns drained for this pass
@@ -979,12 +1007,11 @@ module npu_compute #(
             S_PPU_FEED: begin
                 ppu_acc_in   <= dot_buf[drain_col];
                 ppu_in_valid <= 1'b1;
-                // Capture channel 0 accumulator for debug
-                if (drain_col == 0) begin
-                    last_ppu_acc <= dot_buf[drain_col];
-                    last_tile_x <= tile_x;
-                    last_tile_y <= tile_y;
-                end
+`ifdef DBG_DOTBUF
+    if (sp_oh == 0 && sp_ow == 0 && drain_col == 9)
+        $fwrite(dbg_fh, "[RTL_DB] t=%0d tile(%0d,%0d) pix(0,0) ch9 dot_buf=%0d k_pr=%0d\n",
+                $time, tile_y, tile_x, dot_buf[drain_col], k_pass_remain);
+`endif
                 state        <= S_PPU_WAIT;
             end
 
@@ -2401,5 +2428,22 @@ module npu_compute #(
             endcase
         end
     end
+
+`ifdef DBG_DOTBUF
+// Independent tracker: log dot_buf[9] changes during tile(6,3) pixel(0,0)
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        dbg_prev_db9 <= 0;
+    end else begin
+        if (tile_y == 6 && tile_x == 3 && sp_oh == 0 && sp_ow == 0) begin
+            if (dbg_prev_db9 != dot_buf[9]) begin
+                $fwrite(dbg_trace_fh, "[CHG] t=%0d dot_buf[9]=%0d (0x%h) state=%0d drain=%0d pass=%0d\n",
+                        $time, dot_buf[9], dot_buf[9], state, drain_col, k_pass);
+                dbg_prev_db9 <= dot_buf[9];
+            end
+        end
+    end
+end
+`endif
 
 endmodule
