@@ -975,8 +975,8 @@ module npu_compute #(
                         + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
 `ifdef DBG_DOTBUF
                     if (drain_col == 9)
-                        $fwrite(dbg_fh, "[RTL_DB] t=%0d col=9 pass=%0d kpr=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d\n",
-                                $time, k_pass, k_pass_remain,
+                        $fwrite(dbg_fh, "[RTL_DB] t=%0d tile(%0d,%0d) sp(%0d,%0d) col=9 pass=%0d kpr=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d\n",
+                                $time, tile_y, tile_x, sp_oh, sp_ow, k_pass, k_pass_remain,
                                 dot_acc, acc_buf[reduce_cnt[COL_W-1:0]],
                                 dot_buf[drain_col] + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]]);
 `endif
@@ -1022,7 +1022,8 @@ module npu_compute #(
                         ppu_mult_m     <= param_buf[0][14:0];
                         ppu_shift_s    <= param_buf[0][21:16];
                         ppu_zero_point <= $signed(param_buf[1][15:0]);
-                        ppu_bias       <= $signed({param_buf[3][7:0], param_buf[2]});
+                        ppu_bias       <= $signed({param_buf[3][15:0], param_buf[2],
+                                                   param_buf[1][31:16]});
                         state <= S_PPU_FEED;
                     end else begin
                         param_word_idx <= param_word_idx + 1;
@@ -1041,7 +1042,7 @@ module npu_compute #(
                 if (drain_col == 9 && ((tile_x == 0 && tile_y == 0) || (tile_x == 3 && tile_y == 6)) && sp_oh == 0 && sp_ow == 0)
                     $fwrite(dbg_fh, "[RTL_PPU] t=%0d drain=%0d acc_in=%0d bias=%0d M=%0d S=%0d zp=%0d\n",
                             $time, drain_col, dot_buf[drain_col],
-                            $signed({param_buf[3][7:0], param_buf[2]}),
+                            $signed({param_buf[3][15:0], param_buf[2], param_buf[1][31:16]}),
                             param_buf[0][14:0], param_buf[0][21:16],
                             $signed(param_buf[1][15:0]));
 `endif
@@ -1414,7 +1415,8 @@ module npu_compute #(
                         ppu_mult_m     <= param_buf[0][14:0];
                         ppu_shift_s    <= param_buf[0][21:16];
                         ppu_zero_point <= $signed(param_buf[1][15:0]);
-                        ppu_bias       <= $signed({param_buf[3][7:0], param_buf[2]});
+                        ppu_bias       <= $signed({param_buf[3][15:0], param_buf[2],
+                                                   param_buf[1][31:16]});
                         state <= S_DW_COMPUTE;
                     end else begin
                         param_word_idx <= param_word_idx + 1;
@@ -1652,7 +1654,8 @@ module npu_compute #(
                         ppu_mult_m     <= param_buf[0][14:0];
                         ppu_shift_s    <= param_buf[0][21:16];
                         ppu_zero_point <= $signed(param_buf[1][15:0]);
-                        ppu_bias       <= $signed({param_buf[3][7:0], param_buf[2]});
+                        ppu_bias       <= $signed({param_buf[3][15:0], param_buf[2],
+                                                   param_buf[1][31:16]});
                         // Start spatial loop for this channel
                         pool_oh <= 0;
                         pool_ow <= 0;
@@ -2128,7 +2131,8 @@ module npu_compute #(
                         ppu_mult_m     <= param_buf[0][14:0];
                         ppu_shift_s    <= param_buf[0][21:16];
                         ppu_zero_point <= $signed(param_buf[1][15:0]);
-                        ppu_bias       <= $signed({param_buf[3][7:0], param_buf[2]});
+                        ppu_bias       <= $signed({param_buf[3][15:0], param_buf[2],
+                                                   param_buf[1][31:16]});
                         rsz_oh <= 0;
                         rsz_ow <= 0;
                         rsz_rd_phase <= 0;
