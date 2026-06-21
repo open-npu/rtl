@@ -53,8 +53,8 @@ module npu_ppu #(
     localparam MODE_RELU_ONLY   = 2'b10;
     localparam MODE_PASSTHROUGH = 2'b11;
 
-    // ─── Product width: ACC_W + MULT_W ───
-    localparam PROD_W = ACC_W + MULT_W;  // 40 + 15 = 55
+    // ─── Product width: ACC_W + MULT_W + 1 (sign bit from signed×extended) ───
+    localparam PROD_W = ACC_W + MULT_W + 1'b1;  // 40 + 15 + 1 = 56
 
     // ─── Pipeline Stage Registers ───
 
@@ -203,9 +203,9 @@ module npu_ppu #(
                 shifted_full = rounded_v >>> shift_amt;
                 // Saturate to 17-bit signed range to avoid truncation overflow
                 // 17-bit signed: [-65536, +65535]
-                if (shifted_full > 55'sd65535)
+                if (shifted_full > 56'sd65535)
                     shifted_v = 17'sd65535;
-                else if (shifted_full < -55'sd65536)
+                else if (shifted_full < -56'sd65536)
                     shifted_v = -17'sd65536;
                 else
                     shifted_v = shifted_full[ZP_W:0];

@@ -80,7 +80,8 @@ endif
 # ─── Compile flags ───
 ifeq ($(SIM),verilator)
 COMPILE_ARGS = +incdir+$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) \
-               -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT --trace
+               -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT \
+               +define+DBG_DOTBUF
 ifdef VCD_TRACE
 COMPILE_ARGS += +define+VCD_TRACE
 endif
