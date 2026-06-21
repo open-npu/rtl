@@ -583,10 +583,10 @@ module npu_top #(
     assign compute_done = compute_done_w;
 
     // When DB_EN active, add bank offset (ACT_DEPTH/2) to compute's act_base
-    // based on ping_pong_flag. out_base is NOT offset.
-    wire [ACT_ADDR_W-1:0] effective_act_base = db_en_is_active ?
-        (reg_sram_base[ACT_ADDR_W-1:0] + {ping_pong_flag, {(ACT_ADDR_W-1){1'b0}}}) :
-        reg_sram_base[ACT_ADDR_W-1:0];
+    // based on ping_pong_flag. Each tile is placed at offset 0 within its bank;
+    // no intra-bank word offset needed (compute always reads from bank start).
+    wire [ACT_ADDR_W-1:0] effective_act_base = reg_sram_base[ACT_ADDR_W-1:0]
+        + (db_en_is_active && ping_pong_flag ? (ACT_DEPTH >> 1) : {ACT_ADDR_W{1'b0}});
 
     npu_compute #(
         .ARRAY_SIZE   (ARRAY_SIZE),
@@ -681,42 +681,15 @@ module npu_top #(
     assign act_b_addr = act_b_wr_en ? act_b_wr_addr : act_b_rd_addr;
 
 `ifdef VCD_TRACE
-// Focused VCD: only dot_buf[0:15] + drain_col during last tile
-reg [31:0] vcd_cycle;
+// Minimal VCD: 6 scalar signals only
 initial begin
-    vcd_cycle = 0;
-    $dumpfile("/tmp/npu_focused.vcd");
-    $dumpvars(0, npu_top.u_compute.dot_buf[0]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[1]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[2]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[3]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[4]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[5]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[6]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[7]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[8]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[9]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[10]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[11]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[12]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[13]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[14]);
-    $dumpvars(0, npu_top.u_compute.dot_buf[15]);
+    $dumpfile("/tmp/npu_nano.vcd");
+    $dumpvars(0, npu_top.u_compute.act_wr_data);
+    $dumpvars(0, npu_top.u_compute.ppu_acc_in);
+    $dumpvars(0, npu_top.u_compute.ppu_out_data);
     $dumpvars(0, npu_top.u_compute.drain_col);
     $dumpvars(0, npu_top.u_compute.sp_oh);
-    $dumpvars(0, npu_top.u_compute.sp_ow);
     $dumpvars(0, npu_top.u_compute.tile_x);
-    $dumpvars(0, npu_top.u_compute.tile_y);
-    $dumpvars(0, npu_top.u_compute.k_pass);
-    $dumpvars(0, npu_top.u_compute.state);
-    $dumpoff;
-end
-always @(posedge clk) begin
-    vcd_cycle <= vcd_cycle + 1;
-    // Enable VCD at tile(6,3) pixel(0,0): ~t=227M ns = 22.7M cycles
-    if (vcd_cycle == 22700000) $dumpon;
-    // Disable after ~2M cycles  
-    if (vcd_cycle == 25000000) $dumpoff;
 end
 `endif
 

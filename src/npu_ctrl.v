@@ -124,7 +124,6 @@ module npu_ctrl (
     reg        prefetch_pending;    // Flag flip pending after prefetch completes
     reg [31:0] next_tile_ddr_addr;  // Running DDR address for next tile's input
     reg [15:0] next_sram_offset;    // SRAM offset for prefetch target bank
-    reg [15:0] next_tile_word_off;  // Next tile's word offset within full tensor
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -147,7 +146,6 @@ module npu_ctrl (
             db_prefetch_done <= 1'b1;
             next_tile_ddr_addr <= 32'd0;
             next_sram_offset <= 16'd0;
-            next_tile_word_off <= 16'd0;
         end else if (ctrl_soft_rst) begin
             state            <= S_IDLE;
             hw_busy          <= 1'b0;
@@ -161,7 +159,6 @@ module npu_ctrl (
             prefetch_active  <= 1'b0;
             prefetch_pending <= 1'b0;
             db_prefetch_done <= 1'b1;
-            next_tile_word_off <= 16'd0;
         end else begin
             // Default: clear single-cycle pulses
             hw_done       <= 1'b0;
@@ -278,10 +275,9 @@ module npu_ctrl (
                                 // Advance by tile_in_size when DB_EN active (per-tile), else full in_size
                                 next_tile_ddr_addr <= cfg_dma_in_addr
                                     + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
-                                // Prefetch tile 1 to Bank[1] + tile_word_offset
-                                // Tile 1's word offset within the full tensor = tile_in_words
-                                next_sram_offset   <= cfg_act_bank_offset + tile_in_words;
-                                next_tile_word_off <= tile_in_words + tile_in_words;  // Tile 2's offset
+                                // Prefetch tile 1 to Bank[1] at offset 0
+                                // No intra-bank word offset: compute always reads from offset 0
+                                next_sram_offset   <= cfg_act_bank_offset;
                             end else begin
                                 // Fused: input is contiguous in SRAM, no prefetch
                                 ping_pong_flag     <= 1'b0;
@@ -310,11 +306,10 @@ module npu_ctrl (
                             // Advance DDR address for the tile after next
                             next_tile_ddr_addr <= next_tile_ddr_addr
                                 + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
-                            // Toggle target bank + include next tile's word offset
-                            next_sram_offset <= ((next_sram_offset >= cfg_act_bank_offset) ?
-                                                16'd0 : cfg_act_bank_offset)
-                                                + next_tile_word_off;
-                            next_tile_word_off <= next_tile_word_off + tile_in_words;
+                            // Toggle target bank: alternate between Bank[0] and Bank[1]
+                            // Each tile is placed at offset 0 within its bank
+                            next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
+                                                16'd0 : cfg_act_bank_offset;
                         end
 
                         // ─── Prefetch DMA completion: flip ping_pong_flag ───
