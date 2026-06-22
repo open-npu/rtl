@@ -165,8 +165,9 @@ def load_golden(mode='int8'):
 
 async def program_layer(wb, meta):
     """Program all CSR registers for one layer."""
-    # LAYER_MODE: op_type | (data_type << 4)
-    await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
+    # LAYER_MODE: op_type | (data_type << 4) | (in_zp << 8)
+    await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4)
+                   | ((meta.get('in_zp', 0) & 0xFFFF) << 8))
 
     # Dimensions
     await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])     # IN_DIM_HW
@@ -788,8 +789,9 @@ async def program_layer_db_en(wb, meta):
     without crossing the boundary.  The int8_tiled_db_en golden data
     guarantees n_input_words + n_output_words <= ACT_DEPTH/2.
     """
-    # LAYER_MODE: op_type | (data_type << 4)
-    await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
+    # LAYER_MODE: op_type | (data_type << 4) | (in_zp << 8)
+    await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4)
+                   | ((meta.get('in_zp', 0) & 0xFFFF) << 8))
 
     # Dimensions
     await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])     # IN_DIM_HW

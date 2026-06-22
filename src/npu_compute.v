@@ -57,6 +57,7 @@ module npu_compute #(
     input  wire [15:0]                  cfg_tile_num_w,
     input  wire [15:0]                  cfg_in_w,
     input  wire [15:0]                  cfg_in_h,
+    input  wire signed [15:0]           cfg_in_zp,      // Input zero-point for padding
     input  wire [ACT_ADDR_W-1:0]        cfg_act_base,   // Input activation base (word addr)
     input  wire [ACT_ADDR_W-1:0]        cfg_out_base,   // Output base (word addr in act SRAM)
     input  wire [31:0]                  cfg_pool_cfg,   // Pooling config register
@@ -795,7 +796,12 @@ module npu_compute #(
                 // Read one SRAM word (4 activation bytes)
                 // If padding or deconv_skip, skip read and go directly to emit zeros
                 if (conv_is_pad || deconv_skip) begin
-                    act_buf <= 32'd0;
+                    // Use cfg_in_zp for padding, matching CSIM dma_extract_tile behavior
+                    if (cfg_int16)
+                        act_buf <= {cfg_in_zp, cfg_in_zp};
+                    else
+                        act_buf <= {cfg_in_zp[7:0], cfg_in_zp[7:0],
+                                    cfg_in_zp[7:0], cfg_in_zp[7:0]};
                     state <= S_ACT_EMIT;
                 end else if (!act_read_issued) begin
                     act_rd_en   <= 1'b1;
