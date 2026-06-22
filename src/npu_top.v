@@ -619,6 +619,7 @@ module npu_top #(
         .cfg_tile_num_w (reg_tile_count[31:16]),
         .cfg_in_w       (reg_in_dim_hw[15:0]),
         .cfg_in_h       (reg_in_dim_hw[31:16]),
+        .cfg_in_zp      (reg_layer_mode[23:8]),
         .cfg_act_base   (effective_act_base),
         .cfg_out_base   (reg_sram_base[ACT_ADDR_W+16-1:16]),
         .cfg_pool_cfg   (reg_pool_cfg),
