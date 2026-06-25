@@ -365,7 +365,7 @@ module npu_ctrl (
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b1;  // store
                         dma_ext_addr  <= cfg_dma_out_addr;
-                        dma_sram_addr <= cfg_out_base;
+                        dma_sram_addr <= cfg_out_base + (db_en && ping_pong_flag ? cfg_act_bank_offset : 16'd0);
                         dma_xfer_len  <= out_words;
                         state         <= S_WAIT_STORE;
                     end else begin
