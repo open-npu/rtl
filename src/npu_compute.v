@@ -540,12 +540,19 @@ module npu_compute #(
                     tile_in_h <= 1'b0;  // unused in non-tiled mode
                     tile_in_w <= cfg_in_w;
                 end else begin
-                    tile_in_h <= cfg_tile_h * cfg_stride_h + kw_eff - cfg_stride_h;
-                    tile_in_w <= cfg_tile_w * cfg_stride_w + kw_eff - cfg_stride_w;
+                    // Pooling uses pool_cfg params, Conv uses cfg_stride/kw_eff
+                    if (cfg_op_type == 3) begin  // POOLING
+                        tile_in_h <= cfg_tile_h * {12'd0, pool_cfg_sh} + {12'd0, pool_cfg_h} - {12'd0, pool_cfg_sh};
+                        tile_in_w <= cfg_tile_w * {12'd0, pool_cfg_sw} + {12'd0, pool_cfg_w} - {12'd0, pool_cfg_sw};
+                    end else begin
+                        tile_in_h <= cfg_tile_h * cfg_stride_h + kw_eff - cfg_stride_h;
+                        tile_in_w <= cfg_tile_w * cfg_stride_w + kw_eff - cfg_stride_w;
+                    end
                 end
-                // Output base: all tiles write to cfg_out_base
-                // (tile offset not needed — DMA reads from cfg_out_base for DB_EN)
-                out_base <= cfg_out_base;
+                // Output base: add bank offset so output doesn't overlap input
+                // For DB_EN: out_base = effective_act_base + cfg_out_base
+                // This ensures output is written after input within the same bank
+                out_base <= cfg_act_base + cfg_out_base;
 
                 oc_group <= 0;
 
@@ -574,6 +581,10 @@ module npu_compute #(
                     wgt_base <= (oc_group * ARRAY_SIZE_16 * k_depth) >> 1;
                 else
                     wgt_base <= (oc_group * ARRAY_SIZE_16 * k_depth) >> 2;
+`ifdef DBG_DOTBUF
+                $fwrite(dbg_fh, "[OC_SETUP] oc_group=%0d k_depth=%0d wgt_base=%0d param_base=%0d\n",
+                        oc_group, k_depth, (oc_group * ARRAY_SIZE_16 * k_depth) >> 1, oc_group * ARRAY_SIZE_16 * 4);
+`endif
                 // Param base: 4 words per channel, ARRAY_SIZE channels per group
                 param_base <= oc_group * ARRAY_SIZE_16 * 4;
 
@@ -646,6 +657,11 @@ module npu_compute #(
                     wgt_data_ready <= 1'b1;
                 end else begin
                     // Phase 2: Data available from wgt_rd_data
+`ifdef DBG_DOTBUF
+                    if (wgt_byte_idx == 0 && wgt_col_idx == 2 && sp_oh == 0 && sp_ow == 0 && k_pass == 0)
+                        $fwrite(dbg_fh, "[WGT_RD] oc=%0d col=%0d pass=%0d addr=%0d data=0x%08x bsel=%0d\n",
+                                oc_group, wgt_col_idx, k_pass, wgt_word_addr, wgt_rd_data, wgt_bsel);
+`endif
                     if (cfg_int16) begin : wgt_unpack_int16_blk
                         // INT16: extract 2 half-words per SRAM word
                         reg [31:0] shifted;
@@ -773,16 +789,17 @@ module npu_compute #(
                                 // Non-tiled: full image in SRAM, absolute coords
                                 elem_off = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c + conv_ch_cnt;
                             end else begin
-                                // Tiled: use row/col within input tile
-                                elem_off = ({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh}) * tile_in_w
-                                         + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw};
+                                // Tiled: use row/col within input tile, with channel offset
+                                elem_off = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh}) * tile_in_w
+                                         + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw}) * cfg_in_c
+                                         + {8'd0, conv_ch_cnt};
                             end
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_word_addr <= {2'd0, act_base} + byte_off[15:2];
 `ifdef DBG_DOTBUF
-                            if (tile_x == 0 && tile_y == 0 && sp_oh == 0 && sp_ow == 0 && k_pass < 2)
-                                $fwrite(dbg_fh, "[RTL_CMD] t=%0d pass=%0d fh=%0d fw=%0d elem_off=%0d act_addr=%0d\n",
-                                        $time, k_pass, conv_fh, conv_fw, elem_off,
+                            if (sp_oh == 0 && sp_ow == 0 && k_pass < 2)
+                                $fwrite(dbg_fh, "[RTL_CMD] t=%0d tile(%0d,%0d) pass=%0d fh=%0d fw=%0d elem_off=%0d act_addr=%0d\n",
+                                        $time, tile_y, tile_x, k_pass, conv_fh, conv_fw, elem_off,
                                         {2'd0, act_base} + byte_off[15:2]);
 `endif
                             act_byte_sel <= byte_off[1:0];
@@ -815,7 +832,7 @@ module npu_compute #(
                     // Data available
                     act_buf <= act_rd_data;
 `ifdef DBG_DOTBUF
-                    if (tile_x == 0 && tile_y == 0 && sp_oh < 2 && sp_ow < 2 && k_pass < 2)
+                    if (sp_oh == 0 && sp_ow == 0 && k_pass < 2)
                         $fwrite(dbg_fh, "[RTL_RD] t=%0d tile(%0d,%0d) sp(%0d,%0d) pass=%0d act_addr=%0d act_data=0x%08x\n",
                                 $time, tile_y, tile_x, sp_oh, sp_ow, k_pass, act_word_addr[ACT_ADDR_W-1:0], act_rd_data);
 `endif
@@ -916,8 +933,8 @@ module npu_compute #(
                             if (cfg_tile_h == 16'd0) begin
                                 elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c + conv_ch_cnt;
                             end else begin
-                                elem_off_n = ({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh}) * tile_in_w
-                                           + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw};
+                                elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh}) * tile_in_w
+                                           + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw}) * cfg_in_c;
                             end
                             byte_off_n = cfg_int16 ? (elem_off_n << 1) : elem_off_n;
                             act_word_addr <= {2'd0, act_base} + byte_off_n[15:2];
@@ -980,8 +997,8 @@ module npu_compute #(
                     dot_buf[drain_col] <= dot_buf[drain_col]
                         + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
 `ifdef DBG_DOTBUF
-                    if (drain_col == 9)
-                        $fwrite(dbg_fh, "[RTL_DB] t=%0d tile(%0d,%0d) sp(%0d,%0d) col=9 pass=%0d kpr=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d\n",
+                    if (drain_col == 2)
+                        $fwrite(dbg_fh, "[RTL_DB] t=%0d tile(%0d,%0d) sp(%0d,%0d) col=2 pass=%0d kpr=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d\n",
                                 $time, tile_y, tile_x, sp_oh, sp_ow, k_pass, k_pass_remain,
                                 dot_acc, acc_buf[reduce_cnt[COL_W-1:0]],
                                 dot_buf[drain_col] + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]]);
@@ -1713,9 +1730,18 @@ module npu_compute #(
                         begin : pool_addr_calc
                             reg [31:0] elem_off;
                             reg [31:0] byte_off;
-                            elem_off = (ih_s[15:0] * cfg_in_w * cfg_in_c)
-                                     + (iw_s[15:0] * cfg_in_c)
-                                     + pool_ch;
+                            if (cfg_tile_h == 16'd0) begin
+                                // Non-tiled: full image in SRAM, absolute coords
+                                elem_off = (ih_s[15:0] * cfg_in_w * cfg_in_c)
+                                         + (iw_s[15:0] * cfg_in_c)
+                                         + pool_ch;
+                            end else begin
+                                // Tiled: use tile-local coords (matching Conv2D fix)
+                                elem_off = ({8'd0, pool_oh} * pool_sh + {8'd0, pool_fh}) * tile_in_w
+                                         + {8'd0, pool_ow} * pool_sw + {8'd0, pool_fw};
+                                // Add channel offset for multi-channel pooling
+                                elem_off = elem_off * cfg_in_c + pool_ch;
+                            end
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_rd_en   <= 1'b1;
                             act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
