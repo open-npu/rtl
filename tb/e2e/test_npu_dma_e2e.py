@@ -149,12 +149,17 @@ def load_golden(mode='int8'):
     layer_data = []
     for i in range(len(metadata)):
         prefix = f'layer_{i:02d}'
-        layer_data.append({
+        entry = {
             'wgt': np.load(os.path.join(d, f'{prefix}_wgt.npy')),
             'param': np.load(os.path.join(d, f'{prefix}_param.npy')),
             'input': np.load(os.path.join(d, f'{prefix}_input.npy')),
             'output': np.load(os.path.join(d, f'{prefix}_output.npy')),
-        })
+        }
+        # Load input_b for Add layers if it exists
+        input_b_path = os.path.join(d, f'{prefix}_input_b.npy')
+        if os.path.exists(input_b_path):
+            entry['input_b'] = np.load(input_b_path)
+        layer_data.append(entry)
     return metadata, layer_data
 
 
@@ -189,7 +194,12 @@ async def program_layer(wb, meta):
     await wb.write(0x074, tile_num_h | (tile_num_w << 16))  # [15:0]=NUM_H,  [31:16]=NUM_W
 
     # SRAM_BASE: act_base=0, out_base=after input data
-    out_base = meta['n_input_words']  # output starts after input in SRAM
+    # For DB_EN: SRAM holds one tile, out_base = per-tile input words
+    # For non-DB_EN: SRAM holds full input, out_base = total input words
+    if meta.get('tile_in_size', 0) > 0:
+        out_base = meta['tile_in_size'] // 4  # per-tile words
+    else:
+        out_base = meta['n_input_words']       # full input words
     await wb.write(0x078, (out_base << 16) | 0)
 
     # DMA addresses
@@ -208,9 +218,17 @@ async def program_layer(wb, meta):
     if tile_in_size:
         await wb.write(0x134, tile_in_size)        # DMA_TILE_IN_SIZE
 
+    # Add layer: residual input B address
+    if 'ddr_add_b_addr' in meta:
+        await wb.write(0x120, meta['ddr_add_b_addr'])  # DMA_ADD_B_ADDR
+
     # Post-processing
     await wb.write(0x180, meta['post_ctrl'])       # POST_CTRL
     await wb.write(0x188, meta['dma_param_count']) # POST_PARAM_COUNT
+
+    # Pool config (for Pooling layers)
+    if 'pool_cfg' in meta:
+        await wb.write(0x060, meta['pool_cfg'])    # POOL_CFG
 
     # DMA control: DB_EN bit[0], fusion bits[1:3] from sched_ctrl
     sched = meta.get('sched_ctrl', 0)

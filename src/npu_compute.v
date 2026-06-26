@@ -345,6 +345,7 @@ module npu_compute #(
     wire [15:0] concat_total_c = cfg_concat_cfg[31:16];
     wire        is_concat      = (cfg_op_type == 8'd7);
     reg signed [ACC_W-1:0] pool_acc;     // Running sum or max
+    reg signed [ACC_W-1:0] pool_val;     // Current pool element value
     reg [15:0]             pool_count;   // Valid element count (AvgPool)
     reg [3:0]              pool_fh, pool_fw; // Window position
     reg [15:0]             pool_oh, pool_ow; // Output pixel coords
@@ -1689,7 +1690,7 @@ module npu_compute #(
                         if (pool_mode) begin
                             pool_acc <= 0;  // AvgPool: sum=0
                         end else begin
-                            pool_acc <= {1'b1, {(ACC_W-1){1'b0}}};  // MaxPool: -2^(ACC_W-1)
+                            pool_acc <= -$signed({{(ACC_W-1){1'b0}}, 1'b1});  // MaxPool: -2^(ACC_W-1), signed
                         end
                         pool_count <= 0;
                         state <= S_POOL_READ;
@@ -1711,6 +1712,11 @@ module npu_compute #(
                          - $signed({1'b0, cfg_pad_left[7:0]}) + $signed({1'b0, pool_fw});
                     is_oob = (ih_s < 0) || (ih_s >= $signed({1'b0, cfg_in_h}))
                           || (iw_s < 0) || (iw_s >= $signed({1'b0, cfg_in_w}));
+`ifdef DBG_DOTBUF
+                    if (pool_ch == 33 && pool_oh == 0 && pool_ow == 0 && tile_y == 0 && tile_x == 0)
+                        $fwrite(dbg_fh, "[POOL_RD] t=%0d fh=%0d fw=%0d ih=%0d iw=%0d oob=%0d rd_ph=%0d\n",
+                                $time, pool_fh, pool_fw, ih_s, iw_s, is_oob, pool_rd_phase);
+`endif
 
                     if (is_oob) begin
                         // Out-of-bounds: skip, advance window position
@@ -1760,33 +1766,33 @@ module npu_compute #(
             end
 
             S_POOL_ACC: begin
-                // Extract element and accumulate
-                begin : pool_acc_blk
-                    reg signed [ACC_W-1:0] val;
-                    if (cfg_int16) begin
-                        case (act_byte_sel[1])
-                            1'b0: val = $signed(act_rd_data[15:0]);
-                            1'b1: val = $signed(act_rd_data[31:16]);
-                        endcase
-                    end else begin
-                        case (act_byte_sel)
-                            2'd0: val = {{(ACC_W-8){act_rd_data[7]}},  act_rd_data[7:0]};
-                            2'd1: val = {{(ACC_W-8){act_rd_data[15]}}, act_rd_data[15:8]};
-                            2'd2: val = {{(ACC_W-8){act_rd_data[23]}}, act_rd_data[23:16]};
-                            2'd3: val = {{(ACC_W-8){act_rd_data[31]}}, act_rd_data[31:24]};
-                        endcase
-                    end
-
-                    if (pool_mode) begin
-                        // AvgPool: accumulate sum
-                        pool_acc <= pool_acc + val;
-                    end else begin
-                        // MaxPool: keep max
-                        if (val > pool_acc)
-                            pool_acc <= val;
-                    end
-                    pool_count <= pool_count + 1;
+                // Extract element and accumulate (module-level pool_val for Verilator compat)
+                if (cfg_int16) begin
+                    case (act_byte_sel[1])
+                        1'b0: pool_val = $signed(act_rd_data[15:0]);
+                        1'b1: pool_val = $signed(act_rd_data[31:16]);
+                    endcase
+                end else begin
+                    case (act_byte_sel)
+                        2'd0: pool_val = {{(ACC_W-8){act_rd_data[7]}},  act_rd_data[7:0]};
+                        2'd1: pool_val = {{(ACC_W-8){act_rd_data[15]}}, act_rd_data[15:8]};
+                        2'd2: pool_val = {{(ACC_W-8){act_rd_data[23]}}, act_rd_data[23:16]};
+                        2'd3: pool_val = {{(ACC_W-8){act_rd_data[31]}}, act_rd_data[31:24]};
+                    endcase
                 end
+
+                if (pool_mode) begin
+                    pool_acc <= pool_acc + pool_val;
+                end else begin
+                    if ($signed(pool_val) > $signed(pool_acc))
+                        pool_acc <= pool_val;
+                end
+                pool_count <= pool_count + 1;
+`ifdef DBG_DOTBUF
+                if (pool_ch == 33)
+                    $fwrite(dbg_fh, "[POOL_ACC] t=%0d fh=%0d fw=%0d pix_oh=%0d pix_ow=%0d val=%0d acc=%0d cnt=%0d kw=%0d kh=%0d\n",
+                            $time, pool_fh, pool_fw, pool_oh, pool_ow, pool_val, pool_acc, pool_count, pool_kw, pool_kh);
+`endif
 
                 // Advance window position
                 if ({4'd0, pool_fw} + 1 >= pool_kw) begin
@@ -1893,7 +1899,7 @@ module npu_compute #(
                 if (pool_mode) begin
                     pool_acc <= 0;
                 end else begin
-                    pool_acc <= {1'b1, {(ACC_W-1){1'b0}}};
+                    pool_acc <= -$signed({{(ACC_W-1){1'b0}}, 1'b1});
                 end
                 pool_count <= 0;
 
