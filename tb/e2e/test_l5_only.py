@@ -23,14 +23,8 @@ async def test_l5_only(dut):
     elif len(mm)==0: dut._log.info(f"PASS L5: {nw}/{nw}")
     else: 
         dut._log.error(f"FAIL L5: {len(mm)}/{nw} first w[{mm[0]}] exp={ref[mm[0]]:08X} got={got[mm[0]]:08X}")
-        # Dump SRAM act at input region and out_base region
-        out_base = m.get('tile_in_size', m['n_input_words']*4) // 4
-        dut._log.info(f"SRAM input[0..3]:")
-        for wi in range(4):
-            dut._log.info(f"  sram[{wi}] = 0x{int(dut.u_sram_act.mem[wi].value):08X}")
-        dut._log.info(f"SRAM out_base[{out_base}..{out_base+3}]:")
-        for wi in range(4):
-            dut._log.info(f"  sram[{out_base+wi}] = 0x{int(dut.u_sram_act.mem[out_base+wi].value):08X}")
-        # Check if compute actually ran
-        dut._log.info(f"add_elem_cnt = {int(dut.u_compute.add_elem_cnt.value)}")
-        dut._log.info(f"tile_x = {int(dut.u_compute.tile_x.value)} tile_y = {int(dut.u_compute.tile_y.value)}")
+        # Check SRAM for output data
+        for bank in [0, 4096]:
+            dut._log.info(f"SRAM bank[{bank}][0..3]:")
+            for wi in range(4):
+                dut._log.info(f"  sram[{bank+wi}] = 0x{int(dut.u_sram_act.mem[bank+wi].value):08X}")

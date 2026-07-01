@@ -1946,6 +1946,14 @@ module npu_compute #(
                 add_param_phase <= 0;
                 tile_x <= 0;
                 tile_y <= 0;
+                // Set tile dimensions for actual tile size calculation
+                if (cfg_tile_h == 16'd0) begin
+                    out_tile_h <= cfg_out_h;
+                    out_tile_w <= cfg_out_w;
+                end else begin
+                    out_tile_h <= cfg_tile_h;
+                    out_tile_w <= cfg_tile_w;
+                end
                 state <= S_ADD_PARAM;
             end
 
@@ -2152,7 +2160,16 @@ module npu_compute #(
 
             S_ADD_NEXT: begin
                 reg [31:0] elems_per_tile;
-                elems_per_tile = {16'd0, cfg_tile_h} * {16'd0, cfg_tile_w} * {16'd0, cfg_out_c};
+                reg [31:0] actual_h, actual_w;
+                act_wr_en <= 1'b0;  // Clear write enable
+                // Compute actual tile dimensions (clamped to output bounds)
+                actual_h = (tile_y + 1 >= cfg_tile_num_h) ?
+                           ({16'd0, cfg_out_h} - {16'd0, tile_y} * {16'd0, out_tile_h}) :
+                           {16'd0, out_tile_h};
+                actual_w = (tile_x + 1 >= cfg_tile_num_w) ?
+                           ({16'd0, cfg_out_w} - {16'd0, tile_x} * {16'd0, out_tile_w}) :
+                           {16'd0, out_tile_w};
+                elems_per_tile = actual_h * actual_w * {16'd0, cfg_out_c};
                 if (cfg_tile_h == 16'd0 || elems_per_tile == 0) begin
                     // Non-tiled: original logic
                     if ({16'd0, add_elem_cnt} + 32'd1 >= {16'd0, add_total_elems}) begin
