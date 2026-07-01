@@ -10,9 +10,9 @@ async def test_l2_only(dut):
     cocotb.start_soon(mem.run())
     md, ld = load_golden('model_b_int16')
     i = 2; m = md[i]; d = ld[i]
-    if len(d['wgt']) > 0: mem.populate(m['ddr_wgt_addr'], d['wgt'])
-    if len(d['param']) > 0: mem.populate(m['ddr_param_addr'], d['param'])
     mem.populate(m['ddr_in_addr'], d['input'])
+    mem.populate(m['ddr_wgt_addr'], d['wgt'])   # wgt after input to avoid overlap
+    mem.populate(m['ddr_param_addr'], d['param'])
     await program_layer(wb, m)
     dut._log.info(f"L2 {m['in_h']}x{m['in_w']}x{m['in_c']} -> {m['out_h']}x{m['out_w']}x{m['out_c']} k={m['kernel_h']}x{m['kernel_w']} tile={m.get('tile_h',0)}x{m.get('tile_w',0)}")
     done = await run_layer_and_wait(wb, dut, timeout=300000000)
@@ -23,4 +23,12 @@ async def test_l2_only(dut):
     elif len(mm)==0: dut._log.info(f"PASS L2: {nw}/{nw}")
     else:
         dut._log.error(f"FAIL L2: {len(mm)}/{nw} first w[{mm[0]}] exp={ref[mm[0]]:08X} got={got[mm[0]]:08X}")
-        for j in mm[:10]: dut._log.error(f"  w[{j}] exp={ref[j]:08X} got={got[j]:08X}")
+        # Dump DDR content at L2 weight address for debugging
+        wgt_addr = m['ddr_wgt_addr']
+        dut._log.info(f"DDR at wgt_addr 0x{wgt_addr:08X} [0..15]:")
+        for wi in range(16):
+            dut._log.info(f"  DDR[0x{wgt_addr+wi*4:08X}] = 0x{mem.mem.get(wgt_addr+wi*4, 0):08X}")
+        # Dump weight SRAM first 32 words
+        dut._log.info("Weight SRAM[0..31]:")
+        for wi in range(32):
+            dut._log.info(f"  wgt_sram[{wi}] = 0x{int(dut.u_sram_wgt.mem[wi].value):08X}")

@@ -94,7 +94,9 @@ module npu_ctrl (
     reg       aborted;  // Latched abort flag — prevents auto-restart in S_DONE
 
     // Per-channel param size: 4 words (16 bytes) per channel
-    wire [15:0] param_words = cfg_param_count * 4;
+    wire [15:0] param_words = (cfg_layer_mode[3:0] == 4'd4 || cfg_layer_mode[3:0] == 4'd7)
+                              ? cfg_param_count        // Add/Concat: direct word count
+                              : cfg_param_count * 4;  // Conv2D: 4 words per channel
 
     // Weight words = wgt_size / 4
     wire [15:0] wgt_words = cfg_dma_wgt_size[17:2];
@@ -123,7 +125,9 @@ module npu_ctrl (
     reg        prefetch_active;     // Prefetch DMA is in flight
     reg        prefetch_pending;    // Flag flip pending after prefetch completes
     reg [31:0] next_tile_ddr_addr;  // Running DDR address for next tile's input
+    reg [31:0] cur_tile_ddr_offset; // Current tile's DDR offset from base
     reg [15:0] next_sram_offset;    // SRAM offset for prefetch target bank
+    reg        add_b_reload;        // 1=Add B reload after compute_done (→ S_STORE_OUT)
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -145,6 +149,8 @@ module npu_ctrl (
             prefetch_pending <= 1'b0;
             db_prefetch_done <= 1'b1;
             next_tile_ddr_addr <= 32'd0;
+            cur_tile_ddr_offset <= 32'd0;
+            add_b_reload <= 1'b0;
             next_sram_offset <= 16'd0;
         end else if (ctrl_soft_rst) begin
             state            <= S_IDLE;
@@ -272,6 +278,7 @@ module npu_ctrl (
                                 ping_pong_flag     <= 1'b0;  // Tile 0: reads Bank[0]
                                 prefetch_active    <= 1'b0;
                                 prefetch_pending   <= 1'b0;
+                                cur_tile_ddr_offset <= 32'd0;  // Tile 0: offset 0
                                 // Advance by tile_in_size when DB_EN active (per-tile), else full in_size
                                 next_tile_ddr_addr <= cfg_dma_in_addr
                                     + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
@@ -303,6 +310,8 @@ module npu_ctrl (
                             prefetch_active  <= 1'b1;
                             prefetch_pending <= 1'b1;
                             db_prefetch_done <= 1'b0;  // Block compute until prefetch done
+                            // Track current tile's DDR offset (for Add B reload)
+                            cur_tile_ddr_offset <= next_tile_ddr_addr - cfg_dma_in_addr;
                             // Advance DDR address for the tile after next
                             next_tile_ddr_addr <= next_tile_ddr_addr
                                 + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
@@ -317,10 +326,16 @@ module npu_ctrl (
                         // prefetched bank on the next tile.
                         if (dma_done && prefetch_active) begin
                             prefetch_active  <= 1'b0;
-                            db_prefetch_done <= 1'b1;  // Unblock compute for next tile
                             if (prefetch_pending) begin
                                 ping_pong_flag  <= ~ping_pong_flag;
                                 prefetch_pending <= 1'b0;
+                            end
+                            // For Add layers: prefetch input_b before unblocking compute
+                            if (cfg_dma_add_b_addr != 0) begin
+                                add_b_reload <= 1'b1;
+                                state <= S_LOAD_ADD_B;
+                            end else begin
+                                db_prefetch_done <= 1'b1;  // Unblock compute for next tile
                             end
                         end
 
@@ -365,8 +380,9 @@ module npu_ctrl (
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b1;  // store
                         dma_ext_addr  <= cfg_dma_out_addr;
-                        dma_sram_addr <= cfg_out_base + (db_en && ping_pong_flag ? cfg_act_bank_offset : 16'd0);
-                        dma_xfer_len  <= out_words;
+                        dma_sram_addr <= (db_en && ping_pong_flag ? cfg_act_bank_offset : 16'd0);
+                        // For DB_EN Add: use tile_in_words (same as output size per tile)
+                        dma_xfer_len  <= (db_en && cfg_dma_add_b_addr != 0) ? tile_in_words : out_words;
                         state         <= S_WAIT_STORE;
                     end else begin
                         state <= S_DONE;
@@ -385,12 +401,12 @@ module npu_ctrl (
                 S_LOAD_ADD_B: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;
-                    end else if (cfg_dma_add_b_addr != 0 && in_words != 0) begin
+                    end else if (cfg_dma_add_b_addr != 0 && tile_in_words != 0) begin
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;  // load
-                        dma_ext_addr  <= cfg_dma_add_b_addr;
-                        dma_sram_addr <= cfg_out_base;
-                        dma_xfer_len  <= tile_in_words;  // per-tile when DB_EN, full when not
+                        dma_ext_addr  <= cfg_dma_add_b_addr + cur_tile_ddr_offset;
+                        dma_sram_addr <= cfg_out_base + (db_en && ping_pong_flag ? cfg_act_bank_offset : 16'd0);
+                        dma_xfer_len  <= tile_in_words;
                         state         <= S_WAIT_ADD_B;
                     end else begin
                         state <= S_LOAD_PARAM;
@@ -401,7 +417,15 @@ module npu_ctrl (
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else if (dma_done) begin
-                        state <= S_LOAD_PARAM;
+                        if (add_b_reload) begin
+                            // Prefetch reload (after tile_done): unblock compute
+                            add_b_reload <= 1'b0;
+                            db_prefetch_done <= 1'b1;
+                            state <= S_WAIT_COMP;
+                        end else begin
+                            // First load (tile 0): proceed to param load
+                            state <= S_LOAD_PARAM;
+                        end
                     end
                 end
 

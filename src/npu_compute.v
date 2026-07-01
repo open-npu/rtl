@@ -659,7 +659,7 @@ module npu_compute #(
                 end else begin
                     // Phase 2: Data available from wgt_rd_data
 `ifdef DBG_DOTBUF
-                    if (wgt_byte_idx == 0 && wgt_col_idx == 2 && sp_oh == 0 && sp_ow == 0 && k_pass == 0)
+                    if (wgt_byte_idx == 0 && wgt_col_idx == 0 && sp_oh == 0 && sp_ow == 0 && k_pass == 0)
                         $fwrite(dbg_fh, "[WGT_RD] oc=%0d col=%0d pass=%0d addr=%0d data=0x%08x bsel=%0d\n",
                                 oc_group, wgt_col_idx, k_pass, wgt_word_addr, wgt_rd_data, wgt_bsel);
 `endif
@@ -1314,7 +1314,14 @@ module npu_compute #(
                 if (tile_wait_delay) begin
                     if (db_prefetch_done) begin
                         tile_wait_delay <= 1'b0;
-                        state <= S_TILE_SETUP;
+                        if (cfg_op_type == 8'd4 || cfg_op_type == 8'd7) begin
+                            // Add/Concat: go back to read next element
+                            add_elem_cnt <= add_elem_cnt + 1;
+                            add_rd_phase <= 0;
+                            state <= S_ADD_READ_A;
+                        end else begin
+                            state <= S_TILE_SETUP;
+                        end
                     end
                 end else begin
                     tile_wait_delay <= 1'b1;
@@ -1937,6 +1944,8 @@ module npu_compute #(
                 add_elem_cnt <= 0;
                 add_param_idx <= 0;
                 add_param_phase <= 0;
+                tile_x <= 0;
+                tile_y <= 0;
                 state <= S_ADD_PARAM;
             end
 
@@ -1976,7 +1985,11 @@ module npu_compute #(
                 if (add_rd_phase == 0) begin
                     begin : add_a_addr_calc
                         reg [31:0] byte_off;
-                        byte_off = cfg_int16 ? ({16'd0, add_elem_cnt} << 1) : {16'd0, add_elem_cnt};
+                        reg [31:0] tile_local;
+                        // Tile-local offset: within current tile's element range
+                        tile_local = {16'd0, add_elem_cnt} - ({16'd0, tile_y} * {16'd0, cfg_tile_num_w} + {16'd0, tile_x})
+                                     * {16'd0, cfg_tile_h} * {16'd0, cfg_tile_w} * {16'd0, cfg_out_c};
+                        byte_off = cfg_int16 ? (tile_local << 1) : tile_local;
                         act_rd_en   <= 1'b1;
                         act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
@@ -2009,9 +2022,12 @@ module npu_compute #(
                 if (add_rd_phase == 0) begin
                     begin : add_b_addr_calc
                         reg [31:0] byte_off;
-                        byte_off = cfg_int16 ? ({16'd0, add_elem_cnt} << 1) : {16'd0, add_elem_cnt};
+                        reg [31:0] tile_local;
+                        tile_local = {16'd0, add_elem_cnt} - ({16'd0, tile_y} * {16'd0, cfg_tile_num_w} + {16'd0, tile_x})
+                                     * {16'd0, cfg_tile_h} * {16'd0, cfg_tile_w} * {16'd0, cfg_out_c};
+                        byte_off = cfg_int16 ? (tile_local << 1) : tile_local;
                         act_rd_en   <= 1'b1;
-                        act_rd_addr <= cfg_out_base + byte_off[ACT_ADDR_W+1:2];
+                        act_rd_addr <= cfg_act_base + cfg_out_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
                     end
                     add_rd_phase <= 1;
@@ -2072,6 +2088,9 @@ module npu_compute #(
                     // Compute writeback address
                     begin : add_wb_addr_calc
                         reg [31:0] byte_off;
+                        reg [31:0] tile_local;
+                        tile_local = {16'd0, add_elem_cnt} - ({16'd0, tile_y} * {16'd0, cfg_tile_num_w} + {16'd0, tile_x})
+                                     * {16'd0, cfg_tile_h} * {16'd0, cfg_tile_w} * {16'd0, cfg_out_c};
                         if (is_concat) begin
                             // Concat: output[pixel * total_c + offset + ch]
                             reg [31:0] pixel;
@@ -2081,10 +2100,10 @@ module npu_compute #(
                             byte_off = (pixel * {16'd0, concat_total_c} + {16'd0, concat_offset} + ch)
                                        << (cfg_int16 ? 1 : 0);
                         end else begin
-                            // Add: flat overwrite at out_base
-                            byte_off = cfg_int16 ? ({16'd0, add_elem_cnt} << 1) : {16'd0, add_elem_cnt};
+                            // Add: flat overwrite at out_base (tile-local)
+                            byte_off = cfg_int16 ? (tile_local << 1) : tile_local;
                         end
-                        add_wb_addr    <= cfg_out_base + byte_off[ACT_ADDR_W+1:2];
+                        add_wb_addr    <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];  // Write to input A region (in-place)
                         add_wb_bytesel <= byte_off[1:0];
                     end
                     add_wb_byte <= ppu_out_data;
@@ -2132,10 +2151,36 @@ module npu_compute #(
             end
 
             S_ADD_NEXT: begin
-                if (add_elem_cnt + 1 >= add_total_elems) begin
-                    state <= S_DONE;
+                reg [31:0] elems_per_tile;
+                elems_per_tile = {16'd0, cfg_tile_h} * {16'd0, cfg_tile_w} * {16'd0, cfg_out_c};
+                if (cfg_tile_h == 16'd0 || elems_per_tile == 0) begin
+                    // Non-tiled: original logic
+                    if ({16'd0, add_elem_cnt} + 32'd1 >= {16'd0, add_total_elems}) begin
+                        state <= S_DONE;
+                    end else begin
+                        add_elem_cnt <= add_elem_cnt + 16'd1;
+                        add_rd_phase <= 0;
+                        state <= S_ADD_READ_A;
+                    end
+                end else if (({16'd0, add_elem_cnt} + 32'd1) % elems_per_tile == 0) begin
+                    // Current tile done
+                    if (tile_x + 1 >= cfg_tile_num_w) begin
+                        if (tile_y + 1 >= cfg_tile_num_h) begin
+                            state <= S_DONE;  // Final tile
+                        end else begin
+                            tile_x <= 0;
+                            tile_y <= tile_y + 1;
+                            tile_done_r <= 1'b1;
+                            state <= S_TILE_WAIT_DB;
+                        end
+                    end else begin
+                        tile_x <= tile_x + 1;
+                        tile_done_r <= 1'b1;
+                        state <= S_TILE_WAIT_DB;
+                    end
                 end else begin
-                    add_elem_cnt <= add_elem_cnt + 1;
+                    // Same tile, next element
+                    add_elem_cnt <= add_elem_cnt + 16'd1;
                     add_rd_phase <= 0;
                     state <= S_ADD_READ_A;
                 end
