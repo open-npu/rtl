@@ -363,6 +363,7 @@ module npu_compute #(
     reg [5:0]  add_S_A, add_S_B;
     reg signed [ACC_W-1:0] add_val_a, add_val_b;
     reg [15:0] add_elem_cnt;      // Current element index (flat)
+    reg [15:0] add_tile_elem_cnt; // Element index within current tile
     reg [15:0] add_total_elems;   // H * W * C
     reg [1:0]  add_rd_phase;      // SRAM read phasing
     reg [1:0]  add_param_phase;   // Param read phasing
@@ -457,7 +458,7 @@ module npu_compute #(
             // Add resets
             add_M_A <= 0; add_M_B <= 0; add_S_A <= 0; add_S_B <= 0;
             add_val_a <= 0; add_val_b <= 0;
-            add_elem_cnt <= 0; add_total_elems <= 0;
+            add_elem_cnt <= 0; add_total_elems <= 0; add_tile_elem_cnt <= 0;
             add_rd_phase <= 0; add_param_phase <= 0; add_param_idx <= 0;
             add_wb_phase <= 0; add_wb_addr <= 0; add_wb_bytesel <= 0; add_wb_byte <= 0;
             // Resize resets
@@ -1942,6 +1943,7 @@ module npu_compute #(
             S_ADD_SETUP: begin
                 add_total_elems <= cfg_out_h * cfg_out_w * cfg_out_c;
                 add_elem_cnt <= 0;
+                add_tile_elem_cnt <= 0;
                 add_param_idx <= 0;
                 add_param_phase <= 0;
                 tile_x <= 0;
@@ -2162,6 +2164,7 @@ module npu_compute #(
                 reg [31:0] elems_per_tile;
                 reg [31:0] actual_h, actual_w;
                 act_wr_en <= 1'b0;  // Clear write enable
+                ppu_in_valid <= 1'b0;  // Clear PPU input valid
                 // Compute actual tile dimensions (clamped to output bounds)
                 actual_h = (tile_y + 1 >= cfg_tile_num_h) ?
                            ({16'd0, cfg_out_h} - {16'd0, tile_y} * {16'd0, out_tile_h}) :
@@ -2176,11 +2179,12 @@ module npu_compute #(
                         state <= S_DONE;
                     end else begin
                         add_elem_cnt <= add_elem_cnt + 16'd1;
+                        add_tile_elem_cnt <= add_tile_elem_cnt + 16'd1;
                         add_rd_phase <= 0;
                         state <= S_ADD_READ_A;
                     end
-                end else if (({16'd0, add_elem_cnt} + 32'd1) % elems_per_tile == 0) begin
-                    // Current tile done
+                end else if ({16'd0, add_tile_elem_cnt} + 32'd1 >= elems_per_tile) begin
+                    // Current tile done — use tile-local counter for boundary check
                     if (tile_x + 1 >= cfg_tile_num_w) begin
                         if (tile_y + 1 >= cfg_tile_num_h) begin
                             state <= S_DONE;  // Final tile
@@ -2188,16 +2192,19 @@ module npu_compute #(
                             tile_x <= 0;
                             tile_y <= tile_y + 1;
                             tile_done_r <= 1'b1;
+                            add_tile_elem_cnt <= 0;
                             state <= S_TILE_WAIT_DB;
                         end
                     end else begin
                         tile_x <= tile_x + 1;
                         tile_done_r <= 1'b1;
+                        add_tile_elem_cnt <= 0;
                         state <= S_TILE_WAIT_DB;
                     end
                 end else begin
                     // Same tile, next element
                     add_elem_cnt <= add_elem_cnt + 16'd1;
+                    add_tile_elem_cnt <= add_tile_elem_cnt + 16'd1;
                     add_rd_phase <= 0;
                     state <= S_ADD_READ_A;
                 end

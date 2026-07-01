@@ -23,8 +23,11 @@ async def test_l5_only(dut):
     elif len(mm)==0: dut._log.info(f"PASS L5: {nw}/{nw}")
     else: 
         dut._log.error(f"FAIL L5: {len(mm)}/{nw} first w[{mm[0]}] exp={ref[mm[0]]:08X} got={got[mm[0]]:08X}")
-        # Check SRAM for output data
+        # Check what's in DDR at output addr
+        dut._log.info(f"DDR output[0..3]:")
+        for wi in range(4):
+            dut._log.info(f"  DDR[0x{oa+wi*4:08X}] = 0x{mem.mem.get(oa+wi*4, 0):08X}")
+        # Check SRAM banks
         for bank in [0, 4096]:
-            dut._log.info(f"SRAM bank[{bank}][0..3]:")
-            for wi in range(4):
-                dut._log.info(f"  sram[{bank+wi}] = 0x{int(dut.u_sram_act.mem[bank+wi].value):08X}")
+            v = int(dut.u_sram_act.mem[bank].value)
+            dut._log.info(f"  sram[{bank}] = 0x{v:08X} {'← OUTPUT!' if v != 0xFA25FE25 else '← INPUT A'}")
