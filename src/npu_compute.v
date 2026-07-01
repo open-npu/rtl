@@ -1995,11 +1995,7 @@ module npu_compute #(
                 if (add_rd_phase == 0) begin
                     begin : add_a_addr_calc
                         reg [31:0] byte_off;
-                        reg [31:0] tile_local;
-                        // Tile-local offset: within current tile's element range
-                        tile_local = {16'd0, add_elem_cnt} - ({16'd0, tile_y} * {16'd0, cfg_tile_num_w} + {16'd0, tile_x})
-                                     * {16'd0, cfg_tile_h} * {16'd0, cfg_tile_w} * {16'd0, cfg_out_c};
-                        byte_off = cfg_int16 ? (tile_local << 1) : tile_local;
+                        byte_off = cfg_int16 ? ({16'd0, add_tile_elem_cnt} << 1) : {16'd0, add_tile_elem_cnt};
                         act_rd_en   <= 1'b1;
                         act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
@@ -2032,10 +2028,7 @@ module npu_compute #(
                 if (add_rd_phase == 0) begin
                     begin : add_b_addr_calc
                         reg [31:0] byte_off;
-                        reg [31:0] tile_local;
-                        tile_local = {16'd0, add_elem_cnt} - ({16'd0, tile_y} * {16'd0, cfg_tile_num_w} + {16'd0, tile_x})
-                                     * {16'd0, cfg_tile_h} * {16'd0, cfg_tile_w} * {16'd0, cfg_out_c};
-                        byte_off = cfg_int16 ? (tile_local << 1) : tile_local;
+                        byte_off = cfg_int16 ? ({16'd0, add_tile_elem_cnt} << 1) : {16'd0, add_tile_elem_cnt};
                         act_rd_en   <= 1'b1;
                         act_rd_addr <= cfg_act_base + cfg_out_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
@@ -2098,9 +2091,6 @@ module npu_compute #(
                     // Compute writeback address
                     begin : add_wb_addr_calc
                         reg [31:0] byte_off;
-                        reg [31:0] tile_local;
-                        tile_local = {16'd0, add_elem_cnt} - ({16'd0, tile_y} * {16'd0, cfg_tile_num_w} + {16'd0, tile_x})
-                                     * {16'd0, cfg_tile_h} * {16'd0, cfg_tile_w} * {16'd0, cfg_out_c};
                         if (is_concat) begin
                             // Concat: output[pixel * total_c + offset + ch]
                             reg [31:0] pixel;
@@ -2110,8 +2100,8 @@ module npu_compute #(
                             byte_off = (pixel * {16'd0, concat_total_c} + {16'd0, concat_offset} + ch)
                                        << (cfg_int16 ? 1 : 0);
                         end else begin
-                            // Add: flat overwrite at out_base (tile-local)
-                            byte_off = cfg_int16 ? (tile_local << 1) : tile_local;
+                            // Add: flat overwrite at input A region (tile-local)
+                            byte_off = cfg_int16 ? ({16'd0, add_tile_elem_cnt} << 1) : {16'd0, add_tile_elem_cnt};
                         end
                         add_wb_addr    <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];  // Write to input A region (in-place)
                         add_wb_bytesel <= byte_off[1:0];
@@ -2153,6 +2143,9 @@ module npu_compute #(
                         act_wr_en   <= 1'b1;
                         act_wr_addr <= add_wb_addr;
                         act_wr_data <= merged;
+                        if (add_elem_cnt >= 16'd25087 && add_elem_cnt <= 16'd25090)
+                            $display("[WB_FINAL] elem=%0d tile(%0d,%0d) addr=%0d merged=0x%08x",
+                                     add_elem_cnt, tile_y, tile_x, add_wb_addr, merged);
                     end
                     state <= S_ADD_NEXT;
                 end
@@ -2185,8 +2178,10 @@ module npu_compute #(
                     end
                 end else if ({16'd0, add_tile_elem_cnt} + 32'd1 >= elems_per_tile) begin
                     // Current tile done — use tile-local counter for boundary check
+                    $display("[TILE_DONE] tile(%0d,%0d) elem=%0d", tile_y, tile_x, add_elem_cnt);
                     if (tile_x + 1 >= cfg_tile_num_w) begin
                         if (tile_y + 1 >= cfg_tile_num_h) begin
+                            $display("[TILE_DONE] FINAL tile(%0d,%0d) → S_DONE", tile_y, tile_x);
                             state <= S_DONE;  // Final tile
                         end else begin
                             tile_x <= 0;
