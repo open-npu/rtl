@@ -2067,7 +2067,6 @@ module npu_compute #(
                     else
                         rescaled_a = prod_a;
                     if (is_concat) begin
-                        // Concat: single branch rescale only
                         ppu_acc_in <= rescaled_a;
                     end else begin
                         prod_b = add_val_b * $signed({1'b0, add_M_B});
@@ -2076,6 +2075,9 @@ module npu_compute #(
                         else
                             rescaled_b = prod_b;
                         ppu_acc_in <= rescaled_a + rescaled_b;
+                        if (add_elem_cnt >= 16'd23936 && add_elem_cnt <= 16'd23942)
+                            $display("[ADD_CALC_FINAL] elem=%0d a=%0d b=%0d ra=%0d rb=%0d sum=%0d",
+                                     add_elem_cnt, add_val_a, add_val_b, rescaled_a, rescaled_b, rescaled_a + rescaled_b);
                     end
                 end
                 state <= S_ADD_PPU;
@@ -2155,17 +2157,10 @@ module npu_compute #(
 
             S_ADD_NEXT: begin
                 reg [31:0] elems_per_tile;
-                reg [31:0] actual_h, actual_w;
                 act_wr_en <= 1'b0;  // Clear write enable
                 ppu_in_valid <= 1'b0;  // Clear PPU input valid
-                // Compute actual tile dimensions (clamped to output bounds)
-                actual_h = (tile_y + 1 >= cfg_tile_num_h) ?
-                           ({16'd0, cfg_out_h} - {16'd0, tile_y} * {16'd0, out_tile_h}) :
-                           {16'd0, out_tile_h};
-                actual_w = (tile_x + 1 >= cfg_tile_num_w) ?
-                           ({16'd0, cfg_out_w} - {16'd0, tile_x} * {16'd0, out_tile_w}) :
-                           {16'd0, out_tile_w};
-                elems_per_tile = actual_h * actual_w * {16'd0, cfg_out_c};
+                // Use fixed tile size (padded) for consistent DDR layout
+                elems_per_tile = {16'd0, cfg_tile_h} * {16'd0, cfg_tile_w} * {16'd0, cfg_out_c};
                 if (cfg_tile_h == 16'd0 || elems_per_tile == 0) begin
                     // Non-tiled: original logic
                     if ({16'd0, add_elem_cnt} + 32'd1 >= {16'd0, add_total_elems}) begin
