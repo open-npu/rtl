@@ -128,6 +128,7 @@ module npu_ctrl (
     reg [31:0] cur_tile_ddr_offset; // Current tile's DDR offset from base
     reg [15:0] next_sram_offset;    // SRAM offset for prefetch target bank
     reg        add_b_reload;        // 1=Add B reload after compute_done (→ S_STORE_OUT)
+    reg        store_bank;          // Bank to store from (final tile's ping_pong)
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -341,6 +342,7 @@ module npu_ctrl (
 
                         // ─── Compute done ───
                         if (compute_done) begin
+                            store_bank <= ping_pong_flag;  // Latch final tile's bank
                             if (db_en && prefetch_active) begin
                                 // Prefetch still in flight — wait for it
                                 state <= S_WAIT_PREFETCH;
@@ -380,7 +382,8 @@ module npu_ctrl (
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b1;  // store
                         dma_ext_addr  <= cfg_dma_out_addr;
-                        dma_sram_addr <= (db_en && ping_pong_flag ? cfg_act_bank_offset : 16'd0);
+                        dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
+                        $display("[STORE] ping_pong=%0d store_bank=%0d sram_addr=%0d", ping_pong_flag, store_bank, (db_en && store_bank ? cfg_act_bank_offset : 16'd0));
                         // For DB_EN Add: use tile_in_words (same as output size per tile)
                         dma_xfer_len  <= (db_en && cfg_dma_add_b_addr != 0) ? tile_in_words : out_words;
                         state         <= S_WAIT_STORE;
