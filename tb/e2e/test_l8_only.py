@@ -22,4 +22,15 @@ async def test_l8_only(dut):
     mm=np.where(got!=ref)[0] if len(ref)==nw else np.arange(nw)
     if len(ref)!=nw: dut._log.error(f"FAIL L8: size {len(ref)} vs {nw}")
     elif len(mm)==0: dut._log.info(f"PASS L8: {nw}/{nw}")
-    else: dut._log.error(f"FAIL L8: {len(mm)}/{nw} first w[{mm[0]}] exp={ref[mm[0]]:08X} got={got[mm[0]]:08X}")
+    else: 
+        dut._log.error(f"FAIL L8: {len(mm)}/{nw} first w[{mm[0]}] exp={ref[mm[0]]:08X} got={got[mm[0]]:08X}")
+        # Check SRAM banks
+        for bank in [0, 4096]:
+            v = int(dut.u_sram_act.mem[bank].value)
+            dut._log.info(f"  sram[{bank}] = 0x{v:08X}")
+        # Check compute state
+        dut._log.info(f"  store_bank = {int(dut.u_ctrl.store_bank.value)}")
+        dut._log.info(f"  ping_pong = {int(dut.u_ctrl.ping_pong_flag.value)}")
+        dut._log.info(f"  add_elem_cnt = {int(dut.u_compute.add_elem_cnt.value)}")
+        dut._log.info(f"  add_tile_elem_cnt = {int(dut.u_compute.add_tile_elem_cnt.value)}")
+        dut._log.info(f"  tile_x = {int(dut.u_compute.tile_x.value)} tile_y = {int(dut.u_compute.tile_y.value)}")
