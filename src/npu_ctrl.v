@@ -330,7 +330,6 @@ module npu_ctrl (
                             if (prefetch_pending) begin
                                 ping_pong_flag  <= ~ping_pong_flag;
                                 prefetch_pending <= 1'b0;
-                                $display("[FLIP] t=%0t ping_pong 0→1 (bank%d)", $time, ~ping_pong_flag);
                             end
                             // For Add layers: prefetch input_b before unblocking compute
                             if (cfg_dma_add_b_addr != 0) begin
@@ -344,7 +343,6 @@ module npu_ctrl (
                         // ─── Compute done ───
                         if (compute_done) begin
                             store_bank <= ping_pong_flag;  // Latch final tile's bank
-                            $display("[DONE] t=%0t ping_pong=%0d store_bank=%0d", $time, ping_pong_flag, ping_pong_flag);
                             if (db_en && prefetch_active) begin
                                 // Prefetch still in flight — wait for it
                                 state <= S_WAIT_PREFETCH;
@@ -385,7 +383,6 @@ module npu_ctrl (
                         dma_dir       <= 1'b1;  // store
                         dma_ext_addr  <= cfg_dma_out_addr;
                         dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
-                        $display("[STORE] ping_pong=%0d store_bank=%0d sram_addr=%0d", ping_pong_flag, store_bank, (db_en && store_bank ? cfg_act_bank_offset : 16'd0));
                         // For DB_EN Add: use tile_in_words (same as output size per tile)
                         dma_xfer_len  <= (db_en && cfg_dma_add_b_addr != 0) ? tile_in_words : out_words;
                         state         <= S_WAIT_STORE;
