@@ -382,7 +382,11 @@ module npu_ctrl (
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b1;  // store
                         dma_ext_addr  <= cfg_dma_out_addr;
-                        dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
+                        // Conv2D: store from cfg_out_base; Add: store from cfg_act_base (in-place)
+                        if (cfg_dma_add_b_addr != 0)
+                            dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
+                        else
+                            dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
                         // For DB_EN Add: use tile_in_words (same as output size per tile)
                         dma_xfer_len  <= (db_en && cfg_dma_add_b_addr != 0) ? tile_in_words : out_words;
                         state         <= S_WAIT_STORE;
