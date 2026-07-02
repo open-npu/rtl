@@ -2088,6 +2088,9 @@ module npu_compute #(
             S_ADD_PPU_WAIT: begin
                 if (ppu_out_valid) begin
                     // Compute writeback address
+                    if (add_elem_cnt >= 16'd18816 && add_elem_cnt <= 16'd18820)
+                        $display("[PPU_OUT_DBG] elem=%0d ppu_out_data=0x%04x ppu_acc_in=%0d",
+                                 add_elem_cnt, ppu_out_data, ppu_acc_in);
                     begin : add_wb_addr_calc
                         reg [31:0] byte_off;
                         if (is_concat) begin
