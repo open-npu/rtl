@@ -2142,6 +2142,9 @@ module npu_compute #(
                         act_wr_en   <= 1'b1;
                         act_wr_addr <= add_wb_addr;
                         act_wr_data <= merged;
+                        if (add_elem_cnt >= 16'd18816 && add_elem_cnt <= 16'd18820)
+                            $display("[WB_DBG] elem=%0d tile(%0d,%0d) wb_addr=%0d cfg_act_base=%0d tile_elem=%0d merged=0x%08x wb_byte=0x%04x",
+                                     add_elem_cnt, tile_y, tile_x, add_wb_addr, cfg_act_base, add_tile_elem_cnt, merged, add_wb_byte);
                     end
                     state <= S_ADD_NEXT;
                 end
