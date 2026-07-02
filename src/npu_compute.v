@@ -2075,9 +2075,6 @@ module npu_compute #(
                         else
                             rescaled_b = prod_b;
                         ppu_acc_in <= rescaled_a + rescaled_b;
-                        if (add_elem_cnt >= 16'd23936 && add_elem_cnt <= 16'd23942)
-                            $display("[ADD_CALC_FINAL] elem=%0d a=%0d b=%0d ra=%0d rb=%0d sum=%0d",
-                                     add_elem_cnt, add_val_a, add_val_b, rescaled_a, rescaled_b, rescaled_a + rescaled_b);
                     end
                 end
                 state <= S_ADD_PPU;
@@ -2145,9 +2142,6 @@ module npu_compute #(
                         act_wr_en   <= 1'b1;
                         act_wr_addr <= add_wb_addr;
                         act_wr_data <= merged;
-                        if (add_elem_cnt >= 16'd25087 && add_elem_cnt <= 16'd25090)
-                            $display("[WB_FINAL] elem=%0d tile(%0d,%0d) addr=%0d merged=0x%08x",
-                                     add_elem_cnt, tile_y, tile_x, add_wb_addr, merged);
                     end
                     state <= S_ADD_NEXT;
                 end
@@ -2173,10 +2167,8 @@ module npu_compute #(
                     end
                 end else if ({16'd0, add_tile_elem_cnt} + 32'd1 >= elems_per_tile) begin
                     // Current tile done — use tile-local counter for boundary check
-                    $display("[TILE_DONE] tile(%0d,%0d) elem=%0d", tile_y, tile_x, add_elem_cnt);
                     if (tile_x + 1 >= cfg_tile_num_w) begin
                         if (tile_y + 1 >= cfg_tile_num_h) begin
-                            $display("[TILE_DONE] FINAL tile(%0d,%0d) → S_DONE", tile_y, tile_x);
                             state <= S_DONE;  // Final tile
                         end else begin
                             tile_x <= 0;
