@@ -1039,15 +1039,19 @@ module npu_compute #(
                     param_read_issued <= 1'b1;
                     param_data_ready  <= 1'b0;
                 end else if (!param_data_ready) begin
-                    // Wait for SRAM read latency
+                    // Wait for SRAM read latency (1 cycle)
                     param_data_ready <= 1'b1;
                 end else begin
                     param_buf[param_word_idx] <= param_rd_data;
+                    if (drain_col == 15 && param_word_idx <= 3'd1)
+                        $display("[PDBG] drain=%0d widx=%0d rdata=0x%08x addr=%0d",
+                                 drain_col, param_word_idx, param_rd_data, param_base + drain_col * 4 + param_word_idx);
                     if (param_word_idx == 3'd3) begin
                         ppu_mult_m     <= param_buf[0][14:0];
                         ppu_shift_s    <= param_buf[0][21:16];
                         ppu_zero_point <= $signed(param_buf[1][15:0]);
-                        ppu_bias       <= $signed({param_buf[3][15:0], param_buf[2],
+                        // Use param_rd_data for word 3 (param_buf[3] not yet updated this cycle)
+                        ppu_bias       <= $signed({param_rd_data[15:0], param_buf[2],
                                                    param_buf[1][31:16]});
                         state <= S_PPU_FEED;
                     end else begin
@@ -1686,7 +1690,8 @@ module npu_compute #(
                         ppu_mult_m     <= param_buf[0][14:0];
                         ppu_shift_s    <= param_buf[0][21:16];
                         ppu_zero_point <= $signed(param_buf[1][15:0]);
-                        ppu_bias       <= $signed({param_buf[3][15:0], param_buf[2],
+                        // Use param_rd_data for word 3 (param_buf[3] not yet updated this cycle)
+                        ppu_bias       <= $signed({param_rd_data[15:0], param_buf[2],
                                                    param_buf[1][31:16]});
                         // Start spatial loop for this channel
                         pool_oh <= 0;
@@ -2226,7 +2231,8 @@ module npu_compute #(
                         ppu_mult_m     <= param_buf[0][14:0];
                         ppu_shift_s    <= param_buf[0][21:16];
                         ppu_zero_point <= $signed(param_buf[1][15:0]);
-                        ppu_bias       <= $signed({param_buf[3][15:0], param_buf[2],
+                        // Use param_rd_data for word 3 (param_buf[3] not yet updated this cycle)
+                        ppu_bias       <= $signed({param_rd_data[15:0], param_buf[2],
                                                    param_buf[1][31:16]});
                         rsz_oh <= 0;
                         rsz_ow <= 0;
