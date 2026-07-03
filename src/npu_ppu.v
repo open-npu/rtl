@@ -59,7 +59,7 @@ module npu_ppu #(
     // ─── Pipeline Stage Registers ───
 
     // Stage 1: after bias addition
-    reg signed [ACC_W-1:0]      s1_biased;
+    reg signed [ACC_W:0]        s1_biased;  // ACC_W+1 to avoid overflow
     reg                         s1_valid;
     reg [1:0]                   s1_mode;
     reg [MULT_W-1:0]            s1_mult_m;
@@ -93,7 +93,7 @@ module npu_ppu #(
     // ═══════════════════════════════════════════════════════════════════
     always @(posedge clk or negedge rst_n) begin : pipeline
         // Blocking-assignment intermediates (not registers)
-        reg signed [ACC_W-1:0]  biased_v;
+        reg signed [ACC_W:0]      biased_v;  // ACC_W+1 to avoid overflow in acc+bias
         reg signed [PROD_W-1:0] product_v;
         reg signed [PROD_W-1:0] rounded_v;
         reg signed [PROD_W-1:0] shifted_full;
@@ -225,7 +225,7 @@ module npu_ppu #(
             if (s1_mode == MODE_CONV_REQ)
                 product_v = s1_biased * $signed({1'b0, s1_mult_m});
             else
-                product_v = {{MULT_W{s1_biased[ACC_W-1]}}, s1_biased};
+                product_v = {{MULT_W{s1_biased[ACC_W]}}, s1_biased};  // sign-extend ACC_W+1
 
             s2_valid   <= s1_valid;
             s2_mode    <= s1_mode;
