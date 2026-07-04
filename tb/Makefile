@@ -19,7 +19,7 @@ TOPLEVEL_LANG ?= verilog
 
 # ─── Hardware parameters (override to test different configs) ───
 ARRAY_SIZE ?= 16
-SPAD_KB    ?= 128
+SPAD_KB    ?= 192
 
 # ─── Paths ───
 RTL_DIR    = $(shell pwd)/../src
