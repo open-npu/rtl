@@ -1043,9 +1043,6 @@ module npu_compute #(
                     param_data_ready <= 1'b1;
                 end else begin
                     param_buf[param_word_idx] <= param_rd_data;
-                    if (drain_col == 15 && param_word_idx <= 3'd1)
-                        $display("[PDBG] drain=%0d widx=%0d rdata=0x%08x addr=%0d",
-                                 drain_col, param_word_idx, param_rd_data, param_base + drain_col * 4 + param_word_idx);
                     if (param_word_idx == 3'd3) begin
                         ppu_mult_m     <= param_buf[0][14:0];
                         ppu_shift_s    <= param_buf[0][21:16];
