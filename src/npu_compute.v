@@ -24,7 +24,7 @@
 module npu_compute #(
     parameter ARRAY_SIZE   = `ARRAY_SIZE,
     parameter ACT_ADDR_W   = 13,  // $clog2(SPAD_KB*64) for SPAD_KB=128 → $clog2(8192)=13
-    parameter WGT_ADDR_W   = 14,  // $clog2(SPAD_KB*128) for SPAD_KB=128 → $clog2(16384)=14
+    parameter WGT_ADDR_W   = $clog2(`SPAD_KB * 128),  // $clog2(WGT_DEPTH)
     parameter PARAM_ADDR_W = 11,  // $clog2(SPAD_KB*16) for SPAD_KB=128 → $clog2(2048)=11
     parameter DATA_W       = `DATA_WIDTH,
     parameter ACC_W        = `ACC_WIDTH
@@ -716,9 +716,6 @@ module npu_compute #(
             S_WGT_EMIT: begin
                 // Pulse wgt_valid for this column
                 sa_wgt_valid <= 1'b1;
-                if (k_pass == 16 && wgt_col_idx <= 1 && sp_oh == 0 && sp_ow == 0 && tile_y == 0 && tile_x == 0)
-                    $display("[WGT] col=%0d wgt[0]=%0d wgt[1]=%0d wgt[2]=%0d",
-                             wgt_col_idx, sa_wgt_data[0], sa_wgt_data[1], sa_wgt_data[2]);
 
                 if (wgt_col_idx == COL_MAX) begin
                     // All columns loaded → go to spatial setup (compute act addr)
@@ -1001,10 +998,6 @@ module npu_compute #(
                     // Accumulate reduced dot product into dot_buf[drain_col]
                     dot_buf[drain_col] <= dot_buf[drain_col]
                         + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
-                    if (drain_col == 1 && sp_oh == 0 && sp_ow == 0 && tile_y == 0 && tile_x == 0)
-                        $display("[KP] pass=%0d drain=%0d dot_acc=%0d dot_buf=%0d",
-                                 k_pass, drain_col, dot_acc + acc_buf[reduce_cnt[COL_W-1:0]],
-                                 dot_buf[drain_col] + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]]);
 `ifdef DBG_DOTBUF
                     if (drain_col == 0)
                         $fwrite(dbg_fh, "[RTL_DB] t=%0d tile(%0d,%0d) sp(%0d,%0d) col=0 pass=%0d kpr=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d\n",
