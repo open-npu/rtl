@@ -59,7 +59,7 @@ module npu_ppu #(
     // ─── Pipeline Stage Registers ───
 
     // Stage 1: after bias addition
-    reg signed [ACC_W:0]        s1_biased;  // ACC_W+1 to avoid overflow
+    reg signed [ACC_W-1:0]      s1_biased;  // 40-bit to match CSIM trunc_40bit
     reg                         s1_valid;
     reg [1:0]                   s1_mode;
     reg [MULT_W-1:0]            s1_mult_m;
@@ -93,7 +93,7 @@ module npu_ppu #(
     // ═══════════════════════════════════════════════════════════════════
     always @(posedge clk or negedge rst_n) begin : pipeline
         // Blocking-assignment intermediates (not registers)
-        reg signed [ACC_W:0]      biased_v;  // ACC_W+1 to avoid overflow in acc+bias
+        reg signed [ACC_W-1:0]  biased_v;  // 40-bit to match CSIM trunc_40bit
         reg signed [PROD_W-1:0] product_v;
         reg signed [PROD_W-1:0] rounded_v;
         reg signed [PROD_W-1:0] shifted_full;
@@ -196,7 +196,9 @@ module npu_ppu #(
             // ─── Compute Stage 3: rounding right shift (reads current s2 regs) ───
             shift_amt = s2_shift_s;
             if (s2_mode == MODE_CONV_REQ) begin
-                if (shift_amt > 0)
+                // Rounding: add 2^(S-1) before right shift, matching CSIM
+                // For S >= 56, rounding bit overflows PROD_W — treat as 0 (matches CSIM)
+                if (shift_amt > 0 && shift_amt < PROD_W)
                     rounded_v = s2_product + ($signed({{(PROD_W-1){1'b0}}, 1'b1}) << (shift_amt - 1));
                 else
                     rounded_v = s2_product;
@@ -225,7 +227,7 @@ module npu_ppu #(
             if (s1_mode == MODE_CONV_REQ)
                 product_v = s1_biased * $signed({1'b0, s1_mult_m});
             else
-                product_v = {{MULT_W{s1_biased[ACC_W]}}, s1_biased};  // sign-extend ACC_W+1
+                product_v = {{MULT_W{s1_biased[ACC_W-1]}}, s1_biased};  // sign-extend 40-bit
 
             s2_valid   <= s1_valid;
             s2_mode    <= s1_mode;
