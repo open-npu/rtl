@@ -66,6 +66,8 @@ module npu_pe (
                     if (valid_in) begin
                         // MAC operation
                         acc_reg <= acc_reg + (act_in * weight_reg);
+                        // Debug: print first few MACs for PE 0
+                        // (using $display for Verilator compatibility)
                         // Pass activation to next PE (systolic flow)
                         act_out       <= act_in;
                         act_valid_out <= 1'b1;
