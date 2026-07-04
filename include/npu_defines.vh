@@ -12,7 +12,7 @@
 `endif
 
 `ifndef SPAD_KB
-`define SPAD_KB        128    // Total scratchpad size in KB
+`define SPAD_KB        192    // Total scratchpad size in KB (increased for 64x64 conv)
 `endif
 
 // ─── Derived parameters ───
