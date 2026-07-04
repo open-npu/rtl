@@ -451,6 +451,13 @@ module npu_top #(
     assign wgt_a_addr  = dma_sram_addr_o[WGT_ADDR_W-1:0];
     assign wgt_a_wdata = dma_sram_wdata;
 
+    // Debug: log weight SRAM write at addr=416
+    always @(posedge clk) begin
+        if (wgt_a_en && wgt_a_we && wgt_a_addr == 15'd416)
+            $display("[WGT_DMA] t=%0t data=0x%08x sram_addr=0x%04x dma_start=%0d",
+                     $time, wgt_a_wdata, dma_sram_addr_o, dma_start);
+    end
+
     assign param_a_en    = dma_sram_en && (dma_bank_sel == 2'd2);
     assign param_a_we    = dma_sram_we;
     assign param_a_addr  = dma_sram_addr_o[PARAM_ADDR_W-1:0];
