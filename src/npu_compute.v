@@ -716,6 +716,9 @@ module npu_compute #(
             S_WGT_EMIT: begin
                 // Pulse wgt_valid for this column
                 sa_wgt_valid <= 1'b1;
+                if (k_pass == 16 && wgt_col_idx <= 1 && sp_oh == 0 && sp_ow == 0 && tile_y == 0 && tile_x == 0)
+                    $display("[WGT] col=%0d wgt[0]=%0d wgt[1]=%0d wgt[2]=%0d",
+                             wgt_col_idx, sa_wgt_data[0], sa_wgt_data[1], sa_wgt_data[2]);
 
                 if (wgt_col_idx == COL_MAX) begin
                     // All columns loaded → go to spatial setup (compute act addr)
