@@ -998,6 +998,10 @@ module npu_compute #(
                     // Accumulate reduced dot product into dot_buf[drain_col]
                     dot_buf[drain_col] <= dot_buf[drain_col]
                         + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
+                    if (drain_col == 1 && sp_oh == 0 && sp_ow == 0 && tile_y == 0 && tile_x == 0)
+                        $display("[KP] pass=%0d drain=%0d dot_acc=%0d dot_buf=%0d",
+                                 k_pass, drain_col, dot_acc + acc_buf[reduce_cnt[COL_W-1:0]],
+                                 dot_buf[drain_col] + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]]);
 `ifdef DBG_DOTBUF
                     if (drain_col == 0)
                         $fwrite(dbg_fh, "[RTL_DB] t=%0d tile(%0d,%0d) sp(%0d,%0d) col=0 pass=%0d kpr=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d\n",
