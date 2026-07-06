@@ -20,7 +20,7 @@
     "post_ctrl": 228,
     "dma_wgt_size": 48,
     "dma_in_size": 6144,
-    "dma_out_size": 16384,
+    "dma_out_size": 8192,
     "tile_in_size": 3072,
     "dma_param_count": 8,
     "tile_h": 16,
@@ -34,7 +34,7 @@
     "n_wgt_words": 12,
     "n_param_words": 32,
     "n_input_words": 1536,
-    "n_output_words": 4096
+    "n_output_words": 2048
   },
   {
     "index": 1,
@@ -57,7 +57,7 @@
     "post_ctrl": 228,
     "dma_wgt_size": 128,
     "dma_in_size": 16384,
-    "dma_out_size": 16384,
+    "dma_out_size": 8192,
     "tile_in_size": 8192,
     "dma_param_count": 8,
     "tile_h": 16,
@@ -71,7 +71,7 @@
     "n_wgt_words": 32,
     "n_param_words": 32,
     "n_input_words": 4096,
-    "n_output_words": 4096
+    "n_output_words": 2048
   },
   {
     "index": 2,
@@ -94,7 +94,7 @@
     "post_ctrl": 228,
     "dma_wgt_size": 128,
     "dma_in_size": 16384,
-    "dma_out_size": 16384,
+    "dma_out_size": 8192,
     "tile_in_size": 8192,
     "dma_param_count": 8,
     "tile_h": 16,
@@ -108,7 +108,7 @@
     "n_wgt_words": 32,
     "n_param_words": 32,
     "n_input_words": 4096,
-    "n_output_words": 4096
+    "n_output_words": 2048
   },
   {
     "index": 3,
@@ -131,7 +131,7 @@
     "post_ctrl": 228,
     "dma_wgt_size": 128,
     "dma_in_size": 16384,
-    "dma_out_size": 16384,
+    "dma_out_size": 8192,
     "tile_in_size": 8192,
     "dma_param_count": 8,
     "tile_h": 16,
@@ -145,7 +145,7 @@
     "n_wgt_words": 32,
     "n_param_words": 32,
     "n_input_words": 4096,
-    "n_output_words": 4096
+    "n_output_words": 2048
   },
   {
     "index": 4,
@@ -168,7 +168,7 @@
     "post_ctrl": 224,
     "dma_wgt_size": 128,
     "dma_in_size": 16384,
-    "dma_out_size": 16384,
+    "dma_out_size": 8192,
     "tile_in_size": 8192,
     "dma_param_count": 8,
     "tile_h": 16,
@@ -182,7 +182,7 @@
     "n_wgt_words": 32,
     "n_param_words": 32,
     "n_input_words": 4096,
-    "n_output_words": 4096
+    "n_output_words": 2048
   },
   {
     "index": 5,
@@ -205,7 +205,7 @@
     "post_ctrl": 228,
     "dma_wgt_size": 128,
     "dma_in_size": 16384,
-    "dma_out_size": 16384,
+    "dma_out_size": 8192,
     "tile_in_size": 8192,
     "dma_param_count": 8,
     "tile_h": 16,
@@ -219,6 +219,6 @@
     "n_wgt_words": 32,
     "n_param_words": 32,
     "n_input_words": 4096,
-    "n_output_words": 4096
+    "n_output_words": 2048
   }
 ]
