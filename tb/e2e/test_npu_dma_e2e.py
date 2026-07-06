@@ -869,6 +869,12 @@ async def test_dma_e2e_tiling_int8_db_en(dut):
     Uses int8_tiled_db_en golden data (max 32ch) so output fits within
     one ACT SRAM bank per layer.  DB_EN overlaps DMA prefetch of the
     next tile's input with compute on the current tile.
+
+    Each layer runs independently (reset between layers, reload each
+    layer's input from golden) because the RTL stores only the LAST
+    tile's output to DDR (per a5d399c design) — cascading layers would
+    need full-output store, which is incompatible with DB_EN 2-bank
+    ping-pong.
     """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset(dut)
@@ -880,12 +886,6 @@ async def test_dma_e2e_tiling_int8_db_en(dut):
     metadata, layer_data = load_golden_tiling('int8_tiled_db_en')
 
     for idx, (meta, data) in enumerate(zip(metadata, layer_data)):
-        mem.populate(meta['ddr_wgt_addr'], data['wgt'])
-        mem.populate(meta['ddr_param_addr'], data['param'])
-
-    mem.populate(metadata[0]['ddr_in_addr'], layer_data[0]['input'])
-
-    for idx, (meta, data) in enumerate(zip(metadata, layer_data)):
         tile_info = (f" tile={meta['tile_h']}x{meta['tile_w']}"
                      f" ({meta['tile_num_h']}x{meta['tile_num_w']})"
                      if meta['tile_h'] > 0 else "")
@@ -894,6 +894,17 @@ async def test_dma_e2e_tiling_int8_db_en(dut):
                       f"[{meta['in_h']}x{meta['in_w']}x{meta['in_c']}] -> "
                       f"[{meta['out_h']}x{meta['out_w']}x{meta['out_c']}]"
                       f"{tile_info}")
+
+        # Reset between layers to clear SRAM state (independent layer runs)
+        if idx > 0:
+            await reset(dut)
+
+        # Load this layer's weights, params, and input fresh
+        if len(data['wgt']) > 0:
+            mem.populate(meta['ddr_wgt_addr'], data['wgt'])
+        if len(data['param']) > 0:
+            mem.populate(meta['ddr_param_addr'], data['param'])
+        mem.populate(meta['ddr_in_addr'], data['input'])
 
         await program_layer_db_en(wb, meta)
         done = await run_layer_and_wait(wb, dut, timeout=2000000)
@@ -912,6 +923,12 @@ async def test_dma_e2e_tiling_int16_db_en(dut):
 
     Uses int16_tiled_db_en golden data (max 16ch) so output fits within
     one ACT SRAM bank per layer (INT16: 2 elems/word, tighter constraint).
+
+    Each layer runs independently (reset between layers, reload each
+    layer's input from golden) because the RTL stores only the LAST
+    tile's output to DDR (per a5d399c design) — cascading layers would
+    need full-output store, which is incompatible with DB_EN 2-bank
+    ping-pong.
     """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset(dut)
@@ -923,12 +940,6 @@ async def test_dma_e2e_tiling_int16_db_en(dut):
     metadata, layer_data = load_golden_tiling('int16_tiled_db_en')
 
     for idx, (meta, data) in enumerate(zip(metadata, layer_data)):
-        mem.populate(meta['ddr_wgt_addr'], data['wgt'])
-        mem.populate(meta['ddr_param_addr'], data['param'])
-
-    mem.populate(metadata[0]['ddr_in_addr'], layer_data[0]['input'])
-
-    for idx, (meta, data) in enumerate(zip(metadata, layer_data)):
         tile_info = (f" tile={meta['tile_h']}x{meta['tile_w']}"
                      f" ({meta['tile_num_h']}x{meta['tile_num_w']})"
                      if meta['tile_h'] > 0 else "")
@@ -937,6 +948,17 @@ async def test_dma_e2e_tiling_int16_db_en(dut):
                       f"[{meta['in_h']}x{meta['in_w']}x{meta['in_c']}] -> "
                       f"[{meta['out_h']}x{meta['out_w']}x{meta['out_c']}]"
                       f"{tile_info}")
+
+        # Reset between layers to clear SRAM state (independent layer runs)
+        if idx > 0:
+            await reset(dut)
+
+        # Load this layer's weights, params, and input fresh
+        if len(data['wgt']) > 0:
+            mem.populate(meta['ddr_wgt_addr'], data['wgt'])
+        if len(data['param']) > 0:
+            mem.populate(meta['ddr_param_addr'], data['param'])
+        mem.populate(meta['ddr_in_addr'], data['input'])
 
         await program_layer_db_en(wb, meta)
         done = await run_layer_and_wait(wb, dut, timeout=2000000)
