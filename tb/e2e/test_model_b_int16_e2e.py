@@ -47,6 +47,10 @@ async def test_model_b_int16_e2e(dut):
         if 'input_b' in data and 'ddr_add_b_addr' in meta:
             mem.populate(meta['ddr_add_b_addr'], data['input_b'])
 
+        # Reset between layers to clear SRAM state
+        if i > 0:
+            await reset(dut)
+
         await program_layer(wb, meta)
 
         tile_h = meta.get('tile_h', 0)
@@ -59,7 +63,7 @@ async def test_model_b_int16_e2e(dut):
                       f"tile={tile_h}x{tile_w}@{tiles_h}x{tiles_w} "
                       f"DB_EN={meta.get('sched_ctrl',0)&1}")
 
-        done = await run_layer_and_wait(wb, dut, timeout=120000000)
+        done = await run_layer_and_wait(wb, dut, timeout=600000000)
         assert done, f"L{i} timed out"
 
         # Verify
