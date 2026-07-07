@@ -292,7 +292,12 @@ async def run_layer_and_wait(wb, dut, timeout=500000):
 
 
 def verify_output(mem, meta, golden_output, layer_idx):
-    """Verify DMA output in DDR matches golden. Returns (pass, details)."""
+    """Verify DMA output in DDR matches golden. Returns (pass, details).
+
+    For per_tile_store (NHWC DDR layout): RTL writes tiles to NHWC positions.
+    Since NHWC is row-major contiguous, reading out_addr+i*4 gives the full
+    NHWC output packed contiguously (same as golden).
+    """
     out_addr = meta['ddr_out_addr']
     n_words = meta['n_output_words']
     mismatches = []

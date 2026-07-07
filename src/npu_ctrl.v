@@ -148,6 +148,7 @@ module npu_ctrl (
     reg [15:0] next_sram_offset;    // SRAM offset for prefetch target bank
     reg        add_b_reload;        // 1=Add B reload after compute_done (→ S_STORE_OUT)
     reg        store_bank;          // Bank to store from (final tile's ping_pong)
+    reg        last_tile_store;     // 1=S_TILE_STORE is for final tile (→ S_DONE, no prefetch)
 
     // ─── Per-tile store tile sequencing ───
     // Track tile (y,x) position for NHWC DDR offset computation
@@ -192,6 +193,7 @@ module npu_ctrl (
             next_sram_offset <= 16'd0;
             tile_y_seq <= 16'd0;
             tile_x_seq <= 16'd0;
+            last_tile_store <= 1'b0;
             dma_row_len <= 16'd0;
             dma_row_count <= 16'd0;
             dma_out_stride <= 32'd0;
@@ -357,6 +359,10 @@ module npu_ctrl (
                             if (per_tile_store_en) begin
                                 // Latch current tile's bank for store
                                 store_bank <= ping_pong_flag;
+                                last_tile_store <= 1'b0;  // non-final tile
+                                `ifndef SYNTHESIS
+                                $display("[PTS_TILEDONE] t=%0t tile_done fired, ping_pong=%0d → S_TILE_STORE", $time, ping_pong_flag);
+                                `endif
                                 state <= S_TILE_STORE;
                             end else begin
                                 // Original path: prefetch next tile directly
@@ -399,10 +405,13 @@ module npu_ctrl (
                             end else begin
                                 if (skip_store)
                                     state <= S_DONE;
-                                else if (per_tile_store_en)
-                                    // Last tile already stored by per-tile path;
-                                    // skip final S_STORE_OUT
-                                    state <= S_DONE;
+                                else if (per_tile_store_en) begin
+                                    // Last tile NOT yet stored (tile_done doesn't fire
+                                    // for final tile). Go to S_TILE_STORE to store it,
+                                    // then S_TILE_STORE_WAIT → S_DONE (skip prefetch).
+                                    last_tile_store <= 1'b1;
+                                    state <= S_TILE_STORE;
+                                end
                                 else
                                     state <= S_STORE_OUT;
                             end
@@ -429,6 +438,13 @@ module npu_ctrl (
                         dma_row_len    <= tile_row_len;
                         dma_row_count  <= tile_row_count;
                         dma_out_stride <= nhwc_row_stride;
+                        `ifndef SYNTHESIS
+                        $display("[PTS_STORE] t=%0t ty=%0d tx=%0d ddr=0x%08x sram=%0d len=%0d row_len=%0d row_cnt=%0d stride=%0d bank=%0d",
+                                 $time, tile_y_seq, tile_x_seq,
+                                 cfg_dma_out_addr + tile_ddr_offset,
+                                 cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0),
+                                 tile_out_words, tile_row_len, tile_row_count, nhwc_row_stride, store_bank);
+                        `endif
                         state          <= S_TILE_STORE_WAIT;
                     end
                 end
@@ -440,32 +456,37 @@ module npu_ctrl (
                         // Clear 2D mode (revert to 1D for prefetch)
                         dma_row_len   <= 16'd0;
                         dma_row_count <= 16'd0;
-                        // Advance tile sequence indices (row-major: x first, then y)
-                        if (tile_x_seq + 1 >= cfg_tile_num_w) begin
-                            tile_x_seq <= 16'd0;
-                            tile_y_seq <= tile_y_seq + 1;
+                        if (last_tile_store) begin
+                            // Final tile stored — done (no prefetch needed)
+                            state <= S_DONE;
                         end else begin
-                            tile_x_seq <= tile_x_seq + 1;
+                            // Non-final tile: advance tile indices and prefetch next
+                            if (tile_x_seq + 1 >= cfg_tile_num_w) begin
+                                tile_x_seq <= 16'd0;
+                                tile_y_seq <= tile_y_seq + 1;
+                            end else begin
+                                tile_x_seq <= tile_x_seq + 1;
+                            end
+                            // Fire prefetch for next tile
+                            if (!skip_act_load) begin
+                                dma_start      <= 1'b1;
+                                dma_dir        <= 1'b0;
+                                dma_ext_addr   <= next_tile_ddr_addr;
+                                dma_sram_addr  <= next_sram_offset;
+                                dma_xfer_len   <= tile_in_words;
+                                prefetch_active  <= 1'b1;
+                                prefetch_pending <= 1'b1;
+                                db_prefetch_done <= 1'b0;
+                                cur_tile_ddr_offset <= next_tile_ddr_addr - cfg_dma_in_addr;
+                                next_tile_ddr_addr <= next_tile_ddr_addr
+                                    + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                                next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
+                                                    16'd0 : cfg_act_bank_offset;
+                            end else begin
+                                db_prefetch_done <= 1'b1;
+                            end
+                            state <= S_WAIT_COMP;
                         end
-                        // Now fire prefetch for next tile (same as original tile_done path)
-                        if (!skip_act_load) begin
-                            dma_start      <= 1'b1;
-                            dma_dir        <= 1'b0;
-                            dma_ext_addr   <= next_tile_ddr_addr;
-                            dma_sram_addr  <= next_sram_offset;
-                            dma_xfer_len   <= tile_in_words;
-                            prefetch_active  <= 1'b1;
-                            prefetch_pending <= 1'b1;
-                            db_prefetch_done <= 1'b0;
-                            cur_tile_ddr_offset <= next_tile_ddr_addr - cfg_dma_in_addr;
-                            next_tile_ddr_addr <= next_tile_ddr_addr
-                                + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
-                            next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
-                                                16'd0 : cfg_act_bank_offset;
-                        end else begin
-                            db_prefetch_done <= 1'b1;
-                        end
-                        state <= S_WAIT_COMP;
                     end
                 end
 
