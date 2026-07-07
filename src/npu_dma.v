@@ -176,8 +176,16 @@ module npu_dma #(
                         wb_stb_o <= 1'b1;
                         wb_we_o  <= 1'b0;
                         wb_adr_o <= r_ext_addr;
+                        `ifndef SYNTHESIS
+                        if (xfer_count < 3 && r_sram_addr >= 16'd6144)
+                            $display("[DMA_LD] t=%0t xfer=%0d addr=0x%08x sram=%0d", $time, xfer_count, r_ext_addr, r_sram_addr);
+                        `endif
                         if (wb_ack_i) begin
                             r_data_buf <= wb_dat_i;
+                            `ifndef SYNTHESIS
+                            if (xfer_count < 3 && r_sram_addr >= 16'd6144)
+                                $display("[DMA_LD_DATA] t=%0t xfer=%0d data=0x%08x", $time, xfer_count, wb_dat_i);
+                            `endif
                             wb_cyc_o   <= 1'b0;
                             wb_stb_o   <= 1'b0;
                             state      <= S_LOAD_WR;

@@ -483,6 +483,11 @@ module npu_ctrl (
                                 prefetch_pending <= 1'b1;
                                 db_prefetch_done <= 1'b0;
                                 cur_tile_ddr_offset <= next_tile_ddr_addr - cfg_dma_in_addr;
+                                `ifndef SYNTHESIS
+                                $display("[PTS_PREFETCH] t=%0t ddr=0x%08x sram=%0d len=%0d offset=%0d",
+                                         $time, next_tile_ddr_addr, next_sram_offset, tile_in_words,
+                                         next_tile_ddr_addr - cfg_dma_in_addr);
+                                `endif
                                 next_tile_ddr_addr <= next_tile_ddr_addr
                                     + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
                                 // Toggle target bank for next prefetch
