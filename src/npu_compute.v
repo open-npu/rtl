@@ -598,6 +598,12 @@ module npu_compute #(
                 $fwrite(dbg_fh, "[OC_SETUP] oc_group=%0d k_depth=%0d wgt_base=%0d param_base=%0d\n",
                         oc_group, k_depth, (oc_group * ARRAY_SIZE_16 * k_depth) >> 1, oc_group * ARRAY_SIZE_16 * 4);
 `endif
+                `ifndef SYNTHESIS
+                if (cfg_tile_h != 0)
+                    $display("[CMP_OC] t=%0t tile(%0d,%0d) oc_group=%0d k_depth=%0d k_pass_max=%0d col_last=%0d out_base=%0d",
+                             $time, tile_y, tile_x, oc_group, k_depth,
+                             (k_depth - 1) / ARRAY_SIZE_16, col_last, cfg_act_base + cfg_out_base);
+                `endif
                 // Param base: 4 words per channel, ARRAY_SIZE channels per group
                 param_base <= oc_group * ARRAY_SIZE_16 * 4;
 
@@ -1113,15 +1119,15 @@ module npu_compute #(
                                   + oc_group * ARRAY_SIZE_16
                                   + ({12'd0, drain_col} & ~16'd1)) >> 1);
                             act_wr_data <= {ppu_out_data, wb_pack[15:0]};
-`ifdef DBG_DOTBUF
-                            if (((tile_x == 0 && tile_y == 0) || (tile_x == 3 && tile_y == 6)) && sp_oh == 0 && sp_ow == 0)
-                                $fwrite(dbg_fh, "[RTL_WB] t=%0d drain=%0d wb_data=0x%04x%04x addr=%0d\n",
-                                        $time, drain_col,
-                                        ppu_out_data, wb_pack[15:0],
-                                        (out_base + (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
-                                          + oc_group * ARRAY_SIZE_16
-                                          + ({12'd0, drain_col} & ~16'd1)) >> 1)));
-`endif
+                            `ifndef SYNTHESIS
+                            if (tile_x == 1 && tile_y == 0 && sp_oh == 0 && sp_ow == 0)
+                                $display("[CMP_WB] t=%0t drain=%0d col_last=%0d addr=%0d data=0x%04x%04x",
+                                         $time, drain_col, col_last,
+                                         out_base + (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
+                                           + oc_group * ARRAY_SIZE_16
+                                           + ({12'd0, drain_col} & ~16'd1)) >> 1),
+                                         ppu_out_data, wb_pack[15:0]);
+                            `endif
                         end
                     endcase
                     wb_pos <= {1'b0, ~wb_pos[0]};  // toggle: 0->1->0->1...
