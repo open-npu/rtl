@@ -535,6 +535,11 @@ module npu_compute #(
                 act_base <= cfg_act_base;
                 tile_oh_origin <= tile_y * out_tile_h;
                 tile_ow_origin <= tile_x * out_tile_w;
+                `ifndef SYNTHESIS
+                if (cfg_tile_h != 0)
+                    $display("[CMP_TILE] t=%0t tile(%0d,%0d) act_base=%0d out_base=%0d",
+                             $time, tile_y, tile_x, cfg_act_base, cfg_act_base + cfg_out_base);
+                `endif
                 // Clip tile dimensions to image boundary
                 if (out_tile_w > cfg_out_w - tile_x * out_tile_w)
                     out_tile_w <= cfg_out_w - tile_x * out_tile_w;

@@ -360,6 +360,7 @@ module npu_ctrl (
                                 // Latch current tile's bank for store
                                 store_bank <= ping_pong_flag;
                                 last_tile_store <= 1'b0;  // non-final tile
+                                db_prefetch_done <= 1'b0;  // Block compute during store+prefetch
                                 `ifndef SYNTHESIS
                                 $display("[PTS_TILEDONE] t=%0t tile_done fired, ping_pong=%0d → S_TILE_STORE", $time, ping_pong_flag);
                                 `endif
@@ -388,6 +389,10 @@ module npu_ctrl (
                             if (prefetch_pending) begin
                                 ping_pong_flag  <= ~ping_pong_flag;
                                 prefetch_pending <= 1'b0;
+                                `ifndef SYNTHESIS
+                                $display("[PP_FLIP] t=%0t ping_pong %0d→%0d db_prefetch_done=1",
+                                         $time, ping_pong_flag, ~ping_pong_flag);
+                                `endif
                             end
                             if (cfg_dma_add_b_addr != 0) begin
                                 add_b_reload <= 1'b1;
@@ -480,6 +485,7 @@ module npu_ctrl (
                                 cur_tile_ddr_offset <= next_tile_ddr_addr - cfg_dma_in_addr;
                                 next_tile_ddr_addr <= next_tile_ddr_addr
                                     + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                                // Toggle target bank for next prefetch
                                 next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
                                                     16'd0 : cfg_act_bank_offset;
                             end else begin
