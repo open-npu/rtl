@@ -230,9 +230,15 @@ async def program_layer(wb, meta):
     if 'pool_cfg' in meta:
         await wb.write(0x060, meta['pool_cfg'])    # POOL_CFG
 
-    # DMA control: DB_EN bit[0], fusion bits[1:3] from sched_ctrl
+    # DMA control: DB_EN bit[0], fusion bits[1:3], per_tile_store bit[4] from sched_ctrl
     sched = meta.get('sched_ctrl', 0)
-    await wb.write(0x118, sched)                   # DMA_CTRL: DB_EN[0]+fusion
+    await wb.write(0x118, sched)                   # DMA_CTRL: DB_EN[0]+fusion[1:3]+PTS[4]
+
+    # Per-tile store configuration (2D DMA for NHWC DDR layout)
+    if meta.get('store_mode', 0):
+        await wb.write(0x140, meta['store_mode'])      # DMA_STORE_MODE: PTS_EN
+        await wb.write(0x138, meta.get('tile_out_size', 0))  # DMA_TILE_OUT_SIZE
+        await wb.write(0x144, meta.get('row_cfg', 0))  # DMA_ROW_CFG
 
 
 async def run_layer_and_wait(wb, dut, timeout=500000):
@@ -856,10 +862,17 @@ async def program_layer_db_en(wb, meta):
     await wb.write(0x188, meta['dma_param_count'])
 
     # DB_EN=1 (bit[0]) — enable double-buffer ping-pong prefetch
-    await wb.write(0x118, 0x01)
+    sched = meta.get('sched_ctrl', 0) | 0x01  # ensure DB_EN
+    await wb.write(0x118, sched)
 
     # TILE_IN_SIZE: per-tile input size in bytes (for DB_EN prefetch)
     await wb.write(0x134, meta.get('tile_in_size', 0))
+
+    # Per-tile store configuration (2D DMA for NHWC DDR layout)
+    if meta.get('store_mode', 0):
+        await wb.write(0x140, meta['store_mode'])
+        await wb.write(0x138, meta.get('tile_out_size', 0))
+        await wb.write(0x144, meta.get('row_cfg', 0))
 
 
 @cocotb.test()
