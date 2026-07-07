@@ -37,6 +37,9 @@ module npu_compute #(
     output reg                          done,
     output wire                         tile_done,  // 1-cycle pulse at non-final tile boundary
     input  wire                         db_prefetch_done,  // DB_EN: prefetch complete, safe to start next tile
+    // Per-tile store support: actual (clipped) tile output dimensions
+    output wire [15:0]                  tile_out_h_actual, // Current tile's actual output height (clipped at border)
+    output wire [15:0]                  tile_out_w_actual, // Current tile's actual output width (clipped at border)
 
     // ─── Layer configuration (from CSR) ───
     input  wire [7:0]                   cfg_op_type,
@@ -217,6 +220,9 @@ module npu_compute #(
     reg        tile_done_r;
     reg        tile_wait_delay;  // DB_EN wait: skip 1 cycle, then wait for prefetch
     assign tile_done = tile_done_r;
+    // Expose actual (border-clipped) tile output dims for per-tile store DMA
+    assign tile_out_h_actual = out_tile_h;
+    assign tile_out_w_actual = out_tile_w;
     reg [15:0] oc_group;
 
     // ─── Latched config ───

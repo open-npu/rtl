@@ -61,6 +61,22 @@ module npu_ctrl (
     input  wire [15:0]  cfg_out_base,        // Output base address in SRAM (word addr)
     input  wire [31:0]  cfg_dma_add_b_addr,  // DDR address of Add Branch B data
 
+    // ─── Per-tile Store Configuration (2D DMA for NHWC layout) ───
+    input  wire [31:0]  cfg_dma_store_mode,    // 0x140: bit[0]=PER_TILE_STORE_EN
+    input  wire [31:0]  cfg_dma_tile_out_size, // 0x138: per-tile output size (bytes)
+    input  wire [15:0]  cfg_out_w,             // output width (for NHWC row stride)
+    input  wire [15:0]  cfg_out_c,             // output channels (for NHWC row stride)
+    input  wire [15:0]  cfg_tile_h,            // tile height (for tile sequencing)
+    input  wire [15:0]  cfg_tile_w,            // tile width (for tile sequencing)
+    input  wire [15:0]  cfg_tile_num_h,        // tile count H (for last-tile detection)
+    input  wire [15:0]  cfg_tile_num_w,        // tile count W (for tile sequencing)
+    input  wire         cfg_int16,             // 1=INT16 (elem_bytes=2), 0=INT8 (elem_bytes=1)
+    input  wire [15:0]  tile_out_h_actual,     // Actual (border-clipped) tile height from compute
+    input  wire [15:0]  tile_out_w_actual,     // Actual (border-clipped) tile width from compute
+    output reg  [15:0]  dma_row_len,           // 2D DMA: words per row (0=1D mode)
+    output reg  [15:0]  dma_row_count,         // 2D DMA: row count (0=1D mode)
+    output reg  [31:0]  dma_out_stride,        // 2D DMA: row stride (bytes) for store
+
     // ─── Double-Buffer Interface ───
     output reg          ping_pong_flag,      // 0=compute reads lower half, 1=upper half
     output reg          db_prefetch_done,    // Prefetch complete; compute may start next tile
@@ -73,24 +89,26 @@ module npu_ctrl (
 );
 
     // ─── FSM States ───
-    localparam S_IDLE         = 5'd0;
-    localparam S_LOAD_WGT     = 5'd1;   // DMA: load weights
-    localparam S_WAIT_WGT     = 5'd2;
-    localparam S_LOAD_ACT     = 5'd3;   // DMA: load activations
-    localparam S_WAIT_ACT     = 5'd4;
-    localparam S_LOAD_PARAM   = 5'd5;   // DMA: load PPU parameters
-    localparam S_WAIT_PARAM   = 5'd6;
-    localparam S_COMPUTE      = 5'd7;   // Run compute engine
-    localparam S_WAIT_COMP    = 5'd8;
-    localparam S_STORE_OUT    = 5'd9;   // DMA: store output
-    localparam S_WAIT_STORE   = 5'd10;
-    localparam S_DONE         = 5'd11;
-    localparam S_ERROR        = 5'd12;
-    localparam S_LOAD_ADD_B   = 5'd13;  // DMA: load Add Branch B
-    localparam S_WAIT_ADD_B   = 5'd14;
-    localparam S_WAIT_PREFETCH= 5'd15;  // DB_EN: wait for prefetch DMA to complete
+    localparam S_IDLE         = 6'd0;
+    localparam S_LOAD_WGT     = 6'd1;   // DMA: load weights
+    localparam S_WAIT_WGT     = 6'd2;
+    localparam S_LOAD_ACT     = 6'd3;   // DMA: load activations
+    localparam S_WAIT_ACT     = 6'd4;
+    localparam S_LOAD_PARAM   = 6'd5;   // DMA: load PPU parameters
+    localparam S_WAIT_PARAM   = 6'd6;
+    localparam S_COMPUTE      = 6'd7;   // Run compute engine
+    localparam S_WAIT_COMP    = 6'd8;
+    localparam S_STORE_OUT    = 6'd9;   // DMA: store output
+    localparam S_WAIT_STORE   = 6'd10;
+    localparam S_DONE         = 6'd11;
+    localparam S_ERROR        = 6'd12;
+    localparam S_LOAD_ADD_B   = 6'd13;  // DMA: load Add Branch B
+    localparam S_WAIT_ADD_B   = 6'd14;
+    localparam S_WAIT_PREFETCH= 6'd15;  // DB_EN: wait for prefetch DMA to complete
+    localparam S_TILE_STORE   = 6'd16;  // Per-tile store: fire 2D DMA store for current tile
+    localparam S_TILE_STORE_WAIT = 6'd17; // Per-tile store: wait for DMA done
 
-    reg [4:0] state;
+    reg [5:0] state;
     reg       aborted;  // Latched abort flag — prevents auto-restart in S_DONE
 
     // Per-channel param size: 4 words (16 bytes) per channel
@@ -121,6 +139,7 @@ module npu_ctrl (
 
     // ─── Double-buffer control ───
     wire db_en = cfg_dma_ctrl[0];
+    wire per_tile_store_en = cfg_dma_store_mode[0];  // Per-tile store to NHWC DDR layout
 
     reg        prefetch_active;     // Prefetch DMA is in flight
     reg        prefetch_pending;    // Flag flip pending after prefetch completes
@@ -129,6 +148,24 @@ module npu_ctrl (
     reg [15:0] next_sram_offset;    // SRAM offset for prefetch target bank
     reg        add_b_reload;        // 1=Add B reload after compute_done (→ S_STORE_OUT)
     reg        store_bank;          // Bank to store from (final tile's ping_pong)
+
+    // ─── Per-tile store tile sequencing ───
+    // Track tile (y,x) position for NHWC DDR offset computation
+    reg [15:0] tile_y_seq, tile_x_seq;  // Current tile indices
+    // Computed NHWC output row stride (bytes) = out_w * out_c * elem_bytes
+    wire [31:0] nhwc_row_stride = {16'd0, cfg_out_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
+    // Per-tile output words (total) = tile_out_size / 4
+    wire [15:0] tile_out_words = cfg_dma_tile_out_size[17:2];
+    // Per-tile row length (words) = actual_tile_w * out_c * eb / 4
+    // Uses actual (border-clipped) tile width from compute for correct border tile store
+    wire [15:0] tile_row_len = (tile_out_w_actual != 0) ?
+        (({16'd0, tile_out_w_actual} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1)) >> 2) : tile_out_words;
+    // Per-tile row count = actual tile height (clipped at border)
+    wire [15:0] tile_row_count = (tile_out_h_actual != 0) ? tile_out_h_actual : cfg_tile_h;
+    // DDR offset for current tile = (tile_y*tile_h*out_w + tile_x*tile_w) * out_c * eb
+    wire [31:0] tile_ddr_offset = ({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {16'd0, cfg_out_w}
+                                   + {16'd0, tile_x_seq} * {16'd0, cfg_tile_w})
+                                  * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -153,7 +190,11 @@ module npu_ctrl (
             cur_tile_ddr_offset <= 32'd0;
             add_b_reload <= 1'b0;
             next_sram_offset <= 16'd0;
-        end else if (ctrl_soft_rst) begin
+            tile_y_seq <= 16'd0;
+            tile_x_seq <= 16'd0;
+            dma_row_len <= 16'd0;
+            dma_row_count <= 16'd0;
+            dma_out_stride <= 32'd0;
             state            <= S_IDLE;
             hw_busy          <= 1'b0;
             hw_done          <= 1'b0;
@@ -172,6 +213,11 @@ module npu_ctrl (
             hw_error      <= 1'b0;
             dma_start     <= 1'b0;
             compute_start <= 1'b0;
+            // Default: 1D DMA mode (2D only active in S_TILE_STORE)
+            dma_row_len   <= 16'd0;
+            dma_row_count <= 16'd0;
+            // Default out_stride from CSR (used in 1D S_STORE_OUT; overridden in S_TILE_STORE)
+            dma_out_stride <= cfg_dma_out_stride;
 
             // Latch abort while busy (prevents auto-restart in S_DONE)
             if (ctrl_abort && hw_busy)
@@ -182,6 +228,9 @@ module npu_ctrl (
                     if (ctrl_start) begin
                         hw_busy  <= 1'b1;
                         state    <= S_LOAD_WGT;
+                        // Reset per-tile store sequencing
+                        tile_y_seq <= 16'd0;
+                        tile_x_seq <= 16'd0;
                     end
                 end
 
@@ -300,59 +349,123 @@ module npu_ctrl (
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else begin
-                        // ─── Prefetch trigger: fire DMA on tile_done ───
-                        // skip_act_load: no prefetch needed (fused MID/END)
+                        // ─── tile_done: non-final tile boundary ───
+                        // Per-tile store path: store current tile output to DDR (NHWC) first,
+                        // then prefetch next tile input.
+                        // Non-per-tile path (last-tile-only store): prefetch directly.
                         if (db_en && tile_done && !prefetch_active && !skip_act_load) begin
-                            dma_start      <= 1'b1;
-                            dma_dir        <= 1'b0;  // load
-                            dma_ext_addr   <= next_tile_ddr_addr;
-                            dma_sram_addr  <= next_sram_offset;
-                            dma_xfer_len   <= tile_in_words;
-                            prefetch_active  <= 1'b1;
-                            prefetch_pending <= 1'b1;
-                            db_prefetch_done <= 1'b0;  // Block compute until prefetch done
-                            // Track current tile's DDR offset (for Add B reload)
-                            cur_tile_ddr_offset <= next_tile_ddr_addr - cfg_dma_in_addr;
-                            // Advance DDR address for the tile after next
-                            next_tile_ddr_addr <= next_tile_ddr_addr
-                                + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
-                            // Toggle target bank: alternate between Bank[0] and Bank[1]
-                            // Each tile is placed at offset 0 within its bank
-                            next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
-                                                16'd0 : cfg_act_bank_offset;
+                            if (per_tile_store_en) begin
+                                // Latch current tile's bank for store
+                                store_bank <= ping_pong_flag;
+                                state <= S_TILE_STORE;
+                            end else begin
+                                // Original path: prefetch next tile directly
+                                dma_start      <= 1'b1;
+                                dma_dir        <= 1'b0;  // load
+                                dma_ext_addr   <= next_tile_ddr_addr;
+                                dma_sram_addr  <= next_sram_offset;
+                                dma_xfer_len   <= tile_in_words;
+                                prefetch_active  <= 1'b1;
+                                prefetch_pending <= 1'b1;
+                                db_prefetch_done <= 1'b0;
+                                cur_tile_ddr_offset <= next_tile_ddr_addr - cfg_dma_in_addr;
+                                next_tile_ddr_addr <= next_tile_ddr_addr
+                                    + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                                next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
+                                                    16'd0 : cfg_act_bank_offset;
+                            end
                         end
 
                         // ─── Prefetch DMA completion: flip ping_pong_flag ───
-                        // ping_pong flips on dma_done so compute reads the newly
-                        // prefetched bank on the next tile.
                         if (dma_done && prefetch_active) begin
                             prefetch_active  <= 1'b0;
                             if (prefetch_pending) begin
                                 ping_pong_flag  <= ~ping_pong_flag;
                                 prefetch_pending <= 1'b0;
                             end
-                            // For Add layers: prefetch input_b before unblocking compute
                             if (cfg_dma_add_b_addr != 0) begin
                                 add_b_reload <= 1'b1;
                                 state <= S_LOAD_ADD_B;
                             end else begin
-                                db_prefetch_done <= 1'b1;  // Unblock compute for next tile
+                                db_prefetch_done <= 1'b1;
                             end
                         end
 
-                        // ─── Compute done ───
+                        // ─── Compute done (final tile) ───
                         if (compute_done) begin
-                            store_bank <= ping_pong_flag;  // Latch final tile's bank
+                            store_bank <= ping_pong_flag;
                             if (db_en && prefetch_active) begin
-                                // Prefetch still in flight — wait for it
                                 state <= S_WAIT_PREFETCH;
                             end else begin
                                 if (skip_store)
+                                    state <= S_DONE;
+                                else if (per_tile_store_en)
+                                    // Last tile already stored by per-tile path;
+                                    // skip final S_STORE_OUT
                                     state <= S_DONE;
                                 else
                                     state <= S_STORE_OUT;
                             end
                         end
+                    end
+                end
+
+                // ─── Per-tile store: fire 2D DMA to store current tile to NHWC DDR ───
+                S_TILE_STORE: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else begin
+                        // 2D DMA store: current tile output → DDR at NHWC offset
+                        dma_start     <= 1'b1;
+                        dma_dir       <= 1'b1;  // store
+                        dma_ext_addr  <= cfg_dma_out_addr + tile_ddr_offset;
+                        // Source SRAM: output region in current bank
+                        if (cfg_dma_add_b_addr != 0)
+                            dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
+                        else
+                            dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
+                        dma_xfer_len  <= tile_out_words;
+                        // 2D parameters: row_len words/row, row_count rows, row_stride bytes
+                        dma_row_len    <= tile_row_len;
+                        dma_row_count  <= tile_row_count;
+                        dma_out_stride <= nhwc_row_stride;
+                        state          <= S_TILE_STORE_WAIT;
+                    end
+                end
+
+                S_TILE_STORE_WAIT: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else if (dma_done) begin
+                        // Clear 2D mode (revert to 1D for prefetch)
+                        dma_row_len   <= 16'd0;
+                        dma_row_count <= 16'd0;
+                        // Advance tile sequence indices (row-major: x first, then y)
+                        if (tile_x_seq + 1 >= cfg_tile_num_w) begin
+                            tile_x_seq <= 16'd0;
+                            tile_y_seq <= tile_y_seq + 1;
+                        end else begin
+                            tile_x_seq <= tile_x_seq + 1;
+                        end
+                        // Now fire prefetch for next tile (same as original tile_done path)
+                        if (!skip_act_load) begin
+                            dma_start      <= 1'b1;
+                            dma_dir        <= 1'b0;
+                            dma_ext_addr   <= next_tile_ddr_addr;
+                            dma_sram_addr  <= next_sram_offset;
+                            dma_xfer_len   <= tile_in_words;
+                            prefetch_active  <= 1'b1;
+                            prefetch_pending <= 1'b1;
+                            db_prefetch_done <= 1'b0;
+                            cur_tile_ddr_offset <= next_tile_ddr_addr - cfg_dma_in_addr;
+                            next_tile_ddr_addr <= next_tile_ddr_addr
+                                + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                            next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
+                                                16'd0 : cfg_act_bank_offset;
+                        end else begin
+                            db_prefetch_done <= 1'b1;
+                        end
+                        state <= S_WAIT_COMP;
                     end
                 end
 
@@ -389,6 +502,9 @@ module npu_ctrl (
                             dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
                         // For DB_EN Add: use tile_in_words (same as output size per tile)
                         dma_xfer_len  <= (db_en && cfg_dma_add_b_addr != 0) ? tile_in_words : out_words;
+                        // 1D mode for final store (clear any 2D params)
+                        dma_row_len   <= 16'd0;
+                        dma_row_count <= 16'd0;
                         state         <= S_WAIT_STORE;
                     end else begin
                         state <= S_DONE;
