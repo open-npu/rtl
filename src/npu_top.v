@@ -70,6 +70,10 @@ module npu_top #(
     wire        ping_pong_flag;
     wire        tile_done;
     wire        db_prefetch_done;
+    wire [15:0] tile_out_h_actual, tile_out_w_actual;  // Border-clipped tile dims
+    wire [15:0] dma_row_len;
+    wire [15:0] dma_row_count;
+    wire [31:0] dma_out_stride;
     wire        db_en_is_active = reg_dma_ctrl[0] && hw_busy;
 
     // --- CSR Layer Config outputs ---
@@ -88,6 +92,9 @@ module npu_top #(
     wire [31:0] reg_dma_in_size, reg_dma_wgt_size;
     wire [31:0] reg_dma_out_size;
     wire [31:0] reg_dma_tile_in_size;
+    wire [31:0] reg_dma_tile_out_size;
+    wire [31:0] reg_dma_store_mode;
+    wire [31:0] reg_dma_row_cfg;
     wire [31:0] reg_tile_in_hw;
 
     // --- CSR Post-Processing Config outputs ---
@@ -198,6 +205,9 @@ module npu_top #(
         .reg_dma_wgt_size   (reg_dma_wgt_size),
         .reg_dma_out_size   (reg_dma_out_size),
         .reg_dma_tile_in_size(reg_dma_tile_in_size),
+        .reg_dma_tile_out_size(reg_dma_tile_out_size),
+        .reg_dma_store_mode (reg_dma_store_mode),
+        .reg_dma_row_cfg    (reg_dma_row_cfg),
         .reg_tile_in_hw      (reg_tile_in_hw),
         // Post-processing config
         .reg_post_ctrl          (reg_post_ctrl),
@@ -253,6 +263,21 @@ module npu_top #(
         .cfg_layer_mode     (reg_layer_mode),
         .cfg_out_base       ({3'd0, reg_sram_base[ACT_ADDR_W+16-1:16]}),
         .cfg_dma_add_b_addr (reg_dma_add_b_addr),
+        // Per-tile store (2D DMA for NHWC)
+        .cfg_dma_store_mode    (reg_dma_store_mode),
+        .cfg_dma_tile_out_size (reg_dma_tile_out_size),
+        .cfg_out_w             (reg_out_dim_hw[15:0]),
+        .cfg_out_c             (reg_out_dim_c[15:0]),
+        .cfg_tile_h            (reg_tile_cfg[15:0]),
+        .cfg_tile_w            (reg_tile_cfg[31:16]),
+        .cfg_tile_num_h        (reg_tile_count[15:0]),
+        .cfg_tile_num_w        (reg_tile_count[31:16]),
+        .cfg_int16             (reg_post_ctrl[7]),
+        .tile_out_h_actual     (tile_out_h_actual),
+        .tile_out_w_actual     (tile_out_w_actual),
+        .dma_row_len           (dma_row_len),
+        .dma_row_count         (dma_row_count),
+        .dma_out_stride        (dma_out_stride),
         // Double-Buffer
         .ping_pong_flag     (ping_pong_flag),
         .db_prefetch_done   (db_prefetch_done),
@@ -283,7 +308,9 @@ module npu_top #(
         .xfer_len       (dma_xfer_len),
         .burst_cfg      (reg_dma_ctrl[5:4]),
         .cfg_in_stride  (reg_dma_in_stride),
-        .cfg_out_stride (reg_dma_out_stride),
+        .cfg_out_stride (dma_out_stride),
+        .cfg_row_len    (dma_row_len),
+        .cfg_row_count  (dma_row_count),
         // Status
         .busy           (dma_busy),
         .done_pulse     (dma_done),
@@ -673,7 +700,9 @@ module npu_top #(
         .ppu_out_valid  (ppu_out_valid),
         // DB_EN
         .tile_done          (tile_done),
-        .db_prefetch_done   (db_prefetch_done)
+        .db_prefetch_done   (db_prefetch_done),
+        .tile_out_h_actual  (tile_out_h_actual),
+        .tile_out_w_actual  (tile_out_w_actual)
     );
 
     // ─── SRAM Port B connections (compute engine) ───

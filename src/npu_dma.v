@@ -12,14 +12,22 @@
 //   - Direction: MEM→SRAM (load) or SRAM→MEM (store)
 //   - Busy/done status signals
 //   - Abort capability
+//   - 2D transfer mode (row_len × row_count with row_stride) for NHWC tiled access
 //
 // The DMA operates on 32-bit words. For byte-level transfers,
 // the controller module handles packing/unpacking.
 //
 // Stride behavior:
-//   in_stride (load path):  external address advances by in_stride bytes per word
-//   out_stride (store path): external address advances by out_stride bytes per word
-//   If stride == 0, defaults to 4 (word-aligned linear access).
+//   1D mode (row_len==0 or row_count==0):
+//     in_stride/out_stride: external address advances by stride bytes per word
+//     If stride == 0, defaults to 4 (word-aligned linear access).
+//   2D mode (row_len!=0 && row_count!=0):
+//     Transfers row_count rows, each row_len words.
+//     Within a row: external address advances by stride (or 4) per word.
+//     Between rows: external address jumps by row_stride (= stride, reinterpreted).
+//     SRAM side is always contiguous (r_sram_addr++ every word).
+//     For NHWC: row_len = tile_w * out_c * eb / 4, row_stride = out_w * out_c * eb.
+//     Set stride = row_stride (bytes between rows), row_len = words per row.
 
 `include "npu_defines.vh"
 
@@ -41,6 +49,8 @@ module npu_dma #(
     input  wire [1:0]          burst_cfg,      // Burst: 0=4, 1=8, 2=16, 3=32
     input  wire [31:0]         cfg_in_stride,  // External address stride for load (bytes)
     input  wire [31:0]         cfg_out_stride, // External address stride for store (bytes)
+    input  wire [15:0]         cfg_row_len,    // 2D: words per row (0 = 1D mode)
+    input  wire [15:0]         cfg_row_count,  // 2D: number of rows (0 = 1D mode)
 
     // ─── Status Outputs ───
     output reg                  busy,
@@ -82,7 +92,19 @@ module npu_dma #(
     reg [15:0]            r_xfer_len;
     reg                   r_dir;
     reg [DATA_W-1:0]      r_data_buf;  // temporary data buffer
-    reg [ADDR_W-1:0]      r_stride;    // latched stride value for current direction
+    reg [ADDR_W-1:0]      r_stride;    // latched stride value (row stride in 2D, per-word in 1D)
+    // 2D mode: r_row_len = words per row, r_row_count = rows remaining
+    // r_row_word_count = words transferred in current row
+    // r_row_base = external address of current row start
+    // When r_row_len==0 or r_row_count==0, behaves as 1D (backward compatible)
+    // In 2D: within row, ext_addr advances by 4 (contiguous). At row end,
+    //   ext_addr = r_row_base + r_stride (jump to next row in NHWC layout).
+    //   SRAM is always contiguous (r_sram_addr++ every word).
+    reg [15:0]            r_row_len;
+    reg [15:0]            r_row_count;
+    reg [15:0]            r_row_word_count;
+    reg [ADDR_W-1:0]      r_row_base;
+    wire                  mode_2d = (r_row_len != 16'd0) && (r_row_count != 16'd0);
 
     // Burst length decode (not used for now — single-beat transfers)
     // wire [5:0] burst_len = (burst_cfg == 2'd0) ? 6'd4 :
@@ -110,6 +132,10 @@ module npu_dma #(
             r_dir      <= 1'b0;
             r_data_buf <= {DATA_W{1'b0}};
             r_stride   <= {ADDR_W{1'b0}};
+            r_row_len  <= 16'd0;
+            r_row_count<= 16'd0;
+            r_row_word_count <= 16'd0;
+            r_row_base <= {ADDR_W{1'b0}};
         end else begin
             done_pulse <= 1'b0;  // default: clear pulse
             sram_en    <= 1'b0;  // default: SRAM idle
@@ -125,6 +151,11 @@ module npu_dma #(
                         r_dir      <= dir;
                         // Latch stride for this transfer direction
                         r_stride   <= dir ? cfg_out_stride : cfg_in_stride;
+                        // 2D mode parameters (latched at start)
+                        r_row_len  <= cfg_row_len;
+                        r_row_count<= cfg_row_count;
+                        r_row_word_count <= 16'd0;
+                        r_row_base <= ext_addr;
                         xfer_count <= 16'd0;
                         if (!dir)
                             state <= S_LOAD;
@@ -160,11 +191,25 @@ module npu_dma #(
                     sram_we     <= 1'b1;
                     sram_addr_o <= r_sram_addr;
                     sram_wdata  <= r_data_buf;
-                    // Advance pointers
-                    //   external: advance by stride (or 4 if stride==0 for linear)
-                    r_ext_addr  <= r_ext_addr + (r_stride != 0 ? r_stride : 32'd4);
+                    // Advance SRAM pointer (always contiguous)
                     r_sram_addr <= r_sram_addr + 1;
                     xfer_count  <= xfer_count + 1;
+                    r_row_word_count <= r_row_word_count + 1;
+                    // Advance external address
+                    if (mode_2d && (r_row_word_count + 1 >= r_row_len)) begin
+                        // End of 2D row: jump to next row in NHWC layout
+                        // r_stride = row stride (bytes between row starts)
+                        r_ext_addr <= r_row_base + r_stride;
+                        r_row_base <= r_row_base + r_stride;
+                        r_row_count <= r_row_count - 1;
+                        r_row_word_count <= 16'd0;
+                    end else if (mode_2d) begin
+                        // Within 2D row: contiguous (4 bytes per word)
+                        r_ext_addr  <= r_ext_addr + 32'd4;
+                    end else begin
+                        // 1D mode: advance by stride (or 4 if stride==0)
+                        r_ext_addr  <= r_ext_addr + (r_stride != 0 ? r_stride : 32'd4);
+                    end
                     if (xfer_count + 1 >= r_xfer_len)
                         state <= S_DONE;
                     else
@@ -199,11 +244,24 @@ module npu_dma #(
                         if (wb_ack_i) begin
                             wb_cyc_o    <= 1'b0;
                             wb_stb_o    <= 1'b0;
-                            // Advance pointers
-                            //   external: advance by stride (or 4 if stride==0 for linear)
-                            r_ext_addr  <= r_ext_addr + (r_stride != 0 ? r_stride : 32'd4);
+                            // Advance SRAM pointer (always contiguous)
                             r_sram_addr <= r_sram_addr + 1;
                             xfer_count  <= xfer_count + 1;
+                            r_row_word_count <= r_row_word_count + 1;
+                            // Advance external address
+                            if (mode_2d && (r_row_word_count + 1 >= r_row_len)) begin
+                                // End of 2D row: jump to next row in NHWC layout
+                                r_ext_addr <= r_row_base + r_stride;
+                                r_row_base <= r_row_base + r_stride;
+                                r_row_count <= r_row_count - 1;
+                                r_row_word_count <= 16'd0;
+                            end else if (mode_2d) begin
+                                // Within 2D row: contiguous (4 bytes per word)
+                                r_ext_addr  <= r_ext_addr + 32'd4;
+                            end else begin
+                                // 1D mode: advance by stride (or 4 if stride==0)
+                                r_ext_addr  <= r_ext_addr + (r_stride != 0 ? r_stride : 32'd4);
+                            end
                             if (xfer_count + 1 >= r_xfer_len)
                                 state <= S_DONE;
                             else

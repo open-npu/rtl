@@ -93,6 +93,9 @@ module npu_csr #(
     output wire [DATA_W-1:0]   reg_dma_wgt_size,
     output wire [DATA_W-1:0]   reg_dma_out_size,
     output wire [DATA_W-1:0]   reg_dma_tile_in_size,
+    output wire [DATA_W-1:0]   reg_dma_tile_out_size,
+    output wire [DATA_W-1:0]   reg_dma_store_mode,
+    output wire [DATA_W-1:0]   reg_dma_row_cfg,
     output wire [DATA_W-1:0]   reg_tile_in_hw,
 
     // ─── Post-Processing Config Outputs ───
@@ -148,6 +151,9 @@ module npu_csr #(
     reg [DATA_W-1:0] r_dma_wgt_size;  // 0x12C
     reg [DATA_W-1:0] r_dma_out_size;  // 0x130
     reg [DATA_W-1:0] r_dma_tile_in_size; // 0x134 — per-tile input size (bytes), for DB_EN tiled layers
+    reg [DATA_W-1:0] r_dma_tile_out_size; // 0x138 — per-tile output size (bytes), for per-tile store
+    reg [DATA_W-1:0] r_dma_store_mode;  // 0x140 — bit[0]=PER_TILE_STORE_EN
+    reg [DATA_W-1:0] r_dma_row_cfg;     // 0x144 — [31:16]=row_count, [15:0]=row_len (2D DMA)
 
     // ─── Group 3: Post-Processing Configuration ───
     reg [DATA_W-1:0] r_post_ctrl;     // 0x180
@@ -244,6 +250,9 @@ module npu_csr #(
     assign reg_dma_wgt_size     = r_dma_wgt_size;
     assign reg_dma_out_size     = r_dma_out_size;
     assign reg_dma_tile_in_size = r_dma_tile_in_size;
+    assign reg_dma_tile_out_size = r_dma_tile_out_size;
+    assign reg_dma_store_mode   = r_dma_store_mode;
+    assign reg_dma_row_cfg      = r_dma_row_cfg;
     assign reg_tile_in_hw       = r_tile_in_hw;
     assign reg_post_ctrl        = r_post_ctrl;
     assign reg_post_param_addr  = r_dma_param_addr; // dual-mapped
@@ -298,6 +307,9 @@ module npu_csr #(
             r_dma_wgt_size  <= 32'd0;
             r_dma_out_size  <= 32'd0;
             r_dma_tile_in_size <= 32'd0;
+            r_dma_tile_out_size<= 32'd0;
+            r_dma_store_mode   <= 32'd0;
+            r_dma_row_cfg      <= 32'd0;
             r_tile_in_hw       <= 32'd0;
             r_post_ctrl     <= 32'd0;
             r_post_param_count <= 32'd0;
@@ -361,6 +373,9 @@ module npu_csr #(
                         12'h12C: r_dma_wgt_size  <= wb_dat_i;
                         12'h130: r_dma_out_size  <= wb_dat_i;
                         12'h134: r_dma_tile_in_size <= wb_dat_i;
+                        12'h138: r_dma_tile_out_size<= wb_dat_i;
+                        12'h140: r_dma_store_mode   <= wb_dat_i;
+                        12'h144: r_dma_row_cfg      <= wb_dat_i;
                         12'h13C: r_tile_in_hw       <= wb_dat_i;
 
                         // Group 3: Post-Processing Configuration
@@ -429,6 +444,9 @@ module npu_csr #(
                         12'h12C: wb_dat_o <= r_dma_wgt_size;
                         12'h130: wb_dat_o <= r_dma_out_size;
                         12'h134: wb_dat_o <= r_dma_tile_in_size;
+                        12'h138: wb_dat_o <= r_dma_tile_out_size;
+                        12'h140: wb_dat_o <= r_dma_store_mode;
+                        12'h144: wb_dat_o <= r_dma_row_cfg;
                         12'h13C: wb_dat_o <= r_tile_in_hw;
 
                         // Group 3: Post-Processing Configuration
