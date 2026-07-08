@@ -155,8 +155,10 @@ module npu_ctrl (
     reg [15:0] tile_y_seq, tile_x_seq;  // Current tile indices
     // Computed NHWC output row stride (bytes) = out_w * out_c * elem_bytes
     wire [31:0] nhwc_row_stride = {16'd0, cfg_out_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
-    // Per-tile output words (total) = tile_out_size / 4
-    wire [15:0] tile_out_words = cfg_dma_tile_out_size[17:2];
+    // Per-tile output words (total) — use clipped row_len * row_count for
+    // correct border tile DMA transfer length (avoid over-writing adjacent tiles)
+    wire [15:0] tile_out_words_padded = cfg_dma_tile_out_size[17:2];
+    wire [15:0] tile_out_words = tile_row_len * tile_row_count;
     // Per-tile row length (words) = actual_tile_w * out_c * eb / 4
     // Uses actual (border-clipped) tile width from compute for correct border tile store
     wire [15:0] tile_row_len = (tile_out_w_actual != 0) ?
@@ -440,18 +442,10 @@ module npu_ctrl (
                             dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
                         dma_xfer_len  <= tile_out_words;
                         // 2D parameters: row_len words/row, row_count rows, row_stride bytes
-                        // Add layers use fixed (padded) tile size in SRAM (not clipped),
-                        // so use cfg_tile_h/w directly (not tile_out_h/w_actual).
-                        if (cfg_dma_add_b_addr != 0) begin
-                            dma_row_len    <= (cfg_tile_w != 0) ?
-                                (({16'd0, cfg_tile_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1)) >> 2) : tile_out_words;
-                            dma_row_count  <= cfg_tile_h;
-                            dma_out_stride <= nhwc_row_stride;
-                        end else begin
-                            dma_row_len    <= tile_row_len;
-                            dma_row_count  <= tile_row_count;
-                            dma_out_stride <= nhwc_row_stride;
-                        end
+                        // All layers use tile_out_h/w_actual (border-clipped from compute)
+                        dma_row_len    <= tile_row_len;
+                        dma_row_count  <= tile_row_count;
+                        dma_out_stride <= nhwc_row_stride;
                         `ifndef SYNTHESIS
                         $display("[PTS_STORE] t=%0t ty=%0d tx=%0d ddr=0x%08x sram=%0d len=%0d row_len=%0d row_cnt=%0d stride=%0d bank=%0d",
                                  $time, tile_y_seq, tile_x_seq,

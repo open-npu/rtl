@@ -105,9 +105,13 @@ class WbMasterMem:
                     continue
                 if self.dut.wb_mst_we_o.value:
                     try:
-                        self.mem[addr] = int(self.dut.wb_mst_dat_o.value)
+                        wdata = int(self.dut.wb_mst_dat_o.value)
                     except ValueError:
-                        self.mem[addr] = 0
+                        wdata = 0
+                    self.mem[addr] = wdata
+                    if addr == 0x3015F700:
+                        print(f"[WBMEM_WR] cyc={self._cyc} addr=0x{addr:08X} data=0x{wdata:08X}")
+                    self._cyc = getattr(self, '_cyc', 0) + 1
                 else:
                     self.dut.wb_mst_dat_i.value = self.mem.get(addr, 0)
                 self.dut.wb_mst_ack_i.value = 1
