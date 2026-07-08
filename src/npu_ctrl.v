@@ -440,9 +440,18 @@ module npu_ctrl (
                             dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
                         dma_xfer_len  <= tile_out_words;
                         // 2D parameters: row_len words/row, row_count rows, row_stride bytes
-                        dma_row_len    <= tile_row_len;
-                        dma_row_count  <= tile_row_count;
-                        dma_out_stride <= nhwc_row_stride;
+                        // Add layers use fixed (padded) tile size in SRAM (not clipped),
+                        // so use cfg_tile_h/w directly (not tile_out_h/w_actual).
+                        if (cfg_dma_add_b_addr != 0) begin
+                            dma_row_len    <= (cfg_tile_w != 0) ?
+                                (({16'd0, cfg_tile_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1)) >> 2) : tile_out_words;
+                            dma_row_count  <= cfg_tile_h;
+                            dma_out_stride <= nhwc_row_stride;
+                        end else begin
+                            dma_row_len    <= tile_row_len;
+                            dma_row_count  <= tile_row_count;
+                            dma_out_stride <= nhwc_row_stride;
+                        end
                         `ifndef SYNTHESIS
                         $display("[PTS_STORE] t=%0t ty=%0d tx=%0d ddr=0x%08x sram=%0d len=%0d row_len=%0d row_cnt=%0d stride=%0d bank=%0d",
                                  $time, tile_y_seq, tile_x_seq,
