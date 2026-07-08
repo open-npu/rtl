@@ -256,7 +256,7 @@ module npu_dma #(
                         wb_we_o  <= 1'b1;
                         wb_adr_o <= r_ext_addr;
                         `ifndef SYNTHESIS
-                        if (mode_2d && (xfer_count < 2 || r_row_word_count == 16'd0 || r_row_word_count == 16'd1))
+                        if (mode_2d && (xfer_count < 8 || r_row_word_count == 16'd0 || r_row_word_count == 16'd1))
                             $display("[DMA_2D_WR] t=%0t xfer=%0d addr=0x%08x sram=%0d data=0x%08x row_word=%0d/%0d row_cnt=%0d",
                                      $time, xfer_count, r_ext_addr, r_sram_addr, sram_rdata,
                                      r_row_word_count, r_row_len, r_row_count);
