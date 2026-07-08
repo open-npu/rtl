@@ -73,8 +73,9 @@ module npu_ctrl (
     input  wire         cfg_int16,             // 1=INT16 (elem_bytes=2), 0=INT8 (elem_bytes=1)
     input  wire [15:0]  tile_out_h_actual,     // Actual (border-clipped) tile height from compute
     input  wire [15:0]  tile_out_w_actual,     // Actual (border-clipped) tile width from compute
-    output reg  [15:0]  dma_row_len,           // 2D DMA: words per row (0=1D mode)
+    output reg  [15:0]  dma_row_len,           // 2D DMA: words per row written to DDR (0=1D mode)
     output reg  [15:0]  dma_row_count,         // 2D DMA: row count (0=1D mode)
+    output reg  [15:0]  dma_src_row_len,       // 2D DMA: words per row read from SRAM (0=same as row_len)
     output reg  [31:0]  dma_out_stride,        // 2D DMA: row stride (bytes) for store
 
     // ─── Double-Buffer Interface ───
@@ -198,6 +199,7 @@ module npu_ctrl (
             last_tile_store <= 1'b0;
             dma_row_len <= 16'd0;
             dma_row_count <= 16'd0;
+            dma_src_row_len <= 16'd0;
             dma_out_stride <= 32'd0;
             state            <= S_IDLE;
             hw_busy          <= 1'b0;
@@ -441,10 +443,17 @@ module npu_ctrl (
                         else
                             dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
                         dma_xfer_len  <= tile_out_words;
-                        // 2D parameters: all layers use clipped tile dims
+                        // 2D parameters: all layers use clipped tile dims for DDR row_len.
+                        // Add layers: SRAM uses padded tile_w, so src_row_len = padded.
+                        // Conv: src_row_len = 0 (same as row_len, no padding).
                         dma_row_len    <= tile_row_len;
                         dma_row_count  <= tile_row_count;
                         dma_out_stride <= nhwc_row_stride;
+                        if (cfg_dma_add_b_addr != 0 && cfg_tile_w != 0)
+                            dma_src_row_len <= ({16'd0, cfg_tile_w} * {16'd0, cfg_out_c} *
+                                                 (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
+                        else
+                            dma_src_row_len <= 16'd0;  // same as row_len
                         `ifndef SYNTHESIS
                         $display("[PTS_STORE] t=%0t ty=%0d tx=%0d ddr=0x%08x sram=%0d len=%0d row_len=%0d row_cnt=%0d stride=%0d bank=%0d",
                                  $time, tile_y_seq, tile_x_seq,

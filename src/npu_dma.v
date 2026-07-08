@@ -49,8 +49,9 @@ module npu_dma #(
     input  wire [1:0]          burst_cfg,      // Burst: 0=4, 1=8, 2=16, 3=32
     input  wire [31:0]         cfg_in_stride,  // External address stride for load (bytes)
     input  wire [31:0]         cfg_out_stride, // External address stride for store (bytes)
-    input  wire [15:0]         cfg_row_len,    // 2D: words per row (0 = 1D mode)
+    input  wire [15:0]         cfg_row_len,    // 2D: words per row written to DDR (0 = 1D mode)
     input  wire [15:0]         cfg_row_count,  // 2D: number of rows (0 = 1D mode)
+    input  wire [15:0]         cfg_src_row_len,// 2D: words per row read from SRAM (0 = same as row_len)
 
     // ─── Status Outputs ───
     output reg                  busy,
@@ -103,8 +104,12 @@ module npu_dma #(
     reg [15:0]            r_row_len;
     reg [15:0]            r_row_count;
     reg [15:0]            r_row_word_count;
+    reg [15:0]            r_src_row_len;  // SRAM words per row (>= r_row_len; extra = padding skip)
     reg [ADDR_W-1:0]      r_row_base;
     wire                  mode_2d = (r_row_len != 16'd0) && (r_row_count != 16'd0);
+    // In 2D store: words [0..r_row_len-1] written to DDR, words [r_row_len..r_src_row_len-1]
+    //   read from SRAM but skipped (padding). SRAM always r_sram_addr++.
+    wire [15:0]           effective_src_len = (r_src_row_len != 16'd0) ? r_src_row_len : r_row_len;
 
     // Burst length decode (not used for now — single-beat transfers)
     // wire [5:0] burst_len = (burst_cfg == 2'd0) ? 6'd4 :
@@ -135,6 +140,7 @@ module npu_dma #(
             r_row_len  <= 16'd0;
             r_row_count<= 16'd0;
             r_row_word_count <= 16'd0;
+            r_src_row_len <= 16'd0;
             r_row_base <= {ADDR_W{1'b0}};
         end else begin
             done_pulse <= 1'b0;  // default: clear pulse
@@ -154,6 +160,7 @@ module npu_dma #(
                         // 2D mode parameters (latched at start)
                         r_row_len  <= cfg_row_len;
                         r_row_count<= cfg_row_count;
+                        r_src_row_len <= cfg_src_row_len;
                         r_row_word_count <= 16'd0;
                         r_row_base <= ext_addr;
                         xfer_count <= 16'd0;
@@ -264,7 +271,11 @@ module npu_dma #(
                             r_row_word_count <= r_row_word_count + 1;
                             // Advance external address
                             if (mode_2d && (r_row_word_count + 1 >= r_row_len)) begin
-                                // End of 2D row: jump to next row in NHWC layout
+                                // End of DDR row: jump to next row in NHWC layout.
+                                // Skip SRAM padding: advance sram_addr by (src_len - row_len)
+                                // so next row starts at correct SRAM offset.
+                                if (effective_src_len > r_row_len)
+                                    r_sram_addr <= r_sram_addr + 1 + (effective_src_len - r_row_len);
                                 r_ext_addr <= r_row_base + r_stride;
                                 r_row_base <= r_row_base + r_stride;
                                 r_row_count <= r_row_count - 1;
