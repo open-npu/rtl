@@ -551,8 +551,9 @@ module npu_compute #(
                 end
                 `ifndef SYNTHESIS
                 if (cfg_tile_h != 0)
-                    $display("[CMP_TILE] t=%0t tile(%0d,%0d) act_base=%0d out_base=%0d",
-                             $time, tile_y, tile_x, cfg_act_base, cfg_act_base + cfg_out_base);
+                    $display("[CMP_TILE] t=%0t tile(%0d,%0d) act_base=%0d out_base=%0d ow_origin_reg=%0d out_tw=%0d tile_in_w=%0d",
+                             $time, tile_y, tile_x, cfg_act_base, cfg_act_base + cfg_out_base,
+                             tile_ow_origin, out_tile_w, tile_in_w);
                 `endif
                 // Clip tile dimensions to image boundary (after reset + origin)
                 if (cfg_tile_h != 16'd0) begin
@@ -1721,11 +1722,9 @@ module npu_compute #(
                     pool_sh <= {4'd0, pool_cfg_sh};
                     pool_sw <= {4'd0, pool_cfg_sw};
                 end
-                // Set output base (same as S_TILE_SETUP — Pool skips S_TILE_SETUP)
+                // Set output base (same as S_TILE_SETUP — Pool also goes through S_TILE_SETUP
+                // which sets tile_oh/ow_origin and out_tile_h/w, so don't override here)
                 out_base <= cfg_act_base + cfg_out_base;
-                // Set tile origin and dims (non-tiled: full output)
-                tile_oh_origin <= 16'd0;
-                tile_ow_origin <= 16'd0;
                 pool_ch <= 0;
                 param_word_idx <= 0;
                 param_read_issued <= 1'b0;
@@ -1782,6 +1781,12 @@ module npu_compute #(
                          - $signed({1'b0, cfg_pad_left[7:0]}) + $signed({1'b0, pool_fw});
                     is_oob = (ih_s < 0) || (ih_s >= $signed({1'b0, cfg_in_h}))
                           || (iw_s < 0) || (iw_s >= $signed({1'b0, cfg_in_w}));
+                    `ifndef SYNTHESIS
+                    if (pool_ch == 9 && pool_oh == 0 && pool_ow == 2 && tile_y == 0 && tile_x == 5)
+                        $display("[POOL_DBG] t=%0t ch=%0d oh=%0d ow=%0d fh=%0d fw=%0d ih=%0d iw=%0d oob=%0d tile_in_w=%0d",
+                                 $time, pool_ch, pool_oh, pool_ow, pool_fh, pool_fw,
+                                 ih_s, iw_s, is_oob, tile_in_w);
+                    `endif
 `ifdef DBG_DOTBUF
                     if (pool_ch == 33 && pool_oh == 0 && pool_ow == 0 && tile_y == 0 && tile_x == 0)
                         $fwrite(dbg_fh, "[POOL_RD] t=%0d fh=%0d fw=%0d ih=%0d iw=%0d oob=%0d rd_ph=%0d\n",
