@@ -1143,6 +1143,20 @@ module npu_compute #(
                                            + oc_group * ARRAY_SIZE_16
                                            + ({12'd0, drain_col} & ~16'd1)) >> 1),
                                          ppu_out_data, wb_pack[15:0]);
+                            if (tile_x == 3 && tile_y == 0 && sp_oh == 0 && sp_ow == 0)
+                                $display("[CMP_WB_BORDER] t=%0t drain=%0d col_last=%0d out_tw=%0d addr=%0d data=0x%04x%04x",
+                                         $time, drain_col, col_last, out_tile_w,
+                                         out_base + (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
+                                           + oc_group * ARRAY_SIZE_16
+                                           + ({12'd0, drain_col} & ~16'd1)) >> 1),
+                                         ppu_out_data, wb_pack[15:0]);
+                            if (tile_x == 0 && tile_y == 1 && sp_oh == 0 && sp_ow == 0)
+                                $display("[CMP_WB_ROW2] t=%0t drain=%0d col_last=%0d out_th=%0d out_tw=%0d addr=%0d data=0x%04x%04x",
+                                         $time, drain_col, col_last, out_tile_h, out_tile_w,
+                                         out_base + (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
+                                           + oc_group * ARRAY_SIZE_16
+                                           + ({12'd0, drain_col} & ~16'd1)) >> 1),
+                                         ppu_out_data, wb_pack[15:0]);
                             `endif
                         end
                     endcase
