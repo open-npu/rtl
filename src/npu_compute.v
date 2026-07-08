@@ -1364,7 +1364,15 @@ module npu_compute #(
                     if (db_prefetch_done) begin
                         tile_wait_delay <= 1'b0;
                         if (cfg_op_type == 8'd4 || cfg_op_type == 8'd7) begin
-                            // Add/Concat: go back to read next element
+                            // Add/Concat: clip tile dims for new tile, then read
+                            if (cfg_tile_h != 16'd0) begin
+                                out_tile_h <= cfg_tile_h;
+                                out_tile_w <= cfg_tile_w;
+                                if (cfg_tile_w > cfg_out_w - tile_x * cfg_tile_w)
+                                    out_tile_w <= cfg_out_w - tile_x * cfg_tile_w;
+                                if (cfg_tile_h > cfg_out_h - tile_y * cfg_tile_h)
+                                    out_tile_h <= cfg_out_h - tile_y * cfg_tile_h;
+                            end
                             add_elem_cnt <= add_elem_cnt + 1;
                             add_rd_phase <= 0;
                             state <= S_ADD_READ_A;
@@ -1997,13 +2005,18 @@ module npu_compute #(
                 add_param_phase <= 0;
                 tile_x <= 0;
                 tile_y <= 0;
-                // Set tile dimensions for actual tile size calculation
+                // Set tile dimensions for actual tile size calculation.
+                // Clip border tiles to image boundary (same as S_TILE_SETUP).
                 if (cfg_tile_h == 16'd0) begin
                     out_tile_h <= cfg_out_h;
                     out_tile_w <= cfg_out_w;
                 end else begin
                     out_tile_h <= cfg_tile_h;
                     out_tile_w <= cfg_tile_w;
+                    if (cfg_tile_w > cfg_out_w - tile_x * cfg_tile_w)
+                        out_tile_w <= cfg_out_w - tile_x * cfg_tile_w;
+                    if (cfg_tile_h > cfg_out_h - tile_y * cfg_tile_h)
+                        out_tile_h <= cfg_out_h - tile_y * cfg_tile_h;
                 end
                 state <= S_ADD_PARAM;
             end
@@ -2194,6 +2207,12 @@ module npu_compute #(
                         act_wr_en   <= 1'b1;
                         act_wr_addr <= add_wb_addr;
                         act_wr_data <= merged;
+                        `ifndef SYNTHESIS
+                        if (tile_x == 0 && tile_y == 0 && add_tile_elem_cnt >= 384 && add_tile_elem_cnt <= 390)
+                            $display("[ADD_WB] t=%0t elem=%0d tile_elem=%0d wb_addr=%0d rd=0x%08x merged=0x%08x byte=0x%04x bytesel=%0d",
+                                     $time, add_elem_cnt, add_tile_elem_cnt, add_wb_addr,
+                                     act_rd_data, merged, add_wb_byte, add_wb_bytesel);
+                        `endif
                         if (add_elem_cnt >= 16'd18816 && add_elem_cnt <= 16'd18820)
                             $display("[WB_DBG] elem=%0d tile(%0d,%0d) wb_addr=%0d cfg_act_base=%0d tile_elem=%0d merged=0x%08x wb_byte=0x%04x",
                                      add_elem_cnt, tile_y, tile_x, add_wb_addr, cfg_act_base, add_tile_elem_cnt, merged, add_wb_byte);

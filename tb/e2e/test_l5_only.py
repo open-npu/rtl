@@ -21,5 +21,14 @@ async def test_l5_only(dut):
     mm=np.where(got!=ref)[0] if len(ref)==nw else np.arange(nw)
     if len(ref)!=nw: dut._log.error(f"FAIL L5: size {len(ref)} vs {nw}")
     elif len(mm)==0: dut._log.info(f"PASS L5: {nw}/{nw}")
-    else: 
+    else:
         dut._log.error(f"FAIL L5: {len(mm)}/{nw} first w[{mm[0]}] exp={ref[mm[0]]:08X} got={got[mm[0]]:08X}")
+        # Check if row0 (w[0..191]) is correct, row1 (w[448..639]) is zero
+        r0_ok = sum(1 for j in range(192) if got[j]==ref[j])
+        r1_nonzero = sum(1 for j in range(448,640) if got[j]!=0)
+        dut._log.error(f"  row0: {r0_ok}/192 match, row1: {r1_nonzero}/192 non-zero")
+        # Show pattern of non-zero in row1
+        nz_pos = [j-448 for j in range(448,640) if got[j]!=0]
+        dut._log.error(f"  row1 non-zero at offsets: {nz_pos[:20]}")
+        for j in [0, 1, 446, 447, 448, 449]:
+            dut._log.error(f"  w[{j}] addr=0x{oa+j*4:08X} mem={mem.mem.get(oa+j*4,0):08X} exp={ref[j]:08X}")
