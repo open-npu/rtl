@@ -533,18 +533,34 @@ module npu_compute #(
                 // Input: always use cfg_act_base; tile offset is folded into
                 // conv_ih_base/conv_iw_base via tile_oh_origin/tile_ow_origin
                 act_base <= cfg_act_base;
-                tile_oh_origin <= tile_y * out_tile_h;
-                tile_ow_origin <= tile_x * out_tile_w;
+                // Reset tile dims to full before clipping.
+                // Without this, border-tile clipping persists into next tile
+                // (e.g., tile(0,3) clips out_tile_w to 4, tile(1,0) inherits 4).
+                // For non-tiled (cfg_tile_h=0): use full output dims.
+                if (cfg_tile_h == 16'd0) begin
+                    out_tile_h <= cfg_out_h;
+                    out_tile_w <= cfg_out_w;
+                    tile_oh_origin <= 16'd0;
+                    tile_ow_origin <= 16'd0;
+                end else begin
+                    out_tile_h <= cfg_tile_h;
+                    out_tile_w <= cfg_tile_w;
+                    // Compute tile origin using FULL tile dims (not clipped)
+                    tile_oh_origin <= tile_y * cfg_tile_h;
+                    tile_ow_origin <= tile_x * cfg_tile_w;
+                end
                 `ifndef SYNTHESIS
                 if (cfg_tile_h != 0)
                     $display("[CMP_TILE] t=%0t tile(%0d,%0d) act_base=%0d out_base=%0d",
                              $time, tile_y, tile_x, cfg_act_base, cfg_act_base + cfg_out_base);
                 `endif
-                // Clip tile dimensions to image boundary
-                if (out_tile_w > cfg_out_w - tile_x * out_tile_w)
-                    out_tile_w <= cfg_out_w - tile_x * out_tile_w;
-                if (out_tile_h > cfg_out_h - tile_y * out_tile_h)
-                    out_tile_h <= cfg_out_h - tile_y * out_tile_h;
+                // Clip tile dimensions to image boundary (after reset + origin)
+                if (cfg_tile_h != 16'd0) begin
+                    if (cfg_tile_w > cfg_out_w - tile_x * cfg_tile_w)
+                        out_tile_w <= cfg_out_w - tile_x * cfg_tile_w;
+                    if (cfg_tile_h > cfg_out_h - tile_y * cfg_tile_h)
+                        out_tile_h <= cfg_out_h - tile_y * cfg_tile_h;
+                end
                 // Compute input tile dimensions (including halo)
                 // tile_in_h/w for activation addressing:
                 //   tiled mode: max DMA stride
@@ -816,7 +832,7 @@ module npu_compute #(
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_word_addr <= {2'd0, act_base} + byte_off[15:2];
 `ifdef DBG_DOTBUF
-                            if (sp_oh == 0 && sp_ow == 0 && k_pass < 2)
+                            if (sp_oh == 0 && sp_ow == 0 && k_pass < 2 && ((tile_x == 0 && tile_y == 0) || (tile_x == 1 && tile_y == 0)))
                                 $fwrite(dbg_fh, "[RTL_CMD] t=%0d tile(%0d,%0d) pass=%0d fh=%0d fw=%0d elem_off=%0d act_addr=%0d\n",
                                         $time, tile_y, tile_x, k_pass, conv_fh, conv_fw, elem_off,
                                         {2'd0, act_base} + byte_off[15:2]);
@@ -851,7 +867,7 @@ module npu_compute #(
                     // Data available
                     act_buf <= act_rd_data;
 `ifdef DBG_DOTBUF
-                    if (sp_oh == 0 && sp_ow == 0 && k_pass < 2)
+                    if (sp_oh == 0 && sp_ow == 0 && k_pass < 2 && ((tile_x == 0 && tile_y == 0) || (tile_x == 1 && tile_y == 0)))
                         $fwrite(dbg_fh, "[RTL_RD] t=%0d tile(%0d,%0d) sp(%0d,%0d) pass=%0d act_addr=%0d act_data=0x%08x\n",
                                 $time, tile_y, tile_x, sp_oh, sp_ow, k_pass, act_word_addr[ACT_ADDR_W-1:0], act_rd_data);
 `endif
@@ -1016,7 +1032,7 @@ module npu_compute #(
                     dot_buf[drain_col] <= dot_buf[drain_col]
                         + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
 `ifdef DBG_DOTBUF
-                    if (drain_col == 0)
+                    if (drain_col == 0 && ((tile_x == 0 && tile_y == 0) || (tile_x == 1 && tile_y == 0)) && sp_oh == 0 && sp_ow == 0)
                         $fwrite(dbg_fh, "[RTL_DB] t=%0d tile(%0d,%0d) sp(%0d,%0d) col=0 pass=%0d kpr=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d\n",
                                 $time, tile_y, tile_x, sp_oh, sp_ow, k_pass, k_pass_remain,
                                 dot_acc, acc_buf[reduce_cnt[COL_W-1:0]],
