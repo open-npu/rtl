@@ -441,8 +441,7 @@ module npu_ctrl (
                         else
                             dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
                         dma_xfer_len  <= tile_out_words;
-                        // 2D parameters: row_len words/row, row_count rows, row_stride bytes
-                        // All layers use tile_out_h/w_actual (border-clipped from compute)
+                        // 2D parameters: all layers use clipped tile dims
                         dma_row_len    <= tile_row_len;
                         dma_row_count  <= tile_row_count;
                         dma_out_stride <= nhwc_row_stride;
