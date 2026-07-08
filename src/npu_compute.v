@@ -1721,6 +1721,11 @@ module npu_compute #(
                     pool_sh <= {4'd0, pool_cfg_sh};
                     pool_sw <= {4'd0, pool_cfg_sw};
                 end
+                // Set output base (same as S_TILE_SETUP — Pool skips S_TILE_SETUP)
+                out_base <= cfg_act_base + cfg_out_base;
+                // Set tile origin and dims (non-tiled: full output)
+                tile_oh_origin <= 16'd0;
+                tile_ow_origin <= 16'd0;
                 pool_ch <= 0;
                 param_word_idx <= 0;
                 param_read_issued <= 1'b0;
