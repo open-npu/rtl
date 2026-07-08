@@ -2227,8 +2227,9 @@ module npu_compute #(
                 reg [31:0] elems_per_tile;
                 act_wr_en <= 1'b0;  // Clear write enable
                 ppu_in_valid <= 1'b0;  // Clear PPU input valid
-                // Use fixed tile size (padded) for consistent DDR layout
-                elems_per_tile = {16'd0, cfg_tile_h} * {16'd0, cfg_tile_w} * {16'd0, cfg_out_c};
+                // Use clipped tile size (out_tile_h/w) for consistent SRAM layout
+                // with DMA 2D store (which uses clipped row_len/row_count).
+                elems_per_tile = {16'd0, out_tile_h} * {16'd0, out_tile_w} * {16'd0, cfg_out_c};
                 if (cfg_tile_h == 16'd0 || elems_per_tile == 0) begin
                     // Non-tiled: original logic
                     if ({16'd0, add_elem_cnt} + 32'd1 >= {16'd0, add_total_elems}) begin
