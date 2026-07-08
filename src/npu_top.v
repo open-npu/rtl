@@ -73,6 +73,7 @@ module npu_top #(
     wire [15:0] tile_out_h_actual, tile_out_w_actual;  // Border-clipped tile dims
     wire [15:0] dma_row_len;
     wire [15:0] dma_row_count;
+    wire [15:0] dma_src_row_len;
     wire [31:0] dma_out_stride;
     wire        db_en_is_active = reg_dma_ctrl[0] && hw_busy;
 
@@ -277,6 +278,7 @@ module npu_top #(
         .tile_out_w_actual     (tile_out_w_actual),
         .dma_row_len           (dma_row_len),
         .dma_row_count         (dma_row_count),
+        .dma_src_row_len       (dma_src_row_len),
         .dma_out_stride        (dma_out_stride),
         // Double-Buffer
         .ping_pong_flag     (ping_pong_flag),
@@ -311,6 +313,7 @@ module npu_top #(
         .cfg_out_stride (dma_out_stride),
         .cfg_row_len    (dma_row_len),
         .cfg_row_count  (dma_row_count),
+        .cfg_src_row_len(dma_src_row_len),
         // Status
         .busy           (dma_busy),
         .done_pulse     (dma_done),
