@@ -20,6 +20,7 @@ TOPLEVEL_LANG ?= verilog
 # ─── Hardware parameters (override to test different configs) ───
 ARRAY_SIZE ?= 16
 SPAD_KB    ?= 192
+ACC_WIDTH  ?= 44     # 40: model_x (C_in≤64); 44: synth_res (C_in≤256, k_depth≤2304); 48: future-proof
 
 # ─── Paths ───
 RTL_DIR    = $(shell pwd)/../src
@@ -79,7 +80,7 @@ endif
 
 # ─── Compile flags ───
 ifeq ($(SIM),verilator)
-COMPILE_ARGS = +incdir+$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) \
+COMPILE_ARGS = +incdir+$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH) \
                -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT
 ifdef DEBUG
 COMPILE_ARGS += +define+DBG_DOTBUF
@@ -91,7 +92,7 @@ ifdef FAST_SIM
 COMPILE_ARGS += +define+SYNTHESIS
 endif
 else
-COMPILE_ARGS = -g2012 -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB)
+COMPILE_ARGS = -g2012 -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH)
 endif
 
 # ─── cocotb config ───
