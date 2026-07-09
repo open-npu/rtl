@@ -87,6 +87,9 @@ endif
 ifdef VCD_TRACE
 COMPILE_ARGS += +define+VCD_TRACE
 endif
+ifdef FAST_SIM
+COMPILE_ARGS += +define+SYNTHESIS
+endif
 else
 COMPILE_ARGS = -g2012 -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB)
 endif
