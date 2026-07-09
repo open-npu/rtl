@@ -668,11 +668,11 @@ module npu_compute #(
                 //   INT8: byte_offset = col * k_depth + k_pass * ARRAY_SIZE, word=byte_off/4
                 //   INT16: byte_offset = (col * k_depth + k_pass * ARRAY_SIZE) * 2, word=byte_off/4
                 begin : wgt_cmd_blk
-                    reg [15:0] elem_off;
-                    reg [15:0] byte_off;
+                    reg [31:0] elem_off;
+                    reg [31:0] byte_off;
                     elem_off = wgt_col_idx * k_depth[15:0] + k_pass * ARRAY_SIZE_16;
                     byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
-                    wgt_word_addr <= wgt_base + byte_off[15:2];
+                    wgt_word_addr <= wgt_base + byte_off[17:2];
                     wgt_bsel <= byte_off[1:0];
                 end
                 state <= S_WGT_LOAD;
@@ -761,12 +761,12 @@ module npu_compute #(
                     wgt_read_issued <= 1'b0;
                     wgt_data_ready  <= 1'b0;
                     begin : wgt_emit_next_blk
-                        reg [15:0] elem_off;
-                        reg [15:0] byte_off;
+                        reg [31:0] elem_off;
+                        reg [31:0] byte_off;
                         elem_off = (wgt_col_idx + 1) * k_depth[15:0]
                                  + k_pass * ARRAY_SIZE_16;
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
-                        wgt_word_addr <= wgt_base + byte_off[15:2];
+                        wgt_word_addr <= wgt_base + byte_off[17:2];
                         wgt_bsel <= byte_off[1:0];
                     end
                     state <= S_WGT_LOAD;
@@ -790,8 +790,8 @@ module npu_compute #(
                     begin : act_addr_blk
                         reg signed [15:0] ih, iw;
                         reg signed [15:0] eh, ew;
-                        reg [15:0] elem_off;
-                        reg [15:0] byte_off;
+                        reg [31:0] elem_off;
+                        reg [31:0] byte_off;
                         if (is_deconv) begin
                             // Deconv: eh = oh + pad - fh, then check modulo
                             eh = conv_ih_base - $signed({8'd0, conv_fh});
@@ -811,7 +811,7 @@ module npu_compute #(
                                 elem_off = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c
                                          + conv_ch_cnt;
                                 byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
-                                act_word_addr <= {2'd0, act_base} + byte_off[15:2];
+                                act_word_addr <= {2'd0, act_base} + byte_off[17:2];
                                 act_byte_sel <= byte_off[1:0];
                             end
                         end else begin
@@ -831,12 +831,12 @@ module npu_compute #(
                                          + {8'd0, conv_ch_cnt};
                             end
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
-                            act_word_addr <= {2'd0, act_base} + byte_off[15:2];
+                            act_word_addr <= {2'd0, act_base} + byte_off[17:2];
 `ifdef DBG_DOTBUF
                             if (sp_oh == 0 && sp_ow == 0 && k_pass < 2 && ((tile_x == 0 && tile_y == 0) || (tile_x == 1 && tile_y == 0)))
                                 $fwrite(dbg_fh, "[RTL_CMD] t=%0d tile(%0d,%0d) pass=%0d fh=%0d fw=%0d elem_off=%0d act_addr=%0d\n",
                                         $time, tile_y, tile_x, k_pass, conv_fh, conv_fw, elem_off,
-                                        {2'd0, act_base} + byte_off[15:2]);
+                                        {2'd0, act_base} + byte_off[17:2]);
 `endif
                             act_byte_sel <= byte_off[1:0];
                         end
@@ -929,8 +929,8 @@ module npu_compute #(
                     begin : next_pos_blk
                         reg signed [15:0] nih, niw;
                         reg signed [15:0] neh, new_;
-                        reg [15:0] elem_off_n;
-                        reg [15:0] byte_off_n;
+                        reg [31:0] elem_off_n;
+                        reg [31:0] byte_off_n;
                         reg [7:0] next_fw, next_fh;
                         if (conv_fw + 1 >= {8'd0, cfg_kernel_w}) begin
                             next_fw = 0;
@@ -956,7 +956,7 @@ module npu_compute #(
                                 deconv_skip <= 1'b0;
                                 elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c;
                                 byte_off_n = cfg_int16 ? (elem_off_n << 1) : elem_off_n;
-                                act_word_addr <= {2'd0, act_base} + byte_off_n[15:2];
+                                act_word_addr <= {2'd0, act_base} + byte_off_n[17:2];
                                 act_byte_sel <= byte_off_n[1:0];
                             end
                         end else begin
@@ -973,7 +973,7 @@ module npu_compute #(
                                            + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw}) * cfg_in_c;
                             end
                             byte_off_n = cfg_int16 ? (elem_off_n << 1) : elem_off_n;
-                            act_word_addr <= {2'd0, act_base} + byte_off_n[15:2];
+                            act_word_addr <= {2'd0, act_base} + byte_off_n[17:2];
                             act_byte_sel <= byte_off_n[1:0];
                         end
                     end
