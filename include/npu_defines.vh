@@ -26,7 +26,9 @@
 
 // ─── Data widths ───
 `define DATA_WIDTH     16     // Data port width (always 16-bit; INT8 sign-extends)
-`define ACC_WIDTH      40     // Accumulator width (supports C_in<=512)
+`ifndef ACC_WIDTH
+`define ACC_WIDTH      40     // Accumulator width (40: C_in≤512; 44: C_in≤256, k_depth≤2304; 48: future-proof)
+`endif
 `define MULT_WIDTH     16     // Multiplier operand width (for M parameter)
 `define BIAS_WIDTH     64     // Per-channel bias width
 `define SHIFT_WIDTH    6      // Shift parameter width

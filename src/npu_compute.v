@@ -159,7 +159,6 @@ module npu_compute #(
         S_DRAIN_CMD   = 6'd10,
         S_DRAIN_WAIT  = 6'd11,
         S_PARAM_LOAD  = 6'd12,
-        S_PPU_FEED    = 6'd13,
         S_PPU_WAIT    = 6'd14,
         S_WRITEBACK   = 6'd15,
         S_OC_NEXT     = 6'd16,
@@ -1033,9 +1032,9 @@ module npu_compute #(
                     dot_buf[drain_col] <= dot_buf[drain_col]
                         + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
 `ifdef DBG_DOTBUF
-                    if (drain_col == 0 && ((tile_x == 0 && tile_y == 0) || (tile_x == 1 && tile_y == 0)) && sp_oh == 0 && sp_ow == 0)
-                        $fwrite(dbg_fh, "[RTL_DB] t=%0d tile(%0d,%0d) sp(%0d,%0d) col=0 pass=%0d kpr=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d\n",
-                                $time, tile_y, tile_x, sp_oh, sp_ow, k_pass, k_pass_remain,
+                    if (drain_col == 0)
+                        $fwrite(dbg_fh, "[RTL_DB] t=%0d tile(%0d,%0d) sp(%0d,%0d) col=%0d pass=%0d kpr=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d\n",
+                                $time, tile_y, tile_x, sp_oh, sp_ow, drain_col, k_pass, k_pass_remain,
                                 dot_acc, acc_buf[reduce_cnt[COL_W-1:0]],
                                 dot_buf[drain_col] + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]]);
 `endif
@@ -1084,7 +1083,6 @@ module npu_compute #(
                         // Use param_rd_data for word 3 (param_buf[3] not yet updated this cycle)
                         ppu_bias       <= $signed({param_rd_data[15:0], param_buf[2],
                                                    param_buf[1][31:16]});
-                        state <= S_PPU_FEED;
                     end else begin
                         param_word_idx <= param_word_idx + 1;
                         param_read_issued <= 1'b0;
@@ -1095,9 +1093,12 @@ module npu_compute #(
             // ══════════════════════════════════════════════════════════════
             // PPU FEED: send ONE dot product (dot_buf[drain_col]) to PPU
             // ══════════════════════════════════════════════════════════════
-            S_PPU_FEED: begin
                 ppu_acc_in   <= dot_buf[drain_col];
                 ppu_in_valid <= 1'b1;
+                `ifndef SYNTHESIS
+                if (drain_col == 0 && sp_oh == 0 && sp_ow == 0)
+                             $time, drain_col, sp_oh, sp_ow, dot_buf[drain_col], k_pass);
+                `endif
 `ifdef DBG_DOTBUF
                 if (drain_col == 9 && ((tile_x == 0 && tile_y == 0) || (tile_x == 3 && tile_y == 6)) && sp_oh == 0 && sp_ow == 0)
                     $fwrite(dbg_fh, "[RTL_PPU] t=%0d drain=%0d acc_in=%0d bias=%0d M=%0d S=%0d zp=%0d\n",
@@ -1111,6 +1112,10 @@ module npu_compute #(
 
             S_PPU_WAIT: begin
                 // Wait for PPU output (4-cycle pipeline)
+                `ifndef SYNTHESIS
+                if (ppu_out_valid && drain_col == 0)
+                             $time, oc_group, drain_col, sp_oh, sp_ow, ppu_acc_in, ppu_out_data, k_pass);
+                `endif
                 if (ppu_out_valid) begin
                     state <= S_WRITEBACK;
                 end
@@ -1276,6 +1281,10 @@ module npu_compute #(
                     for (i = 0; i < ARRAY_SIZE; i = i + 1)
                         dot_buf[i] <= 0;
                 end
+                `ifndef SYNTHESIS
+                if (drain_col == 0 && sp_oh == 0 && sp_ow == 0)
+                             $time, sp_oh, sp_ow, k_pass, dot_buf[14]);
+                `endif
 `ifdef DBG_DOTBUF
                 if (tile_x == 0 && tile_y == 0)
                     $fwrite(dbg_fh, "[RTL_SP] t=%0d sp(%0d,%0d) k_pass=%0d conv_fh=%0d conv_fw=%0d\n",
