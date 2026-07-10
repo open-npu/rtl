@@ -43,6 +43,11 @@ module npu_ctrl (
     // ─── Compute Control ───
     output reg          compute_start,   // Start compute engine
     input  wire         compute_done,    // Compute done
+    input  wire         oc_group_done,   // Compute finished an oc_group (request weight reload)
+    output reg          wgt_reload_done, // Weight reload for next oc_group complete
+
+    // ─── DMA Bank Select (explicit, replaces address compare in npu_top) ───
+    output reg  [1:0]   dma_sram_sel,    // 0=weight, 1=activation, 2=param
 
     // ─── Layer Configuration (from CSR register file) ───
     input  wire [31:0]  cfg_dma_in_addr,
@@ -51,6 +56,7 @@ module npu_ctrl (
     input  wire [31:0]  cfg_dma_param_addr,
     input  wire [31:0]  cfg_dma_in_size,     // in bytes
     input  wire [31:0]  cfg_dma_wgt_size,    // in bytes
+    input  wire [31:0]  cfg_dma_wgt_per_oc, // per-oc_group weight words (0=all at once)
     input  wire [31:0]  cfg_dma_out_size,    // in bytes
     input  wire [31:0]  cfg_tile_in_size,    // per-tile input size (bytes), 0=use full in_size
     input  wire [15:0]  cfg_param_count,     // number of output channels
@@ -108,9 +114,12 @@ module npu_ctrl (
     localparam S_WAIT_PREFETCH= 6'd15;  // DB_EN: wait for prefetch DMA to complete
     localparam S_TILE_STORE   = 6'd16;  // Per-tile store: fire 2D DMA store for current tile
     localparam S_TILE_STORE_WAIT = 6'd17; // Per-tile store: wait for DMA done
+    localparam S_RELOAD_WGT     = 6'd18; // Per-oc_group: reload weights
+    localparam S_WAIT_RELOAD_WGT= 6'd19;
 
     reg [5:0] state;
     reg       aborted;  // Latched abort flag — prevents auto-restart in S_DONE
+    reg [15:0] oc_group_cnt; // Current oc_group (for per-oc weight reload)
 
     // Per-channel param size: 4 words (16 bytes) per channel
     wire [15:0] param_words = (cfg_layer_mode[3:0] == 4'd4 || cfg_layer_mode[3:0] == 4'd7)
@@ -186,6 +195,9 @@ module npu_ctrl (
             dma_sram_addr    <= 16'd0;
             dma_xfer_len     <= 16'd0;
             compute_start    <= 1'b0;
+            wgt_reload_done  <= 1'b0;
+            dma_sram_sel     <= 2'd1;  // default: activation
+            oc_group_cnt     <= 16'd0;
             ping_pong_flag   <= 1'b0;
             prefetch_active  <= 1'b0;
             prefetch_pending <= 1'b0;
@@ -219,6 +231,7 @@ module npu_ctrl (
             hw_error      <= 1'b0;
             dma_start     <= 1'b0;
             compute_start <= 1'b0;
+            wgt_reload_done <= 1'b0;
             // Default: 1D DMA mode (2D only active in S_TILE_STORE)
             dma_row_len   <= 16'd0;
             dma_row_count <= 16'd0;
@@ -249,7 +262,10 @@ module npu_ctrl (
                         dma_dir       <= 1'b0;  // load
                         dma_ext_addr  <= cfg_dma_wgt_addr;
                         dma_sram_addr <= 16'd0;
-                        dma_xfer_len  <= wgt_words;
+                        // Per-oc_group: load only first group if wgt_per_oc != 0
+                        dma_xfer_len  <= (cfg_dma_wgt_per_oc != 0) ? cfg_dma_wgt_per_oc[15:0] : wgt_words;
+                        dma_sram_sel  <= 2'd0;  // weight bank
+                        oc_group_cnt  <= 16'd0;
                         state         <= S_WAIT_WGT;
                     end else begin
                         state <= S_LOAD_ACT;
@@ -277,6 +293,7 @@ module npu_ctrl (
                     end else begin
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;
+                        dma_sram_sel  <= 2'd1;  // activation
                         dma_ext_addr  <= cfg_dma_in_addr;
                         dma_sram_addr <= 16'd0;  // First tile always loads to Bank[0]
                         dma_xfer_len  <= tile_in_words;  // per-tile when DB_EN, full when not
@@ -302,6 +319,7 @@ module npu_ctrl (
                     end else if (param_words != 0) begin
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;
+                        dma_sram_sel  <= 2'd2;  // param
                         dma_ext_addr  <= cfg_dma_param_addr;
                         dma_sram_addr <= 16'd0;
                         dma_xfer_len  <= param_words;
@@ -373,6 +391,7 @@ module npu_ctrl (
                                 // Original path: prefetch next tile directly
                                 dma_start      <= 1'b1;
                                 dma_dir        <= 1'b0;  // load
+                                dma_sram_sel   <= 2'd1;  // activation
                                 dma_ext_addr   <= next_tile_ddr_addr;
                                 dma_sram_addr  <= next_sram_offset;
                                 dma_xfer_len   <= tile_in_words;
@@ -406,6 +425,11 @@ module npu_ctrl (
                             end
                         end
 
+                        // ─── oc_group_done: reload weights for next oc_group ───
+                        if (oc_group_done && cfg_dma_wgt_per_oc != 0) begin
+                            state <= S_RELOAD_WGT;
+                        end
+
                         // ─── Compute done (final tile) ───
                         if (compute_done) begin
                             store_bank <= ping_pong_flag;
@@ -436,6 +460,7 @@ module npu_ctrl (
                         // 2D DMA store: current tile output → DDR at NHWC offset
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b1;  // store
+                        dma_sram_sel  <= 2'd1;  // activation
                         dma_ext_addr  <= cfg_dma_out_addr + tile_ddr_offset;
                         // Source SRAM: output region in current bank
                         if (cfg_dma_add_b_addr != 0)
@@ -487,6 +512,7 @@ module npu_ctrl (
                             if (!skip_act_load) begin
                                 dma_start      <= 1'b1;
                                 dma_dir        <= 1'b0;
+                                dma_sram_sel   <= 2'd1;  // activation
                                 dma_ext_addr   <= next_tile_ddr_addr;
                                 dma_sram_addr  <= next_sram_offset;
                                 dma_xfer_len   <= tile_in_words;
@@ -509,6 +535,32 @@ module npu_ctrl (
                             end
                             state <= S_WAIT_COMP;
                         end
+                    end
+                end
+
+                // ─── Per-oc_group weight reload ───
+                S_RELOAD_WGT: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else begin
+                        // DMA next oc_group's weights: DDR offset = oc_group * wgt_per_oc * 4 bytes
+                        oc_group_cnt <= oc_group_cnt + 1;
+                        dma_start     <= 1'b1;
+                        dma_dir       <= 1'b0;  // load
+                        dma_sram_sel  <= 2'd0;  // weight bank
+                        dma_ext_addr  <= cfg_dma_wgt_addr + (oc_group_cnt + 1) * cfg_dma_wgt_per_oc * 4;
+                        dma_sram_addr <= 16'd0;  // always load to SRAM[0]
+                        dma_xfer_len  <= cfg_dma_wgt_per_oc[15:0];
+                        state         <= S_WAIT_RELOAD_WGT;
+                    end
+                end
+
+                S_WAIT_RELOAD_WGT: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else if (dma_done) begin
+                        wgt_reload_done <= 1'b1;
+                        state <= S_WAIT_COMP;
                     end
                 end
 
@@ -537,6 +589,7 @@ module npu_ctrl (
                     end else if (out_words != 0) begin
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b1;  // store
+                        dma_sram_sel  <= 2'd1;  // activation
                         dma_ext_addr  <= cfg_dma_out_addr;
                         // Conv2D: store from cfg_out_base; Add: store from cfg_act_base (in-place)
                         if (cfg_dma_add_b_addr != 0)
@@ -569,6 +622,7 @@ module npu_ctrl (
                     end else if (cfg_dma_add_b_addr != 0 && tile_in_words != 0) begin
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;  // load
+                        dma_sram_sel  <= 2'd1;  // activation
                         dma_ext_addr  <= cfg_dma_add_b_addr + cur_tile_ddr_offset;
                         dma_sram_addr <= cfg_out_base + (db_en && ping_pong_flag ? cfg_act_bank_offset : 16'd0);
                         dma_xfer_len  <= tile_in_words;

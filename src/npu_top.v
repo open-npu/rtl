@@ -96,6 +96,7 @@ module npu_top #(
     wire [31:0] reg_dma_tile_out_size;
     wire [31:0] reg_dma_store_mode;
     wire [31:0] reg_dma_row_cfg;
+    wire [31:0] reg_dma_wgt_per_oc;
     wire [31:0] reg_tile_in_hw;
 
     // --- CSR Post-Processing Config outputs ---
@@ -112,6 +113,8 @@ module npu_top #(
 
     // --- Controller ↔ Compute ---
     wire        compute_start, compute_done;
+    wire        oc_group_done, wgt_reload_done;
+    wire [1:0]  dma_sram_sel;
 
     // --- DMA ↔ SRAM MUX ---
     wire        dma_sram_en, dma_sram_we;
@@ -209,6 +212,7 @@ module npu_top #(
         .reg_dma_tile_out_size(reg_dma_tile_out_size),
         .reg_dma_store_mode (reg_dma_store_mode),
         .reg_dma_row_cfg    (reg_dma_row_cfg),
+        .reg_dma_wgt_per_oc (reg_dma_wgt_per_oc),
         .reg_tile_in_hw      (reg_tile_in_hw),
         // Post-processing config
         .reg_post_ctrl          (reg_post_ctrl),
@@ -248,6 +252,9 @@ module npu_top #(
         // Compute control
         .compute_start  (compute_start),
         .compute_done   (compute_done),
+        .oc_group_done  (oc_group_done),
+        .wgt_reload_done(wgt_reload_done),
+        .dma_sram_sel   (dma_sram_sel),
         // Layer configuration from CSR
         .cfg_dma_in_addr    (reg_dma_in_addr),
         .cfg_dma_out_addr   (reg_dma_out_addr),
@@ -255,6 +262,7 @@ module npu_top #(
         .cfg_dma_param_addr (reg_dma_param_addr),
         .cfg_dma_in_size    (reg_dma_in_size),
         .cfg_dma_wgt_size   (reg_dma_wgt_size),
+        .cfg_dma_wgt_per_oc (reg_dma_wgt_per_oc),
         .cfg_dma_out_size   (reg_dma_out_size),
         .cfg_tile_in_size   (reg_dma_tile_in_size),
         .cfg_param_count    (reg_post_param_count[15:0]),
@@ -451,23 +459,15 @@ module npu_top #(
     // Best V1 approach: Add a 2-bit sram_bank_sel output to npu_ctrl.
     // For now, we decode from the ext_addr matching cfg addresses.
 
-    // SRAM bank select: registered, captured on dma_start pulse
-    // 0 = weight, 1 = activation, 2 = parameter
+    // SRAM bank select: latch on dma_start (same timing as old address-compare)
+    // Controller sets dma_sram_sel in same cycle as dma_start (both non-blocking)
     reg [1:0] dma_bank_sel;
 
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            dma_bank_sel <= 2'd1;
-        end else if (dma_start) begin
-            // Latch bank select at transfer start based on ext_addr
-            if (dma_ext_addr == reg_dma_wgt_addr)
-                dma_bank_sel <= 2'd0;  // weight
-            else if (dma_ext_addr == reg_dma_param_addr ||
-                     dma_ext_addr == reg_dma_add_param_addr)
-                dma_bank_sel <= 2'd2;  // param
-            else
-                dma_bank_sel <= 2'd1;  // activation (load A, load Add B, or store)
-        end
+        if (!rst_n)
+            dma_bank_sel <= 2'd1;  // default: activation
+        else if (dma_start)
+            dma_bank_sel <= dma_sram_sel;  // latch at start, takes effect next cycle
     end
 
     // Route DMA SRAM signals to correct bank
@@ -703,6 +703,9 @@ module npu_top #(
         .ppu_out_valid  (ppu_out_valid),
         // DB_EN
         .tile_done          (tile_done),
+        .oc_group_done      (oc_group_done),
+        .wgt_reload_done    (wgt_reload_done),
+        .cfg_wgt_per_oc     (reg_dma_wgt_per_oc),
         .db_prefetch_done   (db_prefetch_done),
         .tile_out_h_actual  (tile_out_h_actual),
         .tile_out_w_actual  (tile_out_w_actual)
