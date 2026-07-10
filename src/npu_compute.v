@@ -974,7 +974,7 @@ module npu_compute #(
                             deconv_skip <= 1'b0;
                             // Use tile-local or full-image coords, matching S_ACT_CMD
                             if (cfg_tile_h == 16'd0) begin
-                                elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c + conv_ch_cnt;
+                                elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c;
                             end else begin
                                 elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh}) * tile_in_w
                                            + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw}) * cfg_in_c;
