@@ -37,6 +37,7 @@ module npu_compute #(
     output reg                          done,
     output wire                         tile_done,  // 1-cycle pulse at non-final tile boundary
     output reg                          oc_group_done, // 1-cycle pulse: oc_group finished, request weight reload
+    output wire [15:0]                  oc_group_out,   // Current oc_group index (for controller weight reload)
     input  wire                         wgt_reload_done, // Controller loaded next oc_group's weights
     input  wire [31:0]                  cfg_wgt_per_oc,  // Per-oc weight words (0=all weights fit, skip reload)
     input  wire                         db_prefetch_done,  // DB_EN: prefetch complete, safe to start next tile
@@ -224,6 +225,7 @@ module npu_compute #(
     reg        tile_done_r;
     reg        tile_wait_delay;  // DB_EN wait: skip 1 cycle, then wait for prefetch
     assign tile_done = tile_done_r;
+    assign oc_group_out = oc_group;
     // Expose actual (border-clipped) tile output dims for per-tile store DMA
     assign tile_out_h_actual = out_tile_h;
     assign tile_out_w_actual = out_tile_w;

@@ -44,6 +44,7 @@ module npu_ctrl (
     output reg          compute_start,   // Start compute engine
     input  wire         compute_done,    // Compute done
     input  wire         oc_group_done,   // Compute finished an oc_group (request weight reload)
+    input  wire [15:0]  oc_group_idx,    // Current oc_group index from compute
     output reg          wgt_reload_done, // Weight reload for next oc_group complete
 
     // ─── DMA Bank Select (explicit, replaces address compare in npu_top) ───
@@ -119,7 +120,6 @@ module npu_ctrl (
 
     reg [5:0] state;
     reg       aborted;  // Latched abort flag — prevents auto-restart in S_DONE
-    reg [15:0] oc_group_cnt; // Current oc_group (for per-oc weight reload)
 
     // Per-channel param size: 4 words (16 bytes) per channel
     wire [15:0] param_words = (cfg_layer_mode[3:0] == 4'd4 || cfg_layer_mode[3:0] == 4'd7)
@@ -197,7 +197,6 @@ module npu_ctrl (
             compute_start    <= 1'b0;
             wgt_reload_done  <= 1'b0;
             dma_sram_sel     <= 2'd1;  // default: activation
-            oc_group_cnt     <= 16'd0;
             ping_pong_flag   <= 1'b0;
             prefetch_active  <= 1'b0;
             prefetch_pending <= 1'b0;
@@ -265,7 +264,6 @@ module npu_ctrl (
                         // Per-oc_group: load only first group if wgt_per_oc != 0
                         dma_xfer_len  <= (cfg_dma_wgt_per_oc != 0) ? cfg_dma_wgt_per_oc[15:0] : wgt_words;
                         dma_sram_sel  <= 2'd0;  // weight bank
-                        oc_group_cnt  <= 16'd0;
                         state         <= S_WAIT_WGT;
                     end else begin
                         state <= S_LOAD_ACT;
@@ -344,6 +342,7 @@ module npu_ctrl (
                     end else begin
                         compute_start <= 1'b1;
                         state         <= S_WAIT_COMP;
+                        // Reset oc_group counter for this compute run
                         // DB_EN: initialize for first tile (no prefetch for tile 0)
                         // For fused MID/END layers, skip_act_load is asserted:
                         // input is already in SRAM, no DDR load or prefetch needed.
@@ -427,6 +426,8 @@ module npu_ctrl (
 
                         // ─── oc_group_done: reload weights for next oc_group ───
                         if (oc_group_done && cfg_dma_wgt_per_oc != 0) begin
+                            `ifndef SYNTHESIS
+                            `endif
                             state <= S_RELOAD_WGT;
                         end
 
@@ -543,12 +544,11 @@ module npu_ctrl (
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else begin
-                        // DMA next oc_group's weights: DDR offset = oc_group * wgt_per_oc * 4 bytes
-                        oc_group_cnt <= oc_group_cnt + 1;
+                        // DMA next oc_group's weights: DDR offset = (oc_group_idx+1) * wgt_per_oc * 4
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;  // load
                         dma_sram_sel  <= 2'd0;  // weight bank
-                        dma_ext_addr  <= cfg_dma_wgt_addr + (oc_group_cnt + 1) * cfg_dma_wgt_per_oc * 4;
+                        dma_ext_addr  <= cfg_dma_wgt_addr + oc_group_idx * cfg_dma_wgt_per_oc * 4;
                         dma_sram_addr <= 16'd0;  // always load to SRAM[0]
                         dma_xfer_len  <= cfg_dma_wgt_per_oc[15:0];
                         state         <= S_WAIT_RELOAD_WGT;

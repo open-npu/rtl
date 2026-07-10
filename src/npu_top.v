@@ -114,6 +114,7 @@ module npu_top #(
     // --- Controller ↔ Compute ---
     wire        compute_start, compute_done;
     wire        oc_group_done, wgt_reload_done;
+    wire [15:0] oc_group_idx;
     wire [1:0]  dma_sram_sel;
 
     // --- DMA ↔ SRAM MUX ---
@@ -253,6 +254,7 @@ module npu_top #(
         .compute_start  (compute_start),
         .compute_done   (compute_done),
         .oc_group_done  (oc_group_done),
+        .oc_group_idx   (oc_group_idx),
         .wgt_reload_done(wgt_reload_done),
         .dma_sram_sel   (dma_sram_sel),
         // Layer configuration from CSR
@@ -704,6 +706,7 @@ module npu_top #(
         // DB_EN
         .tile_done          (tile_done),
         .oc_group_done      (oc_group_done),
+        .oc_group_out       (oc_group_idx),
         .wgt_reload_done    (wgt_reload_done),
         .cfg_wgt_per_oc     (reg_dma_wgt_per_oc),
         .db_prefetch_done   (db_prefetch_done),
