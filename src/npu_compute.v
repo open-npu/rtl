@@ -36,6 +36,9 @@ module npu_compute #(
     input  wire                         start,
     output reg                          done,
     output wire                         tile_done,  // 1-cycle pulse at non-final tile boundary
+    output reg                          oc_group_done, // 1-cycle pulse: oc_group finished, request weight reload
+    input  wire                         wgt_reload_done, // Controller loaded next oc_group's weights
+    input  wire [31:0]                  cfg_wgt_per_oc,  // Per-oc weight words (0=all weights fit, skip reload)
     input  wire                         db_prefetch_done,  // DB_EN: prefetch complete, safe to start next tile
     // Per-tile store support: actual (clipped) tile output dimensions
     output wire [15:0]                  tile_out_h_actual, // Current tile's actual output height (clipped at border)
@@ -211,7 +214,8 @@ module npu_compute #(
         S_RESIZE_WB       = 6'd59,
         S_RESIZE_PIX_NEXT = 6'd60,
         S_RESIZE_CH_NEXT  = 6'd61,
-        S_TILE_WAIT_DB    = 6'd62;  // Wait for DB_EN prefetch before next tile
+        S_TILE_WAIT_DB    = 6'd62, // Wait for DB_EN prefetch before next tile
+        S_WAIT_WGT_RELOAD = 6'd63; // Wait for controller to reload next oc_group weights
 
     reg [5:0] state;
 
@@ -402,6 +406,7 @@ module npu_compute #(
             state <= S_IDLE;
             done  <= 1'b0;
             tile_done_r <= 1'b0;
+            oc_group_done <= 1'b0;
             tile_wait_delay <= 1'b0;
             // All outputs idle
             sa_cmd       <= MODE_IDLE;
@@ -604,10 +609,10 @@ module npu_compute #(
 
             // ══════════════════════════════════════════════════════════════
             S_OC_SETUP: begin
-                // Weight base for this OC group:
-                //   INT8: oc_group * ARRAY_SIZE * k_depth / 4
-                //   INT16: oc_group * ARRAY_SIZE * k_depth * 2 / 4
-                if (cfg_int16)
+                // Weight base: 0 if per-oc reload, else offset into full weight SRAM
+                if (cfg_wgt_per_oc != 0)
+                    wgt_base <= 0;  // per-oc: weights reloaded to SRAM[0]
+                else if (cfg_int16)
                     wgt_base <= (oc_group * ARRAY_SIZE_16 * k_depth) >> 1;
                 else
                     wgt_base <= (oc_group * ARRAY_SIZE_16 * k_depth) >> 2;
@@ -1331,8 +1336,23 @@ module npu_compute #(
                         param_read_issued <= 1'b0;
                         state <= S_RESIZE_CH_SETUP;
                     end else begin
-                        state <= S_OC_SETUP;
+                        // Conv2D/FC: request weight reload if per-oc enabled
+                        if (cfg_wgt_per_oc != 0) begin
+                            oc_group_done <= 1'b1;
+                            state <= S_WAIT_WGT_RELOAD;
+                        end else begin
+                            // All weights fit in SRAM, go directly
+                            state <= S_OC_SETUP;
+                        end
                     end
+                end
+            end
+
+            S_WAIT_WGT_RELOAD: begin
+                // Wait for controller to DMA next oc_group's weights
+                if (wgt_reload_done) begin
+                    oc_group_done <= 1'b0;
+                    state <= S_OC_SETUP;
                 end
             end
 

@@ -216,6 +216,9 @@ async def program_layer(wb, meta):
     await wb.write(0x128, meta['dma_in_size'])     # DMA_IN_SIZE
     await wb.write(0x12C, meta['dma_wgt_size'])    # DMA_WGT_SIZE
     await wb.write(0x130, meta['dma_out_size'])    # DMA_OUT_SIZE
+    # Per-oc weight words (0=all weights fit, >0=per-oc reload)
+    if 'wgt_per_oc_words' in meta:
+        await wb.write(0x148, meta['wgt_per_oc_words'])  # DMA_WGT_PER_OC
 
     # Per-tile input size (for tiled layers with DB_EN)
     tile_in_size = meta.get('tile_in_size', 0)
