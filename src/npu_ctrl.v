@@ -126,8 +126,8 @@ module npu_ctrl (
                               ? cfg_param_count        // Add/Concat: direct word count
                               : cfg_param_count * 4;  // Conv2D: 4 words per channel
 
-    // Weight words = wgt_size / 4
-    wire [15:0] wgt_words = cfg_dma_wgt_size[17:2];
+    // Weight words = wgt_size / 4 (32-bit to handle large models)
+    wire [31:0] wgt_words = cfg_dma_wgt_size >> 2;
 
     // Input words = in_size / 4
     wire [15:0] in_words = cfg_dma_in_size[17:2];
