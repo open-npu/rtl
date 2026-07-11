@@ -1583,9 +1583,20 @@ module npu_compute #(
                         begin : dw_addr_calc
                             reg [ACT_ADDR_W+15:0] elem_off;
                             reg [ACT_ADDR_W+15:0] byte_off;
-                            elem_off = (ih_s[15:0] * cfg_in_w * cfg_in_c)
-                                     + (iw_s[15:0] * cfg_in_c)
-                                     + oc_group;
+                            if (cfg_tile_h == 16'd0) begin
+                                // Non-tiled: full image address
+                                elem_off = (ih_s[15:0] * cfg_in_w * cfg_in_c)
+                                         + (iw_s[15:0] * cfg_in_c)
+                                         + oc_group;
+                            end else begin
+                                // Tiled: tile-local address (dw_oh/dw_ow are tile-local
+                                // output coords; input row = dw_oh*stride + dw_fh,
+                                // input col = dw_ow*stride + dw_fw, both within tile_in_h/w)
+                                elem_off = ({16'd0, dw_oh} * cfg_stride_h + {16'd0, dw_fh}) * tile_in_w
+                                         + ({16'd0, dw_ow} * cfg_stride_w + {16'd0, dw_fw})
+                                         ;
+                                elem_off = elem_off * cfg_in_c + oc_group;
+                            end
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_rd_en   <= 1'b1;
                             act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
