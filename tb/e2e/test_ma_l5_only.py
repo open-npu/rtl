@@ -13,6 +13,8 @@ async def test_ma_l5_only(dut):
     mem.populate(m['ddr_in_addr'], d['input'])
     if len(d['wgt']) > 0: mem.populate(m['ddr_wgt_addr'], d['wgt'])
     if len(d['param']) > 0: mem.populate(m['ddr_param_addr'], d['param'])
+    if 'input_b' in d and len(d['input_b']) > 0 and 'ddr_add_b_addr' in m:
+        mem.populate(m['ddr_add_b_addr'], d['input_b'])
     await program_layer(wb, m)
     dut._log.info(f"L5 {m['in_h']}x{m['in_w']}x{m['in_c']} -> {m['out_h']}x{m['out_w']}x{m['out_c']} k={m['kernel_h']}x{m['kernel_w']} tile={m.get('tile_h',0)}x{m.get('tile_w',0)}")
     done = await run_layer_and_wait(wb, dut, timeout=20000000000)

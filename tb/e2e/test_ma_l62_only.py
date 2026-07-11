@@ -15,12 +15,6 @@ async def test_ma_l62_only(dut):
     if len(d['param']) > 0: mem.populate(m['ddr_param_addr'], d['param'])
     if 'input_b' in d and len(d['input_b']) > 0 and 'ddr_add_b_addr' in m:
         mem.populate(m['ddr_add_b_addr'], d['input_b'])
-    # Debug: check DDR weight data
-    w0 = mem.mem.get(m['ddr_wgt_addr'], 0)
-    w1 = mem.mem.get(m['ddr_wgt_addr']+4, 0)
-    wgt = d['wgt']
-    dut._log.info(f"DDR wgt[0]=0x{w0:08X} expected=0x{int(wgt[0]):08X} match={w0==int(wgt[0])}")
-    dut._log.info(f"DDR wgt[1]=0x{w1:08X} expected=0x{int(wgt[1]):08X} match={w1==int(wgt[1])}")
     await program_layer(wb, m)
     dut._log.info(f"L62 {m['in_h']}x{m['in_w']}x{m['in_c']} -> {m['out_h']}x{m['out_w']}x{m['out_c']} k={m['kernel_h']}x{m['kernel_w']} tile={m.get('tile_h',0)}x{m.get('tile_w',0)}")
     done = await run_layer_and_wait(wb, dut, timeout=20000000000)
