@@ -2199,18 +2199,23 @@ module npu_compute #(
                     begin : add_wb_addr_calc
                         reg [31:0] byte_off;
                         if (is_concat) begin
-                            // Concat: output[pixel * total_c + offset + ch]
+                            // Concat: output[tile_pixel * total_c + offset + ch]
                             reg [31:0] pixel;
                             reg [31:0] ch;
-                            pixel = {16'd0, add_elem_cnt} / {16'd0, cfg_out_c};
-                            ch    = {16'd0, add_elem_cnt} % {16'd0, cfg_out_c};
+                            pixel = {16'd0, add_tile_elem_cnt} / {16'd0, cfg_in_c};
+                            ch    = {16'd0, add_tile_elem_cnt} % {16'd0, cfg_in_c};
                             byte_off = (pixel * {16'd0, concat_total_c} + {16'd0, concat_offset} + ch)
                                        << (cfg_int16 ? 1 : 0);
                         end else begin
                             // Add: flat overwrite at input A region (tile-local)
                             byte_off = cfg_int16 ? ({16'd0, add_tile_elem_cnt} << 1) : {16'd0, add_tile_elem_cnt};
                         end
-                        add_wb_addr    <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];  // Write to input A region (in-place)
+                        // Concat writes to output region (cfg_act_base + cfg_out_base),
+                        // Add writes in-place to input A region (cfg_act_base)
+                        if (is_concat)
+                            add_wb_addr    <= cfg_act_base + cfg_out_base + byte_off[ACT_ADDR_W+1:2];
+                        else
+                            add_wb_addr    <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
                         add_wb_bytesel <= byte_off[1:0];
                     end
                     add_wb_byte <= ppu_out_data;
