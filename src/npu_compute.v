@@ -2403,9 +2403,19 @@ module npu_compute #(
                     begin : rsz_read0_addr
                         reg [31:0] elem_off;
                         reg [31:0] byte_off;
-                        elem_off = (rsz_ih0 * cfg_in_w * cfg_in_c)
-                                 + (rsz_iw0 * cfg_in_c)
-                                 + rsz_ch;
+                        if (cfg_tile_h == 16'd0) begin
+                            // Non-tiled: full image address
+                            elem_off = (rsz_ih0 * cfg_in_w * cfg_in_c)
+                                     + (rsz_iw0 * cfg_in_c)
+                                     + rsz_ch;
+                        end else begin
+                            // Tiled: tile-local address
+                            // Input tile origin = tile_oh_origin * in_h / out_h
+                            // (Resize has no kernel/stride, scale = out/in)
+                            elem_off = ((rsz_ih0 - (tile_oh_origin * cfg_in_h) / cfg_out_h) * tile_in_w
+                                     + (rsz_iw0 - (tile_ow_origin * cfg_in_w) / cfg_out_w))
+                                     * cfg_in_c + rsz_ch;
+                        end
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                         act_rd_en   <= 1'b1;
                         act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
@@ -2450,9 +2460,15 @@ module npu_compute #(
                     begin : rsz_read1_addr
                         reg [31:0] elem_off;
                         reg [31:0] byte_off;
-                        elem_off = (rsz_ih0 * cfg_in_w * cfg_in_c)
-                                 + (rsz_iw1 * cfg_in_c)
-                                 + rsz_ch;
+                        if (cfg_tile_h == 16'd0) begin
+                            elem_off = (rsz_ih0 * cfg_in_w * cfg_in_c)
+                                     + (rsz_iw1 * cfg_in_c)
+                                     + rsz_ch;
+                        end else begin
+                            elem_off = ((rsz_ih0 - (tile_oh_origin * cfg_in_h) / cfg_out_h) * tile_in_w
+                                     + (rsz_iw1 - (tile_ow_origin * cfg_in_w) / cfg_out_w))
+                                     * cfg_in_c + rsz_ch;
+                        end
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                         act_rd_en   <= 1'b1;
                         act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
@@ -2494,9 +2510,15 @@ module npu_compute #(
                     begin : rsz_read2_addr
                         reg [31:0] elem_off;
                         reg [31:0] byte_off;
-                        elem_off = (rsz_ih1 * cfg_in_w * cfg_in_c)
-                                 + (rsz_iw0 * cfg_in_c)
-                                 + rsz_ch;
+                        if (cfg_tile_h == 16'd0) begin
+                            elem_off = (rsz_ih1 * cfg_in_w * cfg_in_c)
+                                     + (rsz_iw0 * cfg_in_c)
+                                     + rsz_ch;
+                        end else begin
+                            elem_off = ((rsz_ih1 - (tile_oh_origin * cfg_in_h) / cfg_out_h) * tile_in_w
+                                     + (rsz_iw0 - (tile_ow_origin * cfg_in_w) / cfg_out_w))
+                                     * cfg_in_c + rsz_ch;
+                        end
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                         act_rd_en   <= 1'b1;
                         act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
@@ -2538,9 +2560,15 @@ module npu_compute #(
                     begin : rsz_read3_addr
                         reg [31:0] elem_off;
                         reg [31:0] byte_off;
-                        elem_off = (rsz_ih1 * cfg_in_w * cfg_in_c)
-                                 + (rsz_iw1 * cfg_in_c)
-                                 + rsz_ch;
+                        if (cfg_tile_h == 16'd0) begin
+                            elem_off = (rsz_ih1 * cfg_in_w * cfg_in_c)
+                                     + (rsz_iw1 * cfg_in_c)
+                                     + rsz_ch;
+                        end else begin
+                            elem_off = ((rsz_ih1 - (tile_oh_origin * cfg_in_h) / cfg_out_h) * tile_in_w
+                                     + (rsz_iw1 - (tile_ow_origin * cfg_in_w) / cfg_out_w))
+                                     * cfg_in_c + rsz_ch;
+                        end
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                         act_rd_en   <= 1'b1;
                         act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
