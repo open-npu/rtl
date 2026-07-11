@@ -714,9 +714,9 @@
     "tile_num_w": 1,
     "sched_ctrl": 17,
     "ddr_in_addr": 823926784,
-    "ddr_out_addr": 824283136,
-    "ddr_wgt_addr": 824279040,
-    "ddr_param_addr": 824283136,
+    "ddr_out_addr": 824107008,
+    "ddr_wgt_addr": 824102912,
+    "ddr_param_addr": 824107008,
     "clamp_min": -32768,
     "clamp_max": 32767,
     "in_zp": 0,
@@ -725,8 +725,7 @@
     "add_M_A": 16384,
     "add_S_A": 14,
     "add_M_B": 0,
-    "add_S_B": 0,
-    "ddr_add_b_addr": 824102912
+    "add_S_B": 0
   },
   {
     "op_type": 0,
