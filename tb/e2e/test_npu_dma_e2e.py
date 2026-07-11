@@ -233,6 +233,10 @@ async def program_layer(wb, meta):
     await wb.write(0x180, meta['post_ctrl'])       # POST_CTRL
     await wb.write(0x188, meta['dma_param_count']) # POST_PARAM_COUNT
 
+    # Concat config (if present)
+    if 'concat_cfg' in meta:
+        await wb.write(0x06C, meta['concat_cfg'])  # CONCAT_CFG
+
     # Pool config (for Pooling layers)
     if 'pool_cfg' in meta:
         await wb.write(0x060, meta['pool_cfg'])    # POOL_CFG
