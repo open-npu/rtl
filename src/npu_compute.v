@@ -425,6 +425,9 @@ module npu_compute #(
     reg signed [ACC_W-1:0] add_val_a, add_val_b;
     reg [15:0] add_elem_cnt;      // Current element index (flat)
     reg [15:0] add_tile_elem_cnt; // Element index within current tile
+    // Concat pixel/ch counters (avoids division in writeback)
+    reg [15:0] concat_pixel_cnt;  // pixel = elem_cnt / in_c
+    reg [15:0] concat_ch_cnt;     // ch = elem_cnt % in_c
     reg [15:0] add_total_elems;   // H * W * C
     reg [1:0]  add_rd_phase;      // SRAM read phasing
     reg [1:0]  add_param_phase;   // Param read phasing
@@ -2174,6 +2177,8 @@ module npu_compute #(
                 add_total_elems <= cfg_out_h * cfg_out_w * cfg_out_c;
                 add_elem_cnt <= 0;
                 add_tile_elem_cnt <= 0;
+                concat_pixel_cnt <= 0;
+                concat_ch_cnt <= 0;
                 add_param_idx <= 0;
                 add_param_phase <= 0;
                 tile_x <= 0;
@@ -2330,11 +2335,9 @@ module npu_compute #(
                         reg [31:0] byte_off;
                         if (is_concat) begin
                             // Concat: output[tile_pixel * total_c + offset + ch]
-                            reg [31:0] pixel;
-                            reg [31:0] ch;
-                            pixel = {17'd0, add_tile_elem_cnt} / {17'd0, cfg_in_c};
-                            ch    = {17'd0, add_tile_elem_cnt} % {17'd0, cfg_in_c};
-                            byte_off = (pixel * {17'd0, concat_total_c} + {17'd0, concat_offset} + ch)
+                            // Use counters instead of division (pixel = elem/in_c, ch = elem%in_c)
+                            byte_off = ({16'd0, concat_pixel_cnt} * {16'd0, concat_total_c}
+                                     + {16'd0, concat_offset} + {16'd0, concat_ch_cnt})
                                        << (cfg_int16 ? 1 : 0);
                         end else begin
                             // Add: flat overwrite at input A region (tile-local)
@@ -2414,6 +2417,15 @@ module npu_compute #(
                     end else begin
                         add_elem_cnt <= add_elem_cnt + 17'd1;
                         add_tile_elem_cnt <= add_tile_elem_cnt + 17'd1;
+                        // Concat pixel/ch counter increment
+                        if (is_concat) begin
+                            if (concat_ch_cnt + 1 >= cfg_in_c) begin
+                                concat_ch_cnt <= 0;
+                                concat_pixel_cnt <= concat_pixel_cnt + 1;
+                            end else begin
+                                concat_ch_cnt <= concat_ch_cnt + 1;
+                            end
+                        end
                         add_rd_phase <= 0;
                         state <= S_ADD_READ_A;
                     end
@@ -2427,18 +2439,31 @@ module npu_compute #(
                             tile_y <= tile_y + 1;
                             tile_done_r <= 1'b1;
                             add_tile_elem_cnt <= 0;
+                            concat_pixel_cnt <= 0;
+                            concat_ch_cnt <= 0;
                             state <= S_TILE_WAIT_DB;
                         end
                     end else begin
                         tile_x <= tile_x + 1;
                         tile_done_r <= 1'b1;
                         add_tile_elem_cnt <= 0;
+                        concat_pixel_cnt <= 0;
+                        concat_ch_cnt <= 0;
                         state <= S_TILE_WAIT_DB;
                     end
                 end else begin
                     // Same tile, next element
                     add_elem_cnt <= add_elem_cnt + 17'd1;
                     add_tile_elem_cnt <= add_tile_elem_cnt + 17'd1;
+                    // Concat pixel/ch counter increment
+                    if (is_concat) begin
+                        if (concat_ch_cnt + 1 >= cfg_in_c) begin
+                            concat_ch_cnt <= 0;
+                            concat_pixel_cnt <= concat_pixel_cnt + 1;
+                        end else begin
+                            concat_ch_cnt <= concat_ch_cnt + 1;
+                        end
+                    end
                     add_rd_phase <= 0;
                     state <= S_ADD_READ_A;
                 end
