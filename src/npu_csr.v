@@ -168,6 +168,8 @@ module npu_csr #(
     reg [DATA_W-1:0] r_post_add_stride; // 0x19C
 
     // ─── Group 4: LUT Data (256 entries packed 4-per-word for INT8) ───
+    // ASIC: infer SRAM macro; FPGA: infer BRAM
+    (* ram_style = "block" *)
     reg [DATA_W-1:0] r_lut [0:127];   // 128 words covers both INT8(64) and INT16(128)
 
     // ─── Read-Only Hardware Config ───
