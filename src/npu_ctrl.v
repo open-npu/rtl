@@ -161,6 +161,8 @@ module npu_ctrl (
     reg        last_tile_store;     // 1=S_TILE_STORE is for final tile (→ S_DONE, no prefetch)
     reg [31:0] r_tile_ddr_offset;   // Precomputed tile DDR offset (registered)
     reg [31:0] r_nhwc_row_stride;   // Precomputed NHWC row stride (registered)
+    reg [15:0] r_tile_row_len;      // Precomputed tile row length (registered)
+    reg [15:0] r_tile_row_count;    // Precomputed tile row count (registered)
 
     // ─── Per-tile store tile sequencing ───
     // Track tile (y,x) position for NHWC DDR offset computation
@@ -389,6 +391,11 @@ module npu_ctrl (
                                                        + {16'd0, tile_x_seq} * {16'd0, cfg_tile_w})
                                                       * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
                                 r_nhwc_row_stride <= {16'd0, cfg_out_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
+                                r_tile_row_count <= (tile_out_h_actual != 0) ? tile_out_h_actual : cfg_tile_h;
+                                if (tile_out_w_actual != 0)
+                                    r_tile_row_len <= (({16'd0, tile_out_w_actual} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1)) >> 2);
+                                else
+                                    r_tile_row_len <= tile_row_len * tile_row_count;
                                 `ifndef SYNTHESIS
                                 $display("[PTS_TILEDONE] t=%0t tile_done fired, ping_pong=%0d → S_TILE_STORE", $time, ping_pong_flag);
                                 `endif
@@ -456,6 +463,11 @@ module npu_ctrl (
                                                            + {16'd0, tile_x_seq} * {16'd0, cfg_tile_w})
                                                           * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
                                     r_nhwc_row_stride <= {16'd0, cfg_out_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
+                                    r_tile_row_count <= (tile_out_h_actual != 0) ? tile_out_h_actual : cfg_tile_h;
+                                    if (tile_out_w_actual != 0)
+                                        r_tile_row_len <= (({16'd0, tile_out_w_actual} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1)) >> 2);
+                                    else
+                                        r_tile_row_len <= tile_row_len * tile_row_count;
                                     state <= S_TILE_STORE;
                                 end
                                 else
@@ -480,12 +492,12 @@ module npu_ctrl (
                             dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
                         else
                             dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
-                        dma_xfer_len  <= tile_out_words;
+                        dma_xfer_len  <= r_tile_row_len * r_tile_row_count;
                         // 2D parameters: all layers use clipped tile dims for DDR row_len.
                         // Add layers: SRAM uses padded tile_w, so src_row_len = padded.
                         // Conv: src_row_len = 0 (same as row_len, no padding).
-                        dma_row_len    <= tile_row_len;
-                        dma_row_count  <= tile_row_count;
+                        dma_row_len    <= r_tile_row_len;
+                        dma_row_count  <= r_tile_row_count;
                         dma_out_stride <= r_nhwc_row_stride;
                         if (cfg_dma_add_b_addr != 0 && cfg_tile_w != 0)
                             dma_src_row_len <= ({16'd0, cfg_tile_w} * {16'd0, cfg_out_c} *
@@ -497,7 +509,7 @@ module npu_ctrl (
                                  $time, tile_y_seq, tile_x_seq,
                                  cfg_dma_out_addr + r_tile_ddr_offset,
                                  cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0),
-                                 tile_out_words, tile_row_len, tile_row_count, r_nhwc_row_stride, store_bank);
+                                 r_tile_row_len * r_tile_row_count, r_tile_row_len, r_tile_row_count, r_nhwc_row_stride, store_bank);
                         `endif
                         state          <= S_TILE_STORE_WAIT;
                     end
