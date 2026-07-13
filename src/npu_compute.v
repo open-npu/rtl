@@ -245,6 +245,7 @@ module npu_compute #(
         S_RESIZE_INTERP1  = 7'd64, // Bilinear interp cycle 1 (4 mults: top/bot)
         S_RESIZE_INTERP2  = 7'd65; // Bilinear interp cycle 2 (2 mults: val64)
 
+    (* fsm_encoding = "one_hot" *)
     reg [6:0] state;
 
     // ─── Tile iteration ───
@@ -563,6 +564,7 @@ module npu_compute #(
             dw_in_valid  <= 1'b0;
             dw_acc_clear <= 1'b0;
 
+            (* parallel_case, full_case *)
             case (state)
 
             // ══════════════════════════════════════════════════════════════
