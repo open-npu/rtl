@@ -243,8 +243,7 @@ module npu_compute #(
         S_TILE_WAIT_DB    = 7'd62, // Wait for DB_EN prefetch before next tile
         S_WAIT_WGT_RELOAD = 7'd63, // Wait for controller to reload next oc_group weights
         S_RESIZE_INTERP1  = 7'd64, // Bilinear interp cycle 1 (4 mults: top/bot)
-        S_RESIZE_INTERP2  = 7'd65, // Bilinear interp cycle 2 (2 mults: val64)
-        S_RESIZE_COORD2   = 7'd66; // Resize coord cycle 2 (second multiply)
+        S_RESIZE_INTERP2  = 7'd65; // Bilinear interp cycle 2 (2 mults: val64)
 
     (* fsm_encoding = "one_hot" *)
     reg [6:0] state;
@@ -454,14 +453,16 @@ module npu_compute #(
     reg [39:0]             recip_out_w;     // Q40 reciprocal of cfg_out_w
     reg [39:0]             recip_out_h_m1;  // Q40 reciprocal of (cfg_out_h-1)
     reg [39:0]             recip_out_w_m1;  // Q40 reciprocal of (cfg_out_w-1)
+    // Combined reciprocals (in_h * recip_out_h) — single multiply per pixel
+    reg signed [55:0]      recip_scale_h;      // cfg_in_h * recip_out_h
+    reg signed [55:0]      recip_scale_w;      // cfg_in_w * recip_out_w
+    reg signed [55:0]      recip_scale_h_m1;   // ((cfg_in_h-1)<<8) * recip_out_h_m1
+    reg signed [55:0]      recip_scale_w_m1;   // ((cfg_in_w-1)<<8) * recip_out_w_m1
     // Tile-origin hoist (avoid 4x redundant division per pixel)
     reg [15:0]             rsz_tile_ih_origin;  // (tile_oh_origin * in_h) / out_h
     reg [15:0]             rsz_tile_iw_origin;  // (tile_ow_origin * in_w) / out_w
     // Bilinear interp pipeline register (for 2-cycle interp split)
     reg signed [63:0]      rsz_top_r, rsz_bot_r;
-    // Resize coord pipeline register (for 2-cycle coord multiply split)
-    reg [47:0] rsz_coord_prod_h;  // oh_global * in_h (first multiply result)
-    reg [47:0] rsz_coord_prod_w;  // ow_global * in_w
 
     integer i;
 
@@ -2489,6 +2490,11 @@ module npu_compute #(
                 recip_out_w <= (cfg_out_w > 0) ? (40'hFFFFFFFFFF / cfg_out_w) + 1 : 0;
                 recip_out_h_m1 <= (cfg_out_h > 1) ? (40'hFFFFFFFFFF / (cfg_out_h - 1)) + 1 : 0;
                 recip_out_w_m1 <= (cfg_out_w > 1) ? (40'hFFFFFFFFFF / (cfg_out_w - 1)) + 1 : 0;
+                // Precompute combined reciprocals: in_h * recip_out_h (single multiply per pixel)
+                recip_scale_h <= {16'd0, cfg_in_h} * ((cfg_out_h > 0) ? (40'hFFFFFFFFFF / cfg_out_h) + 1 : 0);
+                recip_scale_w <= {16'd0, cfg_in_w} * ((cfg_out_w > 0) ? (40'hFFFFFFFFFF / cfg_out_w) + 1 : 0);
+                recip_scale_h_m1 <= {16'd0, ((cfg_in_h - 1) << 8)} * ((cfg_out_h > 1) ? (40'hFFFFFFFFFF / (cfg_out_h - 1)) + 1 : 0);
+                recip_scale_w_m1 <= {16'd0, ((cfg_in_w - 1) << 8)} * ((cfg_out_w > 1) ? (40'hFFFFFFFFFF / (cfg_out_w - 1)) + 1 : 0);
                 state <= S_RESIZE_CH_SETUP;
             end
 
@@ -2521,31 +2527,19 @@ module npu_compute #(
             end
 
             S_RESIZE_COORD: begin
-                // Cycle 1: first multiply only (oh_global * in_h, ow_global * in_w)
+                // Single-cycle coord computation using combined reciprocals
+                // prod = oh_global * recip_scale_h (one multiply, not two)
                 begin : rsz_coord_blk
                     reg [31:0] oh_global, ow_global;
-                    oh_global = tile_oh_origin + rsz_oh;
-                    ow_global = tile_ow_origin + rsz_ow;
-                    if (!resize_mode) begin
-                        rsz_coord_prod_h <= oh_global * cfg_in_h;
-                        rsz_coord_prod_w <= ow_global * cfg_in_w;
-                    end else begin
-                        rsz_coord_prod_h <= oh_global * ((cfg_in_h - 1) << 8);
-                        rsz_coord_prod_w <= ow_global * ((cfg_in_w - 1) << 8);
-                    end
-                end
-                state <= S_RESIZE_COORD2;
-            end
-
-            S_RESIZE_COORD2: begin
-                // Cycle 2: second multiply (prod * recip) + register results
-                begin : rsz_coord2_blk
                     reg [71:0] prod_h, prod_w;
                     reg [15:0] ih_nearest, iw_nearest;
                     reg [31:0] src_h_q8, src_w_q8;
+                    oh_global = tile_oh_origin + rsz_oh;
+                    ow_global = tile_ow_origin + rsz_ow;
+
                     if (!resize_mode) begin
-                        prod_h = rsz_coord_prod_h * recip_out_h;
-                        prod_w = rsz_coord_prod_w * recip_out_w;
+                        prod_h = oh_global * recip_scale_h;
+                        prod_w = ow_global * recip_scale_w;
                         ih_nearest = prod_h[71:40];
                         iw_nearest = prod_w[71:40];
                         rsz_ih0 <= ih_nearest;
@@ -2556,12 +2550,12 @@ module npu_compute #(
                         rsz_frac_w <= 0;
                     end else begin
                         if (cfg_out_h > 1) begin
-                            prod_h = rsz_coord_prod_h * recip_out_h_m1;
+                            prod_h = oh_global * recip_scale_h_m1;
                             src_h_q8 = prod_h[71:40];
                         end else
                             src_h_q8 = 0;
                         if (cfg_out_w > 1) begin
-                            prod_w = rsz_coord_prod_w * recip_out_w_m1;
+                            prod_w = ow_global * recip_scale_w_m1;
                             src_w_q8 = prod_w[71:40];
                         end else
                             src_w_q8 = 0;
