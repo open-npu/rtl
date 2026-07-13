@@ -159,6 +159,8 @@ module npu_ctrl (
     reg        add_b_reload;        // 1=Add B reload after compute_done (→ S_STORE_OUT)
     reg        store_bank;          // Bank to store from (final tile's ping_pong)
     reg        last_tile_store;     // 1=S_TILE_STORE is for final tile (→ S_DONE, no prefetch)
+    reg [31:0] r_tile_ddr_offset;   // Precomputed tile DDR offset (registered)
+    reg [31:0] r_nhwc_row_stride;   // Precomputed NHWC row stride (registered)
 
     // ─── Per-tile store tile sequencing ───
     // Track tile (y,x) position for NHWC DDR offset computation
@@ -382,6 +384,11 @@ module npu_ctrl (
                                 store_bank <= ping_pong_flag;
                                 last_tile_store <= 1'b0;  // non-final tile
                                 db_prefetch_done <= 1'b0;  // Block compute during store+prefetch
+                                // Precompute tile_ddr_offset and row_stride (avoid 3-level multiply chain in S_TILE_STORE)
+                                r_tile_ddr_offset <= ({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {16'd0, cfg_out_w}
+                                                       + {16'd0, tile_x_seq} * {16'd0, cfg_tile_w})
+                                                      * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
+                                r_nhwc_row_stride <= {16'd0, cfg_out_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
                                 `ifndef SYNTHESIS
                                 $display("[PTS_TILEDONE] t=%0t tile_done fired, ping_pong=%0d → S_TILE_STORE", $time, ping_pong_flag);
                                 `endif
@@ -444,6 +451,11 @@ module npu_ctrl (
                                     // for final tile). Go to S_TILE_STORE to store it,
                                     // then S_TILE_STORE_WAIT → S_DONE (skip prefetch).
                                     last_tile_store <= 1'b1;
+                                    // Precompute tile_ddr_offset and row_stride
+                                    r_tile_ddr_offset <= ({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {16'd0, cfg_out_w}
+                                                           + {16'd0, tile_x_seq} * {16'd0, cfg_tile_w})
+                                                          * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
+                                    r_nhwc_row_stride <= {16'd0, cfg_out_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
                                     state <= S_TILE_STORE;
                                 end
                                 else
@@ -462,7 +474,7 @@ module npu_ctrl (
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b1;  // store
                         dma_sram_sel  <= 2'd1;  // activation
-                        dma_ext_addr  <= cfg_dma_out_addr + tile_ddr_offset;
+                        dma_ext_addr  <= cfg_dma_out_addr + r_tile_ddr_offset;
                         // Source SRAM: output region in current bank
                         if (cfg_dma_add_b_addr != 0)
                             dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
@@ -474,7 +486,7 @@ module npu_ctrl (
                         // Conv: src_row_len = 0 (same as row_len, no padding).
                         dma_row_len    <= tile_row_len;
                         dma_row_count  <= tile_row_count;
-                        dma_out_stride <= nhwc_row_stride;
+                        dma_out_stride <= r_nhwc_row_stride;
                         if (cfg_dma_add_b_addr != 0 && cfg_tile_w != 0)
                             dma_src_row_len <= ({16'd0, cfg_tile_w} * {16'd0, cfg_out_c} *
                                                  (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
@@ -483,9 +495,9 @@ module npu_ctrl (
                         `ifndef SYNTHESIS
                         $display("[PTS_STORE] t=%0t ty=%0d tx=%0d ddr=0x%08x sram=%0d len=%0d row_len=%0d row_cnt=%0d stride=%0d bank=%0d",
                                  $time, tile_y_seq, tile_x_seq,
-                                 cfg_dma_out_addr + tile_ddr_offset,
+                                 cfg_dma_out_addr + r_tile_ddr_offset,
                                  cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0),
-                                 tile_out_words, tile_row_len, tile_row_count, nhwc_row_stride, store_bank);
+                                 tile_out_words, tile_row_len, tile_row_count, r_nhwc_row_stride, store_bank);
                         `endif
                         state          <= S_TILE_STORE_WAIT;
                     end
