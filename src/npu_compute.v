@@ -148,6 +148,31 @@ module npu_compute #(
     localparam [$clog2(ARRAY_SIZE)-1:0] COL_MAX = ARRAY_SIZE - 1;  // last column index
     localparam [15:0] ARRAY_SIZE_16 = ARRAY_SIZE;  // 16-bit for comparisons
 
+    // ─── Reciprocal LUT for AvgPool division (pool_count 1..15) ───
+    // Q32 fixed-point: result = (dividend * recip) >>> 32
+    // For pool_count=1: recip = 0x80000000 (shift 31 instead of 32 to fit 32-bit)
+    function [31:0] recip_pool;
+        input [3:0] idx;
+        case (idx)
+            4'd1:  recip_pool = 32'h8000_0000;  // 1/1 with >>31
+            4'd2:  recip_pool = 32'h8000_0000;  // 1/2 with >>32
+            4'd3:  recip_pool = 32'h5555_5556;
+            4'd4:  recip_pool = 32'h4000_0000;
+            4'd5:  recip_pool = 32'h3333_3333;
+            4'd6:  recip_pool = 32'h2AAA_AAAB;
+            4'd7:  recip_pool = 32'h2492_4925;
+            4'd8:  recip_pool = 32'h2000_0000;
+            4'd9:  recip_pool = 32'h1C71_C71C;
+            4'd10: recip_pool = 32'h1999_999A;
+            4'd11: recip_pool = 32'h1745_D174;
+            4'd12: recip_pool = 32'h1555_5555;
+            4'd13: recip_pool = 32'h13B1_3B14;
+            4'd14: recip_pool = 32'h1249_2492;
+            4'd15: recip_pool = 32'h1111_1111;
+            default: recip_pool = 32'h0;
+        endcase
+    endfunction
+
     // ─── FSM States ───
     localparam [5:0]
         S_IDLE        = 6'd0,
@@ -235,6 +260,12 @@ module npu_compute #(
     reg [15:0] oc_groups_total;
     reg [15:0] k_depth;         // kh * kw * in_c
     reg [15:0] out_tile_h, out_tile_w;
+
+    // ─── Reciprocal registers for Conv k_pass decomposition ───
+    reg [31:0] recip_kw_x_inc;  // Q32 reciprocal of kw*in_c
+    reg [31:0] recip_in_c;      // Q32 reciprocal of in_c
+    reg [15:0] kw_x_inc_r;     // latched kw*in_c
+    reg [15:0] in_c_r;         // latched in_c
 
     // ─── Weight load state ───
     // Load one column at a time: read ceil(k_pass_remain/4) words, fill sa_wgt_data
@@ -517,6 +548,21 @@ module npu_compute #(
 
                     k_depth <= {8'd0, cfg_kernel_h} * {8'd0, cfg_kernel_w} * cfg_in_c;
                     kw_eff  <= cfg_kernel_w;
+
+                    // Precompute reciprocals for Conv k_pass decomposition
+                    // (divisors are layer-constant, computed once here)
+                    begin : recip_setup_blk
+                        reg [15:0] kw_inc;
+                        reg [31:0] rem;
+                        integer i;
+                        kw_inc = {8'd0, cfg_kernel_w} * cfg_in_c;
+                        kw_x_inc_r <= kw_inc;
+                        in_c_r <= cfg_in_c;
+                        // Compute recip_kw_x_inc = ceil((1<<32) / kw_inc) iteratively
+                        // Simple: use division here (once per layer, not critical path)
+                        recip_kw_x_inc <= (kw_inc > 0) ? (32'hFFFF_FFFF / kw_inc) + 1 : 0;
+                        recip_in_c <= (cfg_in_c > 0) ? (32'hFFFF_FFFF / cfg_in_c) + 1 : 0;
+                    end
 
                     if (cfg_tile_h == 16'd0) begin
                         out_tile_h <= cfg_out_h;
@@ -1269,9 +1315,23 @@ module npu_compute #(
                         conv_ch_cnt <= flat_start;
                     end else begin
                         // General conv: decompose flat_start into (fh, fw, ch)
-                        conv_fh <= flat_start / kw_x_inc;
-                        conv_fw <= (flat_start % kw_x_inc) / cfg_in_c;
-                        conv_ch_cnt <= flat_start % cfg_in_c;
+                        // using multiply-by-reciprocal (no division)
+                        begin : recip_decomp_blk
+                            reg [47:0] q_full;    // flat_start / kw_x_inc (16b*32b=48b)
+                            reg [15:0] rem_kw;     // flat_start % kw_x_inc
+                            reg [47:0] q_fw;       // rem_kw / in_c
+                            reg [47:0] q_ch;       // flat_start / in_c
+                            // fh = flat_start / kw_x_inc
+                            q_full = (flat_start * recip_kw_x_inc) >> 32;
+                            conv_fh <= q_full[7:0];
+                            rem_kw = flat_start - q_full[15:0] * kw_x_inc_r;
+                            // fw = rem_kw / in_c
+                            q_fw = (rem_kw * recip_in_c) >> 32;
+                            conv_fw <= q_fw[7:0];
+                            // ch = flat_start % in_c
+                            q_ch = (flat_start * recip_in_c) >> 32;
+                            conv_ch_cnt <= flat_start - q_ch[15:0] * in_c_r;
+                        end
                     end
                 end
 
@@ -1919,18 +1979,25 @@ module npu_compute #(
             end
 
             S_POOL_DIV: begin
-                // AvgPool: symmetric rounding division
+                // AvgPool: symmetric rounding division (reciprocal LUT)
                 // MaxPool: pass through
                 if (pool_mode && pool_count > 0) begin
                     begin : pool_div_blk
                         reg signed [ACC_W-1:0] rounded;
                         reg signed [ACC_W-1:0] half_count;
+                        reg signed [71:0] prod;  // 40-bit * 32-bit = 72-bit
                         half_count = pool_count >> 1;
                         if (pool_acc >= 0)
                             rounded = pool_acc + half_count;
                         else
                             rounded = pool_acc - half_count;
-                        pool_acc <= rounded / $signed({1'b0, pool_count});
+                        // Multiply by reciprocal: q = (rounded * recip) >>> 32
+                        // pool_count=1 is special: recip=0x80000000, shift 31
+                        prod = rounded * $signed(recip_pool(pool_count[3:0]));
+                        if (pool_count == 16'd1)
+                            pool_acc <= prod >>> 31;
+                        else
+                            pool_acc <= prod >>> 32;
                     end
                 end
                 state <= S_POOL_PPU;
