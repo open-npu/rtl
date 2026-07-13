@@ -243,7 +243,8 @@ module npu_compute #(
         S_TILE_WAIT_DB    = 7'd62, // Wait for DB_EN prefetch before next tile
         S_WAIT_WGT_RELOAD = 7'd63, // Wait for controller to reload next oc_group weights
         S_RESIZE_INTERP1  = 7'd64, // Bilinear interp cycle 1 (4 mults: top/bot)
-        S_RESIZE_INTERP2  = 7'd65; // Bilinear interp cycle 2 (2 mults: val64)
+        S_RESIZE_INTERP2  = 7'd65, // Bilinear interp cycle 2 (2 mults: val64)
+        S_RESIZE_COORD2   = 7'd66; // Resize coord cycle 2 (second multiply)
 
     (* fsm_encoding = "one_hot" *)
     reg [6:0] state;
@@ -458,6 +459,9 @@ module npu_compute #(
     reg [15:0]             rsz_tile_iw_origin;  // (tile_ow_origin * in_w) / out_w
     // Bilinear interp pipeline register (for 2-cycle interp split)
     reg signed [63:0]      rsz_top_r, rsz_bot_r;
+    // Resize coord pipeline register (for 2-cycle coord multiply split)
+    reg [47:0] rsz_coord_prod_h;  // oh_global * in_h (first multiply result)
+    reg [47:0] rsz_coord_prod_w;  // ow_global * in_w
 
     integer i;
 
@@ -649,7 +653,7 @@ module npu_compute #(
                 `ifndef SYNTHESIS
                 if (cfg_tile_h != 0)
                     $display("[CMP_TILE] t=%0t tile(%0d,%0d) act_base=%0d out_base=%0d ow_origin_reg=%0d out_tw=%0d tile_in_w=%0d",
-                             $time, tile_y, tile_x, cfg_act_base, cfg_act_base + cfg_out_base,
+                             $time, tile_y, tile_x, act_base, act_base + cfg_out_base,
                              tile_ow_origin, out_tile_w, tile_in_w);
                 `endif
                 // Clip tile dimensions to image boundary (after reset + origin)
@@ -716,7 +720,7 @@ module npu_compute #(
                 if (cfg_tile_h != 0)
                     $display("[CMP_OC] t=%0t tile(%0d,%0d) oc_group=%0d k_depth=%0d k_pass_max=%0d col_last=%0d out_base=%0d",
                              $time, tile_y, tile_x, oc_group, k_depth,
-                             (k_depth - 1) / ARRAY_SIZE_16, col_last, cfg_act_base + cfg_out_base);
+                             (k_depth - 1) / ARRAY_SIZE_16, col_last, act_base + cfg_out_base);
                 `endif
                 // Param base: 4 words per channel, ARRAY_SIZE channels per group
                 param_base <= oc_group * ARRAY_SIZE_16 * 4;
@@ -1725,7 +1729,7 @@ module npu_compute #(
                             end
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_rd_en   <= 1'b1;
-                            act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
+                            act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
                             act_byte_sel <= byte_off[1:0];
                         end
                         dw_read_issued <= 1'b1;
@@ -2396,7 +2400,7 @@ module npu_compute #(
                         `endif
                         if (add_elem_cnt >= 16'd18816 && add_elem_cnt <= 16'd18820)
                             $display("[WB_DBG] elem=%0d tile(%0d,%0d) wb_addr=%0d cfg_act_base=%0d tile_elem=%0d merged=0x%08x wb_byte=0x%04x",
-                                     add_elem_cnt, tile_y, tile_x, add_wb_addr, cfg_act_base, add_tile_elem_cnt, merged, add_wb_byte);
+                                     add_elem_cnt, tile_y, tile_x, add_wb_addr, act_base, add_tile_elem_cnt, merged, add_wb_byte);
                     end
                     state <= S_ADD_NEXT;
                 end
@@ -2517,21 +2521,33 @@ module npu_compute #(
             end
 
             S_RESIZE_COORD: begin
+                // Cycle 1: first multiply only (oh_global * in_h, ow_global * in_w)
                 begin : rsz_coord_blk
-                    reg [31:0] src_h_q8, src_w_q8;
                     reg [31:0] oh_global, ow_global;
-                    reg [15:0] ih_nearest, iw_nearest;
                     oh_global = tile_oh_origin + rsz_oh;
                     ow_global = tile_ow_origin + rsz_ow;
-
                     if (!resize_mode) begin
-                        begin : nn_div_blk
-                            reg [71:0] prod_h, prod_w;
-                            prod_h = oh_global * cfg_in_h * recip_out_h;
-                            prod_w = ow_global * cfg_in_w * recip_out_w;
-                            ih_nearest = prod_h[71:40];
-                            iw_nearest = prod_w[71:40];
-                        end
+                        rsz_coord_prod_h <= oh_global * cfg_in_h;
+                        rsz_coord_prod_w <= ow_global * cfg_in_w;
+                    end else begin
+                        rsz_coord_prod_h <= oh_global * ((cfg_in_h - 1) << 8);
+                        rsz_coord_prod_w <= ow_global * ((cfg_in_w - 1) << 8);
+                    end
+                end
+                state <= S_RESIZE_COORD2;
+            end
+
+            S_RESIZE_COORD2: begin
+                // Cycle 2: second multiply (prod * recip) + register results
+                begin : rsz_coord2_blk
+                    reg [71:0] prod_h, prod_w;
+                    reg [15:0] ih_nearest, iw_nearest;
+                    reg [31:0] src_h_q8, src_w_q8;
+                    if (!resize_mode) begin
+                        prod_h = rsz_coord_prod_h * recip_out_h;
+                        prod_w = rsz_coord_prod_w * recip_out_w;
+                        ih_nearest = prod_h[71:40];
+                        iw_nearest = prod_w[71:40];
                         rsz_ih0 <= ih_nearest;
                         rsz_iw0 <= iw_nearest;
                         rsz_ih1 <= ih_nearest;
@@ -2539,25 +2555,20 @@ module npu_compute #(
                         rsz_frac_h <= 0;
                         rsz_frac_w <= 0;
                     end else begin
-                        begin : bil_div_blk
-                            reg [71:0] prod_h, prod_w;
-                            if (cfg_out_h > 1) begin
-                                prod_h = oh_global * ((cfg_in_h - 1) << 8) * recip_out_h_m1;
-                                src_h_q8 = prod_h[71:40];
-                            end else
-                                src_h_q8 = 0;
-                            if (cfg_out_w > 1) begin
-                                prod_w = ow_global * ((cfg_in_w - 1) << 8) * recip_out_w_m1;
-                                src_w_q8 = prod_w[71:40];
-                            end else
-                                src_w_q8 = 0;
-                        end
-
+                        if (cfg_out_h > 1) begin
+                            prod_h = rsz_coord_prod_h * recip_out_h_m1;
+                            src_h_q8 = prod_h[71:40];
+                        end else
+                            src_h_q8 = 0;
+                        if (cfg_out_w > 1) begin
+                            prod_w = rsz_coord_prod_w * recip_out_w_m1;
+                            src_w_q8 = prod_w[71:40];
+                        end else
+                            src_w_q8 = 0;
                         rsz_ih0 <= src_h_q8[31:8];
                         rsz_iw0 <= src_w_q8[31:8];
                         rsz_frac_h <= src_h_q8[7:0];
                         rsz_frac_w <= src_w_q8[7:0];
-
                         if (src_h_q8[31:8] + 1 >= cfg_in_h)
                             rsz_ih1 <= cfg_in_h - 1;
                         else
@@ -2593,7 +2604,7 @@ module npu_compute #(
                         end
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                         act_rd_en   <= 1'b1;
-                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
                     end
                     rsz_rd_phase <= 2'd1;
@@ -2646,7 +2657,7 @@ module npu_compute #(
                         end
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                         act_rd_en   <= 1'b1;
-                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
                     end
                     rsz_rd_phase <= 2'd1;
@@ -2696,7 +2707,7 @@ module npu_compute #(
                         end
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                         act_rd_en   <= 1'b1;
-                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
                     end
                     rsz_rd_phase <= 2'd1;
@@ -2746,7 +2757,7 @@ module npu_compute #(
                         end
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                         act_rd_en   <= 1'b1;
-                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
                     end
                     rsz_rd_phase <= 2'd1;

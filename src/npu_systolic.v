@@ -235,13 +235,27 @@ module npu_systolic #(
     generate
         for (r = 0; r < ROWS; r = r + 1) begin : gen_drain_mux
             reg signed [ACC_W-1:0] acc_mux;
-            integer ci;
             always @(*) begin
-                acc_mux = {ACC_W{1'b0}};
-                for (ci = 0; ci < COLS; ci = ci + 1) begin
-                    if (drain_col_sel == ci[$clog2(COLS)-1:0])
-                        acc_mux = pe_acc_out[r][ci];
-                end
+                (* full_case *)
+                case (drain_col_sel)
+                    4'd0:  acc_mux = pe_acc_out[r][0];
+                    4'd1:  acc_mux = pe_acc_out[r][1];
+                    4'd2:  acc_mux = pe_acc_out[r][2];
+                    4'd3:  acc_mux = pe_acc_out[r][3];
+                    4'd4:  acc_mux = pe_acc_out[r][4];
+                    4'd5:  acc_mux = pe_acc_out[r][5];
+                    4'd6:  acc_mux = pe_acc_out[r][6];
+                    4'd7:  acc_mux = pe_acc_out[r][7];
+                    4'd8:  acc_mux = pe_acc_out[r][8];
+                    4'd9:  acc_mux = pe_acc_out[r][9];
+                    4'd10: acc_mux = pe_acc_out[r][10];
+                    4'd11: acc_mux = pe_acc_out[r][11];
+                    4'd12: acc_mux = pe_acc_out[r][12];
+                    4'd13: acc_mux = pe_acc_out[r][13];
+                    4'd14: acc_mux = pe_acc_out[r][14];
+                    4'd15: acc_mux = pe_acc_out[r][15];
+                    default: acc_mux = {ACC_W{1'b0}};
+                endcase
             end
             assign acc_out[r] = acc_mux;
         end
