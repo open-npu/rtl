@@ -383,6 +383,21 @@ module npu_compute #(
     wire [8:0]  deconv_step_h = {1'b0, cfg_insert_h} + 9'd1; // ins_h + 1
     wire [8:0]  deconv_step_w = {1'b0, cfg_insert_w} + 9'd1; // ins_w + 1
     reg         deconv_skip;  // 1 = current (fh, fw) maps to zero-inserted position
+
+    // ─── Deconv reciprocal LUT (step=1,2,3,4) ───
+    // Q32: ih = (eh * recip) >> 32
+    wire [31:0] recip_deconv_h = (cfg_insert_h == 8'd0) ? 32'h8000_0000 :  // step=1, shift 31
+                                 (cfg_insert_h == 8'd1) ? 32'h8000_0000 :  // step=2, shift 32
+                                 (cfg_insert_h == 8'd2) ? 32'h5555_5556 :  // step=3
+                                 (cfg_insert_h == 8'd3) ? 32'h4000_0000 :  // step=4
+                                 32'h0;
+    wire [31:0] recip_deconv_w = (cfg_insert_w == 8'd0) ? 32'h8000_0000 :
+                                 (cfg_insert_w == 8'd1) ? 32'h8000_0000 :
+                                 (cfg_insert_w == 8'd2) ? 32'h5555_5556 :
+                                 (cfg_insert_w == 8'd3) ? 32'h4000_0000 :
+                                 32'h0;
+    wire deconv_h_shift1 = (cfg_insert_h == 8'd0);  // step=1: shift 31
+    wire deconv_w_shift1 = (cfg_insert_w == 8'd0);
     // ─── Concat state ───
     wire [15:0] concat_offset  = cfg_concat_cfg[15:0];
     wire [15:0] concat_total_c = cfg_concat_cfg[31:16];
@@ -849,23 +864,35 @@ module npu_compute #(
                             // Deconv: eh = oh + pad - fh, then check modulo
                             eh = conv_ih_base - $signed({8'd0, conv_fh});
                             ew = conv_iw_base - $signed({8'd0, conv_fw});
-                            if ((eh < 0) || (eh >= $signed({1'b0, deconv_exp_h}))
-                                || (ew < 0) || (ew >= $signed({1'b0, deconv_exp_w}))
-                                || (eh[15:0] % deconv_step_h[8:0] != 0)
-                                || (ew[15:0] % deconv_step_w[8:0] != 0)) begin
-                                conv_is_pad  <= 1'b0;
-                                deconv_skip  <= 1'b1;
-                            end else begin
-                                ih = $signed(eh[15:0] / deconv_step_h[8:0]);
-                                iw = $signed(ew[15:0] / deconv_step_w[8:0]);
-                                conv_is_pad  <= (ih < 0) || (ih >= $signed({1'b0, cfg_in_h}))
-                                             || (iw < 0) || (iw >= $signed({1'b0, cfg_in_w}));
-                                deconv_skip  <= 1'b0;
-                                elem_off = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c
-                                         + conv_ch_cnt;
-                                byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
-                                act_word_addr <= {2'd0, act_base} + byte_off[17:2];
-                                act_byte_sel <= byte_off[1:0];
+                            begin : deconv_addr_blk
+                                reg [47:0] qh, qw;  // 16b * 32b = 48b
+                                reg [15:0] ih_u, iw_u;
+                                // ih = eh / step, using reciprocal
+                                qh = (eh[15:0] * recip_deconv_h);
+                                if (deconv_h_shift1) ih_u = qh[46:31];
+                                else                  ih_u = qh[47:32];
+                                qw = (ew[15:0] * recip_deconv_w);
+                                if (deconv_w_shift1) iw_u = qw[46:31];
+                                else                  iw_u = qw[47:32];
+                                // modulo: eh % step = eh - ih*step
+                                if ((eh < 0) || (eh >= $signed({1'b0, deconv_exp_h}))
+                                    || (ew < 0) || (ew >= $signed({1'b0, deconv_exp_w}))
+                                    || (eh[15:0] != ih_u * deconv_step_h[8:0])
+                                    || (ew[15:0] != iw_u * deconv_step_w[8:0])) begin
+                                    conv_is_pad  <= 1'b0;
+                                    deconv_skip  <= 1'b1;
+                                end else begin
+                                    ih = $signed({16'd0, ih_u});
+                                    iw = $signed({16'd0, iw_u});
+                                    conv_is_pad  <= (ih < 0) || (ih >= $signed({1'b0, cfg_in_h}))
+                                                 || (iw < 0) || (iw >= $signed({1'b0, cfg_in_w}));
+                                    deconv_skip  <= 1'b0;
+                                    elem_off = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c
+                                             + conv_ch_cnt;
+                                    byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                                    act_word_addr <= {2'd0, act_base} + byte_off[17:2];
+                                    act_byte_sel <= byte_off[1:0];
+                                end
                             end
                         end else begin
                             ih = conv_ih_base + $signed({8'd0, conv_fh});
@@ -995,22 +1022,32 @@ module npu_compute #(
                         if (is_deconv) begin
                             neh = conv_ih_base - $signed({8'd0, next_fh});
                             new_ = conv_iw_base - $signed({8'd0, next_fw});
-                            if ((neh < 0) || (neh >= $signed({1'b0, deconv_exp_h}))
-                                || (new_ < 0) || (new_ >= $signed({1'b0, deconv_exp_w}))
-                                || (neh[15:0] % deconv_step_h[8:0] != 0)
-                                || (new_[15:0] % deconv_step_w[8:0] != 0)) begin
-                                conv_is_pad  <= 1'b0;
-                                deconv_skip  <= 1'b1;
-                            end else begin
-                                nih = $signed(neh[15:0] / deconv_step_h[8:0]);
-                                niw = $signed(new_[15:0] / deconv_step_w[8:0]);
-                                conv_is_pad <= (nih < 0) || (nih >= $signed({1'b0, cfg_in_h}))
-                                            || (niw < 0) || (niw >= $signed({1'b0, cfg_in_w}));
-                                deconv_skip <= 1'b0;
-                                elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c;
-                                byte_off_n = cfg_int16 ? (elem_off_n << 1) : elem_off_n;
-                                act_word_addr <= {2'd0, act_base} + byte_off_n[17:2];
-                                act_byte_sel <= byte_off_n[1:0];
+                            begin : deconv_next_addr_blk
+                                reg [47:0] qh_n, qw_n;
+                                reg [15:0] nih_u, niw_u;
+                                qh_n = (neh[15:0] * recip_deconv_h);
+                                if (deconv_h_shift1) nih_u = qh_n[46:31];
+                                else                  nih_u = qh_n[47:32];
+                                qw_n = (new_[15:0] * recip_deconv_w);
+                                if (deconv_w_shift1) niw_u = qw_n[46:31];
+                                else                  niw_u = qw_n[47:32];
+                                if ((neh < 0) || (neh >= $signed({1'b0, deconv_exp_h}))
+                                    || (new_ < 0) || (new_ >= $signed({1'b0, deconv_exp_w}))
+                                    || (neh[15:0] != nih_u * deconv_step_h[8:0])
+                                    || (new_[15:0] != niw_u * deconv_step_w[8:0])) begin
+                                    conv_is_pad  <= 1'b0;
+                                    deconv_skip  <= 1'b1;
+                                end else begin
+                                    nih = $signed({16'd0, nih_u});
+                                    niw = $signed({16'd0, niw_u});
+                                    conv_is_pad <= (nih < 0) || (nih >= $signed({1'b0, cfg_in_h}))
+                                                || (niw < 0) || (niw >= $signed({1'b0, cfg_in_w}));
+                                    deconv_skip <= 1'b0;
+                                    elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c;
+                                    byte_off_n = cfg_int16 ? (elem_off_n << 1) : elem_off_n;
+                                    act_word_addr <= {2'd0, act_base} + byte_off_n[17:2];
+                                    act_byte_sel <= byte_off_n[1:0];
+                                end
                             end
                         end else begin
                             nih = conv_ih_base + $signed({8'd0, next_fh});
