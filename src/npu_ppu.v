@@ -193,16 +193,14 @@ module npu_ppu #(
                 end
             end
 
-            // ─── Compute Stage 3: rounding right shift (reads current s2 regs) ───
+            // ─── Compute Stage 3: right shift only (rounding already in s2_product) ───
             shift_amt = s2_shift_s;
             if (s2_mode == MODE_CONV_REQ) begin
-                // Rounding: add 2^(S-1) before right shift, matching CSIM
-                // For S >= 56, rounding bit overflows PROD_W — treat as 0 (matches CSIM)
+                // s2_product already includes rounding bit (added in S2)
                 if (shift_amt > 0 && shift_amt < PROD_W)
-                    rounded_v = s2_product + ($signed({{(PROD_W-1){1'b0}}, 1'b1}) << (shift_amt - 1));
+                    shifted_full = s2_product >>> shift_amt;
                 else
-                    rounded_v = s2_product;
-                shifted_full = rounded_v >>> shift_amt;
+                    shifted_full = s2_product;
                 // Saturate to 17-bit signed range to avoid truncation overflow
                 // 17-bit signed: [-65536, +65535]
                 if (shifted_full > 56'sd65535)
@@ -223,11 +221,16 @@ module npu_ppu #(
             s3_zp_en   <= s2_zp_en;
             s3_int16   <= s2_int16;
 
-            // ─── Compute Stage 2: multiply (reads current s1 regs) ───
+            // ─── Compute Stage 2: multiply + rounding bit (reads current s1 regs) ───
+            // Merge rounding add into S2 to avoid double barrel shifter in S3
             if (s1_mode == MODE_CONV_REQ)
                 product_v = s1_biased * $signed({1'b0, s1_mult_m});
             else
                 product_v = {{MULT_W{s1_biased[ACC_W-1]}}, s1_biased};  // sign-extend 40-bit
+
+            // Add rounding bit now (was in S3): product + (1 << (shift-1))
+            if (s1_mode == MODE_CONV_REQ && s1_shift_s > 0 && s1_shift_s < PROD_W)
+                product_v = product_v + ($signed({{(PROD_W-1){1'b0}}, 1'b1}) << (s1_shift_s - 1));
 
             s2_valid   <= s1_valid;
             s2_mode    <= s1_mode;
