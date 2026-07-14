@@ -1519,6 +1519,8 @@ module npu_compute #(
                         tile_wait_delay <= 1'b0;
                         if (cfg_op_type == 8'd4 || cfg_op_type == 8'd7) begin
                             // Add/Concat: clip tile dims for new tile, then read
+                            // Re-latch act_base here since this path skips S_TILE_SETUP
+                            act_base <= cfg_act_base;
                             if (cfg_tile_h != 17'd0) begin
                                 out_tile_h <= cfg_tile_h;
                                 out_tile_w <= cfg_tile_w;
@@ -1989,7 +1991,7 @@ module npu_compute #(
                             end
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_rd_en   <= 1'b1;
-                            act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
+                            act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
                             act_byte_sel <= byte_off[1:0];
                         end
                         pool_rd_phase <= 1;
@@ -2242,7 +2244,7 @@ module npu_compute #(
                         reg [31:0] byte_off;
                         byte_off = cfg_int16 ? ({17'd0, add_tile_elem_cnt} << 1) : {17'd0, add_tile_elem_cnt};
                         act_rd_en   <= 1'b1;
-                        act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
                     end
                     add_rd_phase <= 1;
@@ -2275,7 +2277,7 @@ module npu_compute #(
                         reg [31:0] byte_off;
                         byte_off = cfg_int16 ? ({17'd0, add_tile_elem_cnt} << 1) : {17'd0, add_tile_elem_cnt};
                         act_rd_en   <= 1'b1;
-                        act_rd_addr <= cfg_act_base + cfg_out_base + byte_off[ACT_ADDR_W+1:2];
+                        act_rd_addr <= act_base + cfg_out_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
                     end
                     add_rd_phase <= 1;
@@ -2351,9 +2353,9 @@ module npu_compute #(
                         // Concat writes to output region (cfg_act_base + cfg_out_base),
                         // Add writes in-place to input A region (cfg_act_base)
                         if (is_concat)
-                            add_wb_addr    <= cfg_act_base + cfg_out_base + byte_off[ACT_ADDR_W+1:2];
+                            add_wb_addr    <= act_base + cfg_out_base + byte_off[ACT_ADDR_W+1:2];
                         else
-                            add_wb_addr    <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
+                            add_wb_addr    <= act_base + byte_off[ACT_ADDR_W+1:2];
                         add_wb_bytesel <= byte_off[1:0];
                     end
                     add_wb_byte <= ppu_out_data;
@@ -2598,7 +2600,7 @@ module npu_compute #(
                         end
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                         act_rd_en   <= 1'b1;
-                        act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
                     end
                     rsz_rd_phase <= 2'd1;
@@ -2651,7 +2653,7 @@ module npu_compute #(
                         end
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                         act_rd_en   <= 1'b1;
-                        act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
                     end
                     rsz_rd_phase <= 2'd1;
@@ -2701,7 +2703,7 @@ module npu_compute #(
                         end
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                         act_rd_en   <= 1'b1;
-                        act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
                     end
                     rsz_rd_phase <= 2'd1;
@@ -2751,7 +2753,7 @@ module npu_compute #(
                         end
                         byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                         act_rd_en   <= 1'b1;
-                        act_rd_addr <= cfg_act_base + byte_off[ACT_ADDR_W+1:2];
+                        act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
                         act_byte_sel <= byte_off[1:0];
                     end
                     rsz_rd_phase <= 2'd1;
