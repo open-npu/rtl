@@ -244,7 +244,6 @@ module npu_compute #(
         S_WAIT_WGT_RELOAD = 7'd63, // Wait for controller to reload next oc_group weights
         S_RESIZE_INTERP1  = 7'd64, // Bilinear interp cycle 1 (4 mults: top/bot)
         S_RESIZE_INTERP2  = 7'd65; // Bilinear interp cycle 2 (2 mults: val64)
-
     (* fsm_encoding = "one_hot" *)
     reg [6:0] state;
 
@@ -386,6 +385,9 @@ module npu_compute #(
     wire [8:0]  deconv_step_h = {1'b0, cfg_insert_h} + 9'd1; // ins_h + 1
     wire [8:0]  deconv_step_w = {1'b0, cfg_insert_w} + 9'd1; // ins_w + 1
     reg         deconv_skip;  // 1 = current (fh, fw) maps to zero-inserted position
+    // Deconv precomputed address (avoids deep combinational path in S_ACT_CMD)
+    reg [31:0]  deconv_elem_off;  // precomputed elem_off for deconv
+    reg         deconv_addr_valid; // 1 = deconv_elem_off is valid (not skip)
 
     // ─── Deconv reciprocal LUT (step=1,2,3,4) ───
     // Q32: ih = (eh * recip) >> 32
@@ -891,42 +893,17 @@ module npu_compute #(
                     // Compute activation address for current (conv_fh, conv_fw)
                     begin : act_addr_blk
                         reg signed [15:0] ih, iw;
-                        reg signed [15:0] eh, ew;
                         reg [31:0] elem_off;
                         reg [31:0] byte_off;
                         if (is_deconv) begin
-                            // Deconv: eh = oh + pad - fh, then check modulo
-                            eh = conv_ih_base - $signed({8'd0, conv_fh});
-                            ew = conv_iw_base - $signed({8'd0, conv_fw});
-                            begin : deconv_addr_blk
-                                reg [47:0] qh, qw;  // 16b * 32b = 48b
-                                reg [15:0] ih_u, iw_u;
-                                // ih = eh / step, using reciprocal
-                                qh = (eh[15:0] * recip_deconv_h);
-                                if (deconv_h_shift1) ih_u = qh[46:31];
-                                else                  ih_u = qh[47:32];
-                                qw = (ew[15:0] * recip_deconv_w);
-                                if (deconv_w_shift1) iw_u = qw[46:31];
-                                else                  iw_u = qw[47:32];
-                                // modulo: eh % step = eh - ih*step
-                                if ((eh < 0) || (eh >= $signed({1'b0, deconv_exp_h}))
-                                    || (ew < 0) || (ew >= $signed({1'b0, deconv_exp_w}))
-                                    || (eh[15:0] != ih_u * deconv_step_h[8:0])
-                                    || (ew[15:0] != iw_u * deconv_step_w[8:0])) begin
-                                    conv_is_pad  <= 1'b0;
-                                    deconv_skip  <= 1'b1;
-                                end else begin
-                                    ih = $signed({17'd0, ih_u});
-                                    iw = $signed({17'd0, iw_u});
-                                    conv_is_pad  <= (ih < 0) || (ih >= $signed({1'b0, cfg_in_h}))
-                                                 || (iw < 0) || (iw >= $signed({1'b0, cfg_in_w}));
-                                    deconv_skip  <= 1'b0;
-                                    elem_off = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c
-                                             + conv_ch_cnt;
-                                    byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
-                                    act_word_addr <= {2'd0, act_base} + byte_off[17:2];
-                                    act_byte_sel <= byte_off[1:0];
-                                end
+                            // Deconv: address precomputed in S_SPATIAL_SETUP
+                            if (deconv_skip) begin
+                                // Already set by S_SPATIAL_SETUP
+                            end else if (deconv_addr_valid) begin
+                                elem_off = deconv_elem_off;
+                                byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                                act_word_addr <= {2'd0, act_base} + byte_off[17:2];
+                                act_byte_sel <= byte_off[1:0];
                             end
                         end else begin
                             ih = conv_ih_base + $signed({8'd0, conv_fh});
@@ -1357,11 +1334,47 @@ module npu_compute #(
                 // Compute input window origin for output pixel (sp_oh, sp_ow)
                 // Use global output coordinates for input address & padding check
                 if (is_deconv) begin
-                    // Deconv: ih_base = oh + pad_top (fh subtracted later in S_ACT_CMD)
+                    // Deconv: ih_base = oh + pad_top (fh subtracted later)
                     conv_ih_base <= $signed({1'b0, tile_oh_origin + sp_oh})
                                   + $signed({1'b0, cfg_pad_top[7:0]});
                     conv_iw_base <= $signed({1'b0, tile_ow_origin + sp_ow})
                                   + $signed({1'b0, cfg_pad_left[7:0]});
+                    // Precompute deconv address here (avoid deep combinational
+                    // path in S_ACT_CMD). conv_ih_base is non-blocking so use
+                    // local blocking vars for the deconv calc.
+                    begin : deconv_precompute_blk
+                        reg signed [15:0] eh_local, ew_local;
+                        reg [47:0] qh, qw;
+                        reg [15:0] ih_u, iw_u;
+                        reg signed [15:0] ih_s, iw_s;
+                        eh_local = $signed({1'b0, tile_oh_origin + sp_oh})
+                                 + $signed({1'b0, cfg_pad_top[7:0]})
+                                 - $signed({8'd0, conv_fh});
+                        ew_local = $signed({1'b0, tile_ow_origin + sp_ow})
+                                 + $signed({1'b0, cfg_pad_left[7:0]})
+                                 - $signed({8'd0, conv_fw});
+                        qh = (eh_local[15:0] * recip_deconv_h);
+                        if (deconv_h_shift1) ih_u = qh[46:31];
+                        else                  ih_u = qh[47:32];
+                        qw = (ew_local[15:0] * recip_deconv_w);
+                        if (deconv_w_shift1) iw_u = qw[46:31];
+                        else                  iw_u = qw[47:32];
+                        if ((eh_local < 0) || (eh_local >= $signed({1'b0, deconv_exp_h}))
+                            || (ew_local < 0) || (ew_local >= $signed({1'b0, deconv_exp_w}))
+                            || (eh_local[15:0] != ih_u * deconv_step_h[8:0])
+                            || (ew_local[15:0] != iw_u * deconv_step_w[8:0])) begin
+                            deconv_skip  <= 1'b1;
+                            deconv_addr_valid <= 1'b0;
+                        end else begin
+                            ih_s = $signed({17'd0, ih_u});
+                            iw_s = $signed({17'd0, iw_u});
+                            conv_is_pad <= (ih_s < 0) || (ih_s >= $signed({1'b0, cfg_in_h}))
+                                        || (iw_s < 0) || (iw_s >= $signed({1'b0, cfg_in_w}));
+                            deconv_skip <= 1'b0;
+                            deconv_addr_valid <= 1'b1;
+                            deconv_elem_off <= (ih_u * cfg_in_w + iw_u) * cfg_in_c + conv_ch_cnt;
+                        end
+                    end
                 end else begin
                     conv_ih_base <= $signed({1'b0, tile_oh_origin + sp_oh}) * $signed({1'b0, cfg_stride_h[7:0]})
                                   - $signed({1'b0, cfg_pad_top[7:0]});
