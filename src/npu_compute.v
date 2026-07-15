@@ -702,7 +702,14 @@ module npu_compute #(
                 end else if (cfg_op_type == 8'd5) begin
                     state <= S_RESIZE_SETUP;
                 end else begin
-                    state <= S_OC_SETUP;
+                    // Conv2D/FC: if per-oc reload, need to reload oc_group 0 weights
+                    // (SRAM still has last oc_group's weights from previous tile)
+                    if (cfg_wgt_per_oc != 0) begin
+                        oc_group_done <= 1'b1;  // Request reload of oc_group 0
+                        state <= S_WAIT_WGT_RELOAD;
+                    end else begin
+                        state <= S_OC_SETUP;
+                    end
                 end
             end
 
