@@ -547,6 +547,25 @@ def save_golden(output_dir, int16_mode=False, force_tiling=False, db_en=False):
                 np.array(data['output_words'], dtype=np.uint32))
 
         addrs = get_ddr_addrs(i)
+
+        # Determine scheduling mode
+        has_tiling = cfg['tile_h'] > 0
+        if db_en:
+            sched_ctrl = 0x01  # DB_EN
+        else:
+            sched_ctrl = 0x10  # PTS (per-tile store) for non-DB_EN tiled
+
+        # Per-tile store configuration
+        store_mode = 1 if has_tiling else 0
+        eb = 2 if int16_mode else 1
+        tile_out_size = cfg['tile_h'] * cfg['tile_w'] * cfg['out_c'] * eb if has_tiling else 0
+        row_len = (cfg['tile_w'] * cfg['out_c'] * eb + 3) // 4 if has_tiling else 0
+        row_cfg = (cfg['tile_h'] << 16) | row_len if has_tiling else 0
+
+        # Clamp max: for ReLU6, clamp to min(type_max, round(6/scale))
+        # For simplicity, use type_max (127 for INT8, 32767 for INT16)
+        clamp_max = 32767 if int16_mode else 127
+
         metadata.append({
             'index': i,
             'op_type': cfg['op_type'],
@@ -559,6 +578,7 @@ def save_golden(output_dir, int16_mode=False, force_tiling=False, db_en=False):
             'k_depth': cfg['k_depth'],
             'relu6': cfg['relu6'],
             'post_ctrl': cfg['post_ctrl'],
+            'clamp_max': clamp_max,
             'dma_wgt_size': cfg['dma_wgt_size'],
             'dma_in_size': cfg['dma_in_size'],
             'dma_out_size': cfg['dma_out_size'],
@@ -569,6 +589,10 @@ def save_golden(output_dir, int16_mode=False, force_tiling=False, db_en=False):
             'tile_w': cfg['tile_w'],
             'tile_num_h': cfg['tile_num_h'],
             'tile_num_w': cfg['tile_num_w'],
+            'sched_ctrl': sched_ctrl,
+            'store_mode': store_mode,
+            'tile_out_size': tile_out_size,
+            'row_cfg': row_cfg,
             'ddr_wgt_addr': addrs['wgt_addr'],
             'ddr_param_addr': addrs['param_addr'],
             'ddr_in_addr': addrs['in_addr'],
