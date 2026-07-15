@@ -164,9 +164,9 @@ module npu_ppu #(
 
             out_valid <= s3_valid;
 
-            if (s3_mode == MODE_PASSTHROUGH || s3_mode == MODE_ADD) begin
+            if (s3_mode == MODE_PASSTHROUGH) begin
                 out_data <= zp_result[DATA_W-1:0];
-            end else if (s3_mode == MODE_RELU_ONLY) begin
+            end else if (s3_mode == MODE_RELU_ONLY || s3_mode == MODE_ADD) begin
                 if (s3_int16) begin
                     // INT16 clamp+relu/relu6
                     if ((s3_relu_en || s3_relu6_en) && zp_result < $signed(17'sd0))
