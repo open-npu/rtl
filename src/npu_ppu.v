@@ -29,9 +29,11 @@ module npu_ppu #(
     // ─── Control ───
     input  wire [1:0]                   mode,       // 2'b00=CONV_REQ, 2'b10=RELU_ONLY, 2'b11=PASS
     input  wire                         relu_en,    // Enable ReLU
+    input  wire                         relu6_en,   // Enable ReLU6 (clamp to clamp_max)
     input  wire                         bias_en,    // Enable bias addition
     input  wire                         zp_en,      // Enable zero_point addition
     input  wire                         int16_mode, // 1=INT16 clamp, 0=INT8 clamp
+    input  wire signed [ZP_W-1:0]       clamp_max,  // ReLU6 upper bound (from layer descriptor)
 
     // ─── Input ───
     input  wire signed [ACC_W-1:0]      acc_in,     // From systolic array
@@ -50,6 +52,7 @@ module npu_ppu #(
 
     // ─── Mode encoding ───
     localparam MODE_CONV_REQ    = 2'b00;
+    localparam MODE_ADD         = 2'b01;  // Add: same as PASSTHROUGH (Add done in FSM)
     localparam MODE_RELU_ONLY   = 2'b10;
     localparam MODE_PASSTHROUGH = 2'b11;
 
@@ -66,8 +69,10 @@ module npu_ppu #(
     reg [SHIFT_W-1:0]           s1_shift_s;
     reg signed [ZP_W-1:0]       s1_zp;
     reg                         s1_relu_en;
+    reg                         s1_relu6_en;
     reg                         s1_zp_en;
     reg                         s1_int16;
+    reg signed [ZP_W-1:0]       s1_clamp_max;
 
     // Stage 2: after multiply
     reg signed [PROD_W-1:0]     s2_product;
@@ -76,8 +81,10 @@ module npu_ppu #(
     reg [SHIFT_W-1:0]           s2_shift_s;
     reg signed [ZP_W-1:0]       s2_zp;
     reg                         s2_relu_en;
+    reg                         s2_relu6_en;
     reg                         s2_zp_en;
     reg                         s2_int16;
+    reg signed [ZP_W-1:0]       s2_clamp_max;
 
     // Stage 3: after shift
     reg signed [ZP_W:0]         s3_shifted;  // 17-bit
@@ -85,8 +92,10 @@ module npu_ppu #(
     reg [1:0]                   s3_mode;
     reg signed [ZP_W-1:0]       s3_zp;
     reg                         s3_relu_en;
+    reg                         s3_relu6_en;
     reg                         s3_zp_en;
     reg                         s3_int16;
+    reg signed [ZP_W-1:0]       s3_clamp_max;
 
     // ═══════════════════════════════════════════════════════════════════
     // Pipeline — single always block with all computations inline
@@ -99,6 +108,7 @@ module npu_ppu #(
         reg signed [PROD_W-1:0] shifted_full;
         reg signed [ZP_W:0]     shifted_v;
         reg signed [ZP_W:0]     zp_result;
+        reg signed [ZP_W:0]     clamp_hi;  // Upper clamp bound (32767 or clamp_max for ReLU6)
         reg [SHIFT_W-1:0]       shift_amt;
 
         if (!rst_n) begin
@@ -109,8 +119,10 @@ module npu_ppu #(
             s1_shift_s <= 0;
             s1_zp      <= 0;
             s1_relu_en <= 1'b0;
+            s1_relu6_en <= 1'b0;
             s1_zp_en   <= 1'b0;
             s1_int16   <= 1'b0;
+            s1_clamp_max <= 0;
 
             s2_product <= 0;
             s2_valid   <= 1'b0;
@@ -118,21 +130,33 @@ module npu_ppu #(
             s2_shift_s <= 0;
             s2_zp      <= 0;
             s2_relu_en <= 1'b0;
+            s2_relu6_en <= 1'b0;
             s2_zp_en   <= 1'b0;
             s2_int16   <= 1'b0;
+            s2_clamp_max <= 0;
 
             s3_shifted <= 0;
             s3_valid   <= 1'b0;
             s3_mode    <= MODE_PASSTHROUGH;
             s3_zp      <= 0;
             s3_relu_en <= 1'b0;
+            s3_relu6_en <= 1'b0;
             s3_zp_en   <= 1'b0;
             s3_int16   <= 1'b0;
+            s3_clamp_max <= 0;
 
             out_data   <= 0;
             out_valid  <= 1'b0;
         end else begin
             // ─── Compute Stage 4 output FIRST (reads current s3 regs) ───
+            // Compute effective clamp upper bound: relu6 uses clamp_max, else type max
+            if (s3_relu6_en)
+                clamp_hi = $signed({1'b0, s3_clamp_max});  // clamp_max is unsigned range [0, 65535]
+            else if (s3_int16)
+                clamp_hi = 17'sd32767;
+            else
+                clamp_hi = 17'sd127;
+
             if (s3_zp_en && s3_mode == MODE_CONV_REQ)
                 zp_result = s3_shifted + $signed({{1{s3_zp[ZP_W-1]}}, s3_zp});
             else
@@ -140,50 +164,50 @@ module npu_ppu #(
 
             out_valid <= s3_valid;
 
-            if (s3_mode == MODE_PASSTHROUGH) begin
+            if (s3_mode == MODE_PASSTHROUGH || s3_mode == MODE_ADD) begin
                 out_data <= zp_result[DATA_W-1:0];
             end else if (s3_mode == MODE_RELU_ONLY) begin
                 if (s3_int16) begin
-                    // INT16 clamp+relu
-                    if (s3_relu_en && zp_result < $signed(17'sd0))
+                    // INT16 clamp+relu/relu6
+                    if ((s3_relu_en || s3_relu6_en) && zp_result < $signed(17'sd0))
                         out_data <= 16'sd0;
                     else if (zp_result < -$signed(17'sd32768))
                         out_data <= -16'sd32768;
-                    else if (zp_result > $signed(17'sd32767))
-                        out_data <= 16'sd32767;
+                    else if (zp_result > clamp_hi)
+                        out_data <= clamp_hi[DATA_W-1:0];
                     else
                         out_data <= zp_result[DATA_W-1:0];
                 end else begin
-                    // INT8 clamp+relu (sign-extend to 16-bit output)
-                    if (s3_relu_en && zp_result < $signed(17'sd0))
+                    // INT8 clamp+relu/relu6 (sign-extend to 16-bit output)
+                    if ((s3_relu_en || s3_relu6_en) && zp_result < $signed(17'sd0))
                         out_data <= 16'sd0;
                     else if (zp_result < -$signed(17'sd128))
                         out_data <= {{8{1'b1}}, 8'h80};  // -128 sign-extended
-                    else if (zp_result > $signed(17'sd127))
-                        out_data <= 16'sd127;
+                    else if (zp_result > clamp_hi)
+                        out_data <= {{8{clamp_hi[7]}}, clamp_hi[7:0]};
                     else
                         out_data <= {{8{zp_result[7]}}, zp_result[7:0]};
                 end
             end else begin
                 // MODE_CONV_REQ: Clamp then ReLU
                 if (s3_int16) begin
-                    // INT16: clamp to [-32768, 32767]
+                    // INT16: clamp to [-32768, clamp_hi]
                     if (zp_result < -$signed(17'sd32768)) begin
-                        out_data <= (s3_relu_en) ? 16'sd0 : -16'sd32768;
-                    end else if (zp_result > $signed(17'sd32767)) begin
-                        out_data <= 16'sd32767;
+                        out_data <= (s3_relu_en || s3_relu6_en) ? 16'sd0 : -16'sd32768;
+                    end else if (zp_result > clamp_hi) begin
+                        out_data <= clamp_hi[DATA_W-1:0];
                     end else begin
-                        if (s3_relu_en && zp_result < $signed(17'sd0))
+                        if ((s3_relu_en || s3_relu6_en) && zp_result < $signed(17'sd0))
                             out_data <= 16'sd0;
                         else
                             out_data <= zp_result[DATA_W-1:0];
                     end
                 end else begin
-                    // INT8: clamp to [-128, 127], sign-extend to 16-bit
+                    // INT8: clamp to [-128, clamp_hi], sign-extend to 16-bit
                     if (zp_result < -$signed(17'sd128)) begin
-                        out_data <= (s3_relu_en) ? 16'sd0 : {{8{1'b1}}, 8'h80};
-                    end else if (zp_result > $signed(17'sd127)) begin
-                        out_data <= 16'sd127;
+                        out_data <= (s3_relu_en || s3_relu6_en) ? 16'sd0 : {{8{1'b1}}, 8'h80};
+                    end else if (zp_result > clamp_hi) begin
+                        out_data <= {{8{clamp_hi[7]}}, clamp_hi[7:0]};
                     end else begin
                         if (s3_relu_en && zp_result < $signed(17'sd0))
                             out_data <= 16'sd0;
@@ -218,8 +242,10 @@ module npu_ppu #(
             s3_shifted <= shifted_v;
             s3_zp      <= s2_zp;
             s3_relu_en <= s2_relu_en;
+            s3_relu6_en <= s2_relu6_en;
             s3_zp_en   <= s2_zp_en;
             s3_int16   <= s2_int16;
+            s3_clamp_max <= s2_clamp_max;
 
             // ─── Compute Stage 2: multiply + rounding bit (reads current s1 regs) ───
             // Merge rounding add into S2 to avoid double barrel shifter in S3
@@ -238,8 +264,10 @@ module npu_ppu #(
             s2_shift_s <= s1_shift_s;
             s2_zp      <= s1_zp;
             s2_relu_en <= s1_relu_en;
+            s2_relu6_en <= s1_relu6_en;
             s2_zp_en   <= s1_zp_en;
             s2_int16   <= s1_int16;
+            s2_clamp_max <= s1_clamp_max;
 
             // ─── Compute Stage 1: bias addition (reads input ports) ───
             if (bias_en && mode == MODE_CONV_REQ)
@@ -254,8 +282,10 @@ module npu_ppu #(
             s1_shift_s <= shift_s;
             s1_zp      <= zero_point;
             s1_relu_en <= relu_en;
+            s1_relu6_en <= relu6_en;
             s1_zp_en   <= zp_en;
             s1_int16   <= int16_mode;
+            s1_clamp_max <= clamp_max;
         end
     end
 

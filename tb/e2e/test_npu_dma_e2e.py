@@ -230,7 +230,8 @@ async def program_layer(wb, meta):
         await wb.write(0x120, meta['ddr_add_b_addr'])  # DMA_ADD_B_ADDR
 
     # Post-processing
-    await wb.write(0x180, meta['post_ctrl'])       # POST_CTRL
+    await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
     await wb.write(0x188, meta['dma_param_count']) # POST_PARAM_COUNT
 
     # Concat config (if present)
@@ -875,6 +876,7 @@ async def program_layer_db_en(wb, meta):
 
     # Post-processing
     await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
     await wb.write(0x188, meta['dma_param_count'])
 
     # DB_EN=1 (bit[0]) — enable double-buffer ping-pong prefetch
@@ -1053,6 +1055,7 @@ async def program_layer_fused_db_en(wb, meta, sched_ctrl, out_base=None, db_en=T
     await wb.write(0x130, meta['dma_out_size'])
 
     await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
     await wb.write(0x188, meta['dma_param_count'])
 
     # sched_ctrl: DB_EN=bit[0] (for FUSE_START), FUSE_START(bit1), FUSE_MID(bit2), FUSE_END(bit3)
@@ -1102,6 +1105,7 @@ async def test_dma_e2e_tiling_int8_db_en_fused(dut):
         await wb.write(0x12C, meta['dma_wgt_size'])
         await wb.write(0x130, meta['dma_out_size'])
         await wb.write(0x180, meta['post_ctrl'])
+        await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
         await wb.write(0x188, meta['dma_param_count'])
         await wb.write(0x118, sched | (0x01 if db else 0))
 
@@ -1278,6 +1282,7 @@ async def program_layer_with_stride(wb, meta, in_stride, out_stride):
     await wb.write(0x130, meta['dma_out_size'])
 
     await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
     await wb.write(0x188, meta['dma_param_count'])
 
     await wb.write(0x118, 0)  # no fusion, no DB_EN
@@ -1544,6 +1549,7 @@ async def program_pooling_layer(wb, meta, data):
 
     # Post-processing
     await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
     await wb.write(0x188, meta['dma_param_count'])
 
     # No fusion
@@ -1588,6 +1594,7 @@ async def program_add_layer(wb, meta, data):
 
     # Post-processing
     await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
     # Param count: for Add, the per-channel PPU params are not used.
     # The add params (2 words) are loaded to param SRAM via DMA_PARAM_ADDR.
     # We load 2 words (set param_count such that param_words=2 → count=0 special case).
@@ -1629,6 +1636,7 @@ async def program_resize_layer(wb, meta, data):
     await wb.write(0x130, meta['dma_out_size'])
 
     await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
     await wb.write(0x188, meta['dma_param_count'])
     await wb.write(0x118, 0)
 
@@ -2165,6 +2173,7 @@ async def program_deconv_layer(wb, meta, data):
 
     # Post-processing (MODE_CONV_REQ)
     await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
     await wb.write(0x188, meta['dma_param_count'])
     await wb.write(0x118, 0)
 
@@ -2393,6 +2402,7 @@ async def program_concat_layer(wb, meta, data, out_base):
 
     # Post-processing
     await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
     await wb.write(0x188, 1)  # param_count=1 (loads 4 words, only first 1 matters)
 
     # No fusion
@@ -2502,6 +2512,7 @@ async def program_conv1x1_layer(wb, meta):
     await wb.write(0x12C, meta['dma_wgt_size'])
     await wb.write(0x130, meta['dma_out_size'])
     await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
     await wb.write(0x188, meta['dma_param_count'])
     await wb.write(0x118, 0)  # no fusion
 
@@ -2721,6 +2732,7 @@ async def program_generic_layer(wb, meta, out_base=None):
 
     # Post-processing
     await wb.write(0x180, meta['post_ctrl'])
+    await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
     param_count = meta.get('dma_param_count', 0)
     if op_type in (4, 7):
         # Add/Concat: param_count=1 to load the rescale params
