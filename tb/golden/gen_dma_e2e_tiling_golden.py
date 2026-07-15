@@ -475,13 +475,16 @@ def build_model_32x32(int16_mode=False, force_tiling=False, db_en=False):
         h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=False) # L4
         h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L5
     else:
-        # Original model: varied channel widths (non-DB_EN)
-        h, w, c = add_conv(current, h, w, c, 32, kernel=3, stride=2, relu6=True)  # L0: [32x32x3]->[16x16x32]
-        h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                  # L1: [16x16x32]->[16x16x32]
-        h, w, c = add_conv(current, h, w, c, 48, kernel=1, stride=1, relu6=True)  # L2: [16x16x32]->[16x16x48]
-        h, w, c = add_dw(current, h, w, c, stride=1, relu6=True)                  # L3: [16x16x48]->[16x16x48]
-        h, w, c = add_conv(current, h, w, c, 16, kernel=1, stride=1, relu6=False) # L4: [16x16x48]->[16x16x16]
-        h, w, c = add_conv(current, h, w, c, 32, kernel=1, stride=1, relu6=True)  # L5: [16x16x16]->[16x16x32]
+        # Non-DB_EN path: use same Conv1x1 stride=1 model as DB_EN
+        # (kernel=3 stride=2 creates halo overlap between tiles that
+        # the simple DB_EN prefetch doesn't handle)
+        out_ch = 8 if int16_mode else 16
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L0
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L1
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L2
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L3
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=False) # L4
+        h, w, c = add_conv(current, h, w, c, out_ch, kernel=1, stride=1, relu6=True)  # L5
 
     return layers, layer_data, input_nhwc
 

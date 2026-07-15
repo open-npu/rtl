@@ -761,7 +761,7 @@ async def test_dma_e2e_tiling_int8_tiled(dut):
                       f"[{meta['out_h']}x{meta['out_w']}x{meta['out_c']}]"
                       f"{tile_info}")
 
-        await program_layer(wb, meta)
+        await program_layer_db_en(wb, meta)
         done = await run_layer_and_wait(wb, dut, timeout=2000000)
         assert done, f"Layer {idx} did not complete within timeout"
 
