@@ -552,8 +552,12 @@ def save_golden(output_dir, int16_mode=False, force_tiling=False, db_en=False):
         has_tiling = cfg['tile_h'] > 0
         if db_en:
             sched_ctrl = 0x01  # DB_EN
+        elif has_tiling:
+            # Non-DB_EN tiled: need both DB_EN and PTS for per-tile store
+            # (PTS path requires DB_EN to get tile_done signal)
+            sched_ctrl = 0x11  # DB_EN | PTS
         else:
-            sched_ctrl = 0x10  # PTS (per-tile store) for non-DB_EN tiled
+            sched_ctrl = 0x00  # no tiling
 
         # Per-tile store configuration
         store_mode = 1 if has_tiling else 0
@@ -582,8 +586,12 @@ def save_golden(output_dir, int16_mode=False, force_tiling=False, db_en=False):
             'dma_wgt_size': cfg['dma_wgt_size'],
             'dma_in_size': cfg['dma_in_size'],
             'dma_out_size': cfg['dma_out_size'],
-            'tile_in_size': cfg['dma_in_size'] // (cfg['tile_num_h'] * cfg['tile_num_w'])
-                           if (db_en and cfg['tile_h'] > 0) else 0,
+            'tile_in_size': (
+                # tile_in_h = tile_h * stride + kernel - stride (halo included)
+                (cfg['tile_h'] * cfg['stride_h'] + cfg['kernel_h'] - cfg['stride_h'])
+                * cfg['in_w'] * cfg['in_c']
+                if (cfg['tile_h'] > 0 and (db_en or force_tiling)) else 0
+            ),
             'dma_param_count': cfg['dma_param_count'],
             'tile_h': cfg['tile_h'],
             'tile_w': cfg['tile_w'],
