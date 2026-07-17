@@ -79,6 +79,11 @@ module npu_dma #(
     // Always select all bytes
     assign wb_sel_o = 4'hF;
 
+`ifndef SYNTHESIS
+    integer dma_dbg_fh;
+    reg       dma_dbg_opened;
+`endif
+
     // ─── FSM States ───
     localparam S_IDLE    = 3'd0;
     localparam S_LOAD    = 3'd1;  // MEM→SRAM: issue WB read
@@ -190,8 +195,14 @@ module npu_dma #(
                         if (wb_ack_i) begin
                             r_data_buf <= wb_dat_i;
                             `ifndef SYNTHESIS
-                            if (xfer_count < 3 && r_sram_addr >= 16'd6144)
-                                $display("[DMA_LD_DATA] t=%0t xfer=%0d data=0x%08x", $time, xfer_count, wb_dat_i);
+                            if (xfer_count < 5 && !wb_we_o) begin
+                                if (!dma_dbg_opened) begin
+                                    dma_dbg_fh = $fopen("dma_load.log", "w");
+                                    dma_dbg_opened = 1;
+                                end
+                                $fwrite(dma_dbg_fh, "LD xfer=%0d addr=0x%08x data=0x%08x sram=%0d\n",
+                                        xfer_count, r_ext_addr, wb_dat_i, r_sram_addr);
+                            end
                             `endif
                             wb_cyc_o   <= 1'b0;
                             wb_stb_o   <= 1'b0;
@@ -263,6 +274,16 @@ module npu_dma #(
                         `endif
                         wb_dat_o <= sram_rdata;
                         if (wb_ack_i) begin
+                            `ifndef SYNTHESIS
+                            if (xfer_count < 5 && wb_we_o) begin
+                                if (!dma_dbg_opened) begin
+                                    dma_dbg_fh = $fopen("dma_store.log", "w");
+                                    dma_dbg_opened = 1;
+                                end
+                                $fwrite(dma_dbg_fh, "ST xfer=%0d addr=0x%08x data=0x%08x sram=%0d\n",
+                                        xfer_count, r_ext_addr, sram_rdata, r_sram_addr);
+                            end
+                            `endif
                             wb_cyc_o    <= 1'b0;
                             wb_stb_o    <= 1'b0;
                             // Advance SRAM pointer (always contiguous)
