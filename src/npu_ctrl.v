@@ -133,7 +133,7 @@ module npu_ctrl (
     wire [15:0] in_words = cfg_dma_in_size[17:2];
 
     // Per-tile input words (for DB_EN): use tile_in_size when non-zero, else full in_words
-    wire [15:0] tile_in_words = (cfg_tile_in_size[17:2] != 0)
+    wire [15:0] tile_in_words = (db_en && cfg_tile_in_size[17:2] != 0)
                                 ? cfg_tile_in_size[17:2]
                                 : in_words;
 
@@ -347,24 +347,27 @@ module npu_ctrl (
                         compute_start <= 1'b1;
                         state         <= S_WAIT_COMP;
                         // Reset oc_group counter for this compute run
-                        // Initialize for first tile (no prefetch for tile 0)
+                        // DB_EN: initialize for first tile (no prefetch for tile 0)
                         // For fused MID/END layers, skip_act_load is asserted:
                         // input is already in SRAM, no DDR load or prefetch needed.
-                        if (!skip_act_load) begin
-                            ping_pong_flag     <= 1'b0;  // Tile 0: reads Bank[0]
-                            prefetch_active    <= 1'b0;
-                            prefetch_pending   <= 1'b0;
-                            cur_tile_ddr_offset <= 32'd0;  // Tile 0: offset 0
-                            // Advance by tile_in_size when tiling (per-tile), else full in_size
-                            next_tile_ddr_addr <= cfg_dma_in_addr
-                                + (cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
-                            // Prefetch tile 1 to Bank[1] at offset 0 (DB_EN) or Bank[0] (no DB_EN)
-                            next_sram_offset   <= db_en ? cfg_act_bank_offset : 16'd0;
-                        end else begin
-                            // Fused: input is contiguous in SRAM, no prefetch
-                            ping_pong_flag     <= 1'b0;
-                            prefetch_active    <= 1'b0;
-                            prefetch_pending   <= 1'b0;
+                        if (db_en) begin
+                            if (!skip_act_load) begin
+                                ping_pong_flag     <= 1'b0;  // Tile 0: reads Bank[0]
+                                prefetch_active    <= 1'b0;
+                                prefetch_pending   <= 1'b0;
+                                cur_tile_ddr_offset <= 32'd0;  // Tile 0: offset 0
+                                // Advance by tile_in_size when DB_EN active (per-tile), else full in_size
+                                next_tile_ddr_addr <= cfg_dma_in_addr
+                                    + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                                // Prefetch tile 1 to Bank[1] at offset 0
+                                // No intra-bank word offset: compute always reads from offset 0
+                                next_sram_offset   <= cfg_act_bank_offset;
+                            end else begin
+                                // Fused: input is contiguous in SRAM, no prefetch
+                                ping_pong_flag     <= 1'b0;
+                                prefetch_active    <= 1'b0;
+                                prefetch_pending   <= 1'b0;
+                            end
                         end
                     end
                 end
@@ -377,8 +380,7 @@ module npu_ctrl (
                         // Per-tile store path: store current tile output to DDR (NHWC) first,
                         // then prefetch next tile input.
                         // Non-per-tile path (last-tile-only store): prefetch directly.
-                        // Non-DB_EN path: store tile, then load next tile sequentially.
-                        if (tile_done && !prefetch_active && !skip_act_load) begin
+                        if (db_en && tile_done && !prefetch_active && !skip_act_load) begin
                             if (per_tile_store_en) begin
                                 // Latch current tile's bank for store
                                 store_bank <= ping_pong_flag;
@@ -411,9 +413,9 @@ module npu_ctrl (
                                 db_prefetch_done <= 1'b0;
                                 cur_tile_ddr_offset <= next_tile_ddr_addr - cfg_dma_in_addr;
                                 next_tile_ddr_addr <= next_tile_ddr_addr
-                                    + (cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
-                                next_sram_offset <= db_en ? ((next_sram_offset >= cfg_act_bank_offset) ?
-                                                    16'd0 : cfg_act_bank_offset) : 16'd0;
+                                    + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                                next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
+                                                    16'd0 : cfg_act_bank_offset;
                             end
                         end
 
@@ -421,7 +423,7 @@ module npu_ctrl (
                         if (dma_done && prefetch_active) begin
                             prefetch_active  <= 1'b0;
                             if (prefetch_pending) begin
-                                if (db_en) ping_pong_flag  <= ~ping_pong_flag;
+                                ping_pong_flag  <= ~ping_pong_flag;
                                 prefetch_pending <= 1'b0;
                                 `ifndef SYNTHESIS
                                 $display("[PP_FLIP] t=%0t ping_pong %0d→%0d db_prefetch_done=1",
@@ -549,10 +551,10 @@ module npu_ctrl (
                                          next_tile_ddr_addr - cfg_dma_in_addr);
                                 `endif
                                 next_tile_ddr_addr <= next_tile_ddr_addr
-                                    + (cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
-                                // Toggle target bank for next prefetch (only with DB_EN)
-                                next_sram_offset <= db_en ? ((next_sram_offset >= cfg_act_bank_offset) ?
-                                                    16'd0 : cfg_act_bank_offset) : 16'd0;
+                                    + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                                // Toggle target bank for next prefetch
+                                next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
+                                                    16'd0 : cfg_act_bank_offset;
                             end else begin
                                 db_prefetch_done <= 1'b1;
                             end
@@ -594,7 +596,7 @@ module npu_ctrl (
                         prefetch_active  <= 1'b0;
                         db_prefetch_done <= 1'b1;
                         if (prefetch_pending) begin
-                            if (db_en) ping_pong_flag  <= ~ping_pong_flag;
+                            ping_pong_flag  <= ~ping_pong_flag;
                             prefetch_pending <= 1'b0;
                         end
                         if (skip_store)
