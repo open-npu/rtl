@@ -2515,8 +2515,16 @@ module npu_compute #(
                 // Precompute combined reciprocals: in_h * recip_out_h (single multiply per pixel)
                 recip_scale_h <= {16'd0, cfg_in_h} * ((cfg_out_h > 0) ? (40'hFFFFFFFFFF / cfg_out_h) + 1 : 0);
                 recip_scale_w <= {16'd0, cfg_in_w} * ((cfg_out_w > 0) ? (40'hFFFFFFFFFF / cfg_out_w) + 1 : 0);
-                recip_scale_h_m1 <= {16'd0, ((cfg_in_h - 1) << 8)} * ((cfg_out_h > 1) ? (40'hFFFFFFFFFF / (cfg_out_h - 1)) + 1 : 0);
-                recip_scale_w_m1 <= {16'd0, ((cfg_in_w - 1) << 8)} * ((cfg_out_w > 1) ? (40'hFFFFFFFFFF / (cfg_out_w - 1)) + 1 : 0);
+                // Avoid unsized concat: use explicit sizing
+                begin : resize_recip_m1_blk
+                    reg [24:0] in_h_m1_shifted, in_w_m1_shifted;
+                    in_h_m1_shifted = {9'd0, cfg_in_h[15:0]} - 17'd1;
+                    in_h_m1_shifted = in_h_m1_shifted << 8;
+                    in_w_m1_shifted = {9'd0, cfg_in_w[15:0]} - 17'd1;
+                    in_w_m1_shifted = in_w_m1_shifted << 8;
+                    recip_scale_h_m1 <= {16'd0, in_h_m1_shifted} * ((cfg_out_h > 17'd1) ? (40'hFFFFFFFFFF / (cfg_out_h - 17'd1)) + 1 : 0);
+                    recip_scale_w_m1 <= {16'd0, in_w_m1_shifted} * ((cfg_out_w > 17'd1) ? (40'hFFFFFFFFFF / (cfg_out_w - 17'd1)) + 1 : 0);
+                end
                 state <= S_RESIZE_CH_SETUP;
             end
 
