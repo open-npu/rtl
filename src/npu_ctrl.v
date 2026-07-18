@@ -204,20 +204,21 @@ module npu_ctrl (
     // Next tile address = base + tile_offset(next_ty, next_tx)
     wire use_2d_load = (cfg_tile_h != 16'd0) && (cfg_dma_in_stride != 32'd0);
     // Tile input start in NHWC: row_start * in_w * in_c * eb + col_start * in_c * eb
-    // where row_start = ty * tile_h * stride, col_start = tx * tile_w * stride
+    // Conv: row_start = ty * tile_h * stride, col_start = tx * tile_w * stride
+    // Pool: row_start = ty * tile_h * pool_sh, col_start = tx * tile_w * pool_sw
+    wire [7:0] tile_stride_h = is_pool ? {4'd0, pool_sh} : cfg_stride_h;
+    wire [7:0] tile_stride_w = is_pool ? {4'd0, pool_sw} : cfg_stride_w;
     wire [31:0] tile_in_addr_2d = cfg_dma_in_addr
-        + ({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {8'd0, cfg_stride_h}) * load_in_stride
-        + ({16'd0, tile_x_seq} * {16'd0, cfg_tile_w} * {8'd0, cfg_stride_w})
+        + ({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {8'd0, tile_stride_h}) * load_in_stride
+        + ({16'd0, tile_x_seq} * {16'd0, cfg_tile_w} * {8'd0, tile_stride_w})
           * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1);
 
     // Next tile (ty', tx') address for 2D prefetch
-    // tx' = (tx+1 >= num_w) ? 0 : tx+1
-    // ty' = (tx+1 >= num_w) ? ty+1 : ty
     wire [15:0] next_tx_2d = (tile_x_seq + 1 >= cfg_tile_num_w) ? 16'd0 : tile_x_seq + 16'd1;
     wire [15:0] next_ty_2d = (tile_x_seq + 1 >= cfg_tile_num_w) ? tile_y_seq + 16'd1 : tile_y_seq;
     wire [31:0] next_tile_in_addr_2d = cfg_dma_in_addr
-        + ({16'd0, next_ty_2d} * {16'd0, cfg_tile_h} * {8'd0, cfg_stride_h}) * load_in_stride
-        + ({16'd0, next_tx_2d} * {16'd0, cfg_tile_w} * {8'd0, cfg_stride_w})
+        + ({16'd0, next_ty_2d} * {16'd0, cfg_tile_h} * {8'd0, tile_stride_h}) * load_in_stride
+        + ({16'd0, next_tx_2d} * {16'd0, cfg_tile_w} * {8'd0, tile_stride_w})
           * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1);
     // Per-tile output words (total) — use clipped row_len * row_count for
     // correct border tile DMA transfer length (avoid over-writing adjacent tiles)

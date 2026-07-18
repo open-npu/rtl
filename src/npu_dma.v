@@ -197,13 +197,13 @@ module npu_dma #(
                         if (wb_ack_i) begin
                             r_data_buf <= wb_dat_i;
                             `ifndef SYNTHESIS
-                            if (xfer_count < 20 && !wb_we_o) begin
+                            if (xfer_count < 3 && !wb_we_o) begin
                                 if (!dma_ld_opened) begin
                                     dma_ld_fh = $fopen("dma_load.log", "w");
                                     dma_ld_opened = 1;
                                 end
-                                $fwrite(dma_ld_fh, "LD xfer=%0d addr=0x%08x data=0x%08x sram=%0d\n",
-                                        xfer_count, r_ext_addr, wb_dat_i, r_sram_addr);
+                                $fwrite(dma_ld_fh, "LD xfer=%0d addr=0x%08x data=0x%08x sram=%0d 2d=%0d\n",
+                                        xfer_count, r_ext_addr, wb_dat_i, r_sram_addr, mode_2d);
                             end
                             `endif
                             wb_cyc_o   <= 1'b0;
