@@ -285,6 +285,7 @@ module npu_top #(
         .cfg_stride_w          (reg_stride[15:8]),
         .cfg_kernel_h          (reg_kernel_size[7:0]),
         .cfg_kernel_w          (reg_kernel_size[11:8]),
+        .cfg_pool_cfg          (reg_pool_cfg),
         .cfg_tile_h            (reg_tile_cfg[15:0]),
         .cfg_tile_w            (reg_tile_cfg[31:16]),
         .cfg_tile_num_h        (reg_tile_count[15:0]),
