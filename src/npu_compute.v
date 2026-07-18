@@ -599,8 +599,11 @@ module npu_compute #(
                         in_c_r <= cfg_in_c;
                         // Compute recip_kw_x_inc = ceil((1<<32) / kw_inc) iteratively
                         // Simple: use division here (once per layer, not critical path)
-                        recip_kw_x_inc <= (kw_inc > 0) ? (32'hFFFF_FFFF / kw_inc) + 1 : 0;
-                        recip_in_c <= (cfg_in_c > 0) ? (32'hFFFF_FFFF / cfg_in_c) + 1 : 0;
+                        recip_kw_x_inc <= (kw_inc > 1) ? (32'hFFFF_FFFF / kw_inc) + 1 :
+                                          (kw_inc == 1) ? 32'hFFFF_FFFF : 0;
+                        // For in_c=1: (0xFFFFFFFF/1)+1 overflows to 0. Use 0xFFFFFFFF.
+                        recip_in_c <= (cfg_in_c > 1) ? (32'hFFFF_FFFF / cfg_in_c) + 1 :
+                                      (cfg_in_c == 1) ? 32'hFFFF_FFFF : 0;
                     end
 
                     if (cfg_tile_h == 17'd0) begin
@@ -1416,12 +1419,17 @@ module npu_compute #(
                             q_full = (flat_start * recip_kw_x_inc) >> 32;
                             conv_fh <= q_full[7:0];
                             rem_kw = flat_start - q_full[15:0] * kw_x_inc_r;
-                            // fw = rem_kw / in_c
-                            q_fw = (rem_kw * recip_in_c) >> 32;
-                            conv_fw <= q_fw[7:0];
-                            // ch = flat_start % in_c
-                            q_ch = (flat_start * recip_in_c) >> 32;
-                            conv_ch_cnt <= flat_start - q_ch[15:0] * in_c_r;
+                            // fw = rem_kw / in_c (special case in_c=1)
+                            if (in_c_r == 16'd1) begin
+                                conv_fw <= rem_kw[7:0];
+                                conv_ch_cnt <= 16'd0;
+                            end else begin
+                                q_fw = (rem_kw * recip_in_c) >> 32;
+                                conv_fw <= q_fw[7:0];
+                                // ch = flat_start % in_c
+                                q_ch = (flat_start * recip_in_c) >> 32;
+                                conv_ch_cnt <= flat_start - q_ch[15:0] * in_c_r;
+                            end
                         end
                     end
                 end
