@@ -80,8 +80,8 @@ module npu_dma #(
     assign wb_sel_o = 4'hF;
 
 `ifndef SYNTHESIS
-    integer dma_dbg_fh;
-    reg       dma_dbg_opened;
+    integer dma_ld_fh, dma_st_fh;
+    reg       dma_ld_opened, dma_st_opened;
 `endif
 
     // ─── FSM States ───
@@ -195,12 +195,12 @@ module npu_dma #(
                         if (wb_ack_i) begin
                             r_data_buf <= wb_dat_i;
                             `ifndef SYNTHESIS
-                            if (xfer_count < 5 && !wb_we_o) begin
-                                if (!dma_dbg_opened) begin
-                                    dma_dbg_fh = $fopen("dma_load.log", "w");
-                                    dma_dbg_opened = 1;
+                            if (xfer_count < 20 && !wb_we_o) begin
+                                if (!dma_ld_opened) begin
+                                    dma_ld_fh = $fopen("dma_load.log", "w");
+                                    dma_ld_opened = 1;
                                 end
-                                $fwrite(dma_dbg_fh, "LD xfer=%0d addr=0x%08x data=0x%08x sram=%0d\n",
+                                $fwrite(dma_ld_fh, "LD xfer=%0d addr=0x%08x data=0x%08x sram=%0d\n",
                                         xfer_count, r_ext_addr, wb_dat_i, r_sram_addr);
                             end
                             `endif
@@ -275,13 +275,14 @@ module npu_dma #(
                         wb_dat_o <= sram_rdata;
                         if (wb_ack_i) begin
                             `ifndef SYNTHESIS
-                            if (xfer_count < 5 && wb_we_o) begin
-                                if (!dma_dbg_opened) begin
-                                    dma_dbg_fh = $fopen("dma_store.log", "w");
-                                    dma_dbg_opened = 1;
+                            if (wb_we_o && xfer_count < 20) begin
+                                if (!dma_st_opened) begin
+                                    dma_st_fh = $fopen("dma_store.log", "w");
+                                    dma_st_opened = 1;
                                 end
-                                $fwrite(dma_dbg_fh, "ST xfer=%0d addr=0x%08x data=0x%08x sram=%0d\n",
-                                        xfer_count, r_ext_addr, sram_rdata, r_sram_addr);
+                                $fwrite(dma_st_fh, "ST xfer=%0d addr=0x%08x data=0x%08x sram=%0d row=%0d/%0d\n",
+                                        xfer_count, r_ext_addr, sram_rdata, r_sram_addr,
+                                        r_row_word_count, r_row_len);
                             end
                             `endif
                             wb_cyc_o    <= 1'b0;
