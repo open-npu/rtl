@@ -79,6 +79,7 @@ module npu_ctrl (
     input  wire [7:0]   cfg_stride_w,          // stride width (for tile_in_w calc)
     input  wire [7:0]   cfg_kernel_h,          // kernel height (for tile_in_h calc)
     input  wire [7:0]   cfg_kernel_w,          // kernel width (for tile_in_w calc)
+    input  wire [31:0]  cfg_pool_cfg,          // pool config [19:16]=sw [15:12]=sh [11:8]=w [7:4]=h
     input  wire [15:0]  cfg_tile_h,            // tile height (for tile sequencing)
     input  wire [15:0]  cfg_tile_w,            // tile width (for tile sequencing)
     input  wire [15:0]  cfg_tile_num_h,        // tile count H (for last-tile detection)
@@ -177,15 +178,19 @@ module npu_ctrl (
     wire [31:0] nhwc_row_stride = {16'd0, cfg_out_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
 
     // 2D DMA load parameters for tiled layers:
-    // tile_in_h = (tile_h-1)*stride + kernel, tile_in_w = (tile_w-1)*stride + kernel
-    // For pooling (op=3): tile_in_h = (tile_h-1)*pool_stride + pool_size
-    // row_len = tile_in_w * in_c * eb / 4 (words per row)
-    // in_stride = in_w * in_c * eb (bytes between NHWC rows)
-    // row_count = tile_in_h
-    wire [15:0] tile_in_h_calc = ({8'd0, cfg_tile_h} - 16'd1) * {8'd0, cfg_stride_h}
-                                  + {8'd0, cfg_kernel_h};
-    wire [15:0] tile_in_w_calc = ({8'd0, cfg_tile_w} - 16'd1) * {8'd0, cfg_stride_w}
-                                  + {8'd0, cfg_kernel_w};
+    // Conv: tile_in_h = (tile_h-1)*stride + kernel, tile_in_w = (tile_w-1)*stride + kernel
+    // Pool: tile_in_h = tile_h*pool_sh + pool_h - pool_sh, tile_in_w = tile_w*pool_sw + pool_w - pool_sw
+    wire is_pool = (cfg_layer_mode[3:0] == 4'd3);
+    wire [3:0] pool_h = cfg_pool_cfg[7:4];
+    wire [3:0] pool_w = cfg_pool_cfg[11:8];
+    wire [3:0] pool_sh = cfg_pool_cfg[15:12];
+    wire [3:0] pool_sw = cfg_pool_cfg[19:16];
+    wire [15:0] tile_in_h_calc = is_pool ?
+        ({8'd0, cfg_tile_h} * {8'd0, pool_sh} + {8'd0, pool_h} - {8'd0, pool_sh}) :
+        ({8'd0, cfg_tile_h} - 16'd1) * {8'd0, cfg_stride_h} + {8'd0, cfg_kernel_h};
+    wire [15:0] tile_in_w_calc = is_pool ?
+        ({8'd0, cfg_tile_w} * {8'd0, pool_sw} + {8'd0, pool_w} - {8'd0, pool_sw}) :
+        ({8'd0, cfg_tile_w} - 16'd1) * {8'd0, cfg_stride_w} + {8'd0, cfg_kernel_w};
     wire [31:0] load_row_len = ({16'd0, tile_in_w_calc} * {16'd0, cfg_in_c}
                                  * (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
     wire [31:0] load_in_stride = {16'd0, cfg_in_w} * {16'd0, cfg_in_c}
