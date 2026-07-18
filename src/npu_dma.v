@@ -160,8 +160,10 @@ module npu_dma #(
                         r_sram_addr<= sram_addr;
                         r_xfer_len <= xfer_len;
                         r_dir      <= dir;
-                        // Latch stride for this transfer direction
-                        r_stride   <= dir ? cfg_out_stride : cfg_in_stride;
+                        // Latch stride: use cfg_out_stride for 2D mode (set by ctrl for
+                        // both load and store), cfg_in_stride only for 1D load.
+                        r_stride   <= (cfg_row_len != 0) ? cfg_out_stride :
+                                      (dir ? cfg_out_stride : cfg_in_stride);
                         // 2D mode parameters (latched at start)
                         r_row_len  <= cfg_row_len;
                         r_row_count<= cfg_row_count;

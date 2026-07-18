@@ -73,6 +73,12 @@ module npu_ctrl (
     input  wire [31:0]  cfg_dma_tile_out_size, // 0x138: per-tile output size (bytes)
     input  wire [15:0]  cfg_out_w,             // output width (for NHWC row stride)
     input  wire [15:0]  cfg_out_c,             // output channels (for NHWC row stride)
+    input  wire [15:0]  cfg_in_w,              // input width (for 2D load row stride)
+    input  wire [15:0]  cfg_in_c,              // input channels (for 2D load row len)
+    input  wire [7:0]   cfg_stride_h,          // stride height (for tile_in_h calc)
+    input  wire [7:0]   cfg_stride_w,          // stride width (for tile_in_w calc)
+    input  wire [7:0]   cfg_kernel_h,          // kernel height (for tile_in_h calc)
+    input  wire [7:0]   cfg_kernel_w,          // kernel width (for tile_in_w calc)
     input  wire [15:0]  cfg_tile_h,            // tile height (for tile sequencing)
     input  wire [15:0]  cfg_tile_w,            // tile width (for tile sequencing)
     input  wire [15:0]  cfg_tile_num_h,        // tile count H (for last-tile detection)
@@ -169,6 +175,45 @@ module npu_ctrl (
     reg [15:0] tile_y_seq, tile_x_seq;  // Current tile indices
     // Computed NHWC output row stride (bytes) = out_w * out_c * elem_bytes
     wire [31:0] nhwc_row_stride = {16'd0, cfg_out_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
+
+    // 2D DMA load parameters for tiled layers:
+    // tile_in_h = (tile_h-1)*stride + kernel, tile_in_w = (tile_w-1)*stride + kernel
+    // For pooling (op=3): tile_in_h = (tile_h-1)*pool_stride + pool_size
+    // row_len = tile_in_w * in_c * eb / 4 (words per row)
+    // in_stride = in_w * in_c * eb (bytes between NHWC rows)
+    // row_count = tile_in_h
+    wire [15:0] tile_in_h_calc = ({8'd0, cfg_tile_h} - 16'd1) * {8'd0, cfg_stride_h}
+                                  + {8'd0, cfg_kernel_h};
+    wire [15:0] tile_in_w_calc = ({8'd0, cfg_tile_w} - 16'd1) * {8'd0, cfg_stride_w}
+                                  + {8'd0, cfg_kernel_w};
+    wire [31:0] load_row_len = ({16'd0, tile_in_w_calc} * {16'd0, cfg_in_c}
+                                 * (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
+    wire [31:0] load_in_stride = {16'd0, cfg_in_w} * {16'd0, cfg_in_c}
+                                  * (cfg_int16 ? 32'd2 : 32'd1);
+    wire [15:0] load_row_count = tile_in_h_calc;
+    wire [15:0] load_total_words = load_row_len[15:0] * load_row_count;
+
+    // 2D tile DDR address: start of tile (ty,tx) input in NHWC image
+    // = (ty * tile_h * stride_h) * in_w * in_c * eb + (tx * tile_w * stride_w) * in_c * eb
+    // For simplicity, compute as sequential offset using row-major tile order
+    // Next tile address = base + tile_offset(next_ty, next_tx)
+    wire use_2d_load = (cfg_tile_h != 16'd0) && (cfg_dma_in_stride != 32'd0);
+    // Tile input start in NHWC: row_start * in_w * in_c * eb + col_start * in_c * eb
+    // where row_start = ty * tile_h * stride, col_start = tx * tile_w * stride
+    wire [31:0] tile_in_addr_2d = cfg_dma_in_addr
+        + ({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {8'd0, cfg_stride_h}) * load_in_stride
+        + ({16'd0, tile_x_seq} * {16'd0, cfg_tile_w} * {8'd0, cfg_stride_w})
+          * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1);
+
+    // Next tile (ty', tx') address for 2D prefetch
+    // tx' = (tx+1 >= num_w) ? 0 : tx+1
+    // ty' = (tx+1 >= num_w) ? ty+1 : ty
+    wire [15:0] next_tx_2d = (tile_x_seq + 1 >= cfg_tile_num_w) ? 16'd0 : tile_x_seq + 16'd1;
+    wire [15:0] next_ty_2d = (tile_x_seq + 1 >= cfg_tile_num_w) ? tile_y_seq + 16'd1 : tile_y_seq;
+    wire [31:0] next_tile_in_addr_2d = cfg_dma_in_addr
+        + ({16'd0, next_ty_2d} * {16'd0, cfg_tile_h} * {8'd0, cfg_stride_h}) * load_in_stride
+        + ({16'd0, next_tx_2d} * {16'd0, cfg_tile_w} * {8'd0, cfg_stride_w})
+          * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1);
     // Per-tile output words (total) — use clipped row_len * row_count for
     // correct border tile DMA transfer length (avoid over-writing adjacent tiles)
     wire [15:0] tile_out_words_padded = cfg_dma_tile_out_size[17:2];
@@ -296,9 +341,19 @@ module npu_ctrl (
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;
                         dma_sram_sel  <= 2'd1;  // activation
-                        dma_ext_addr  <= cfg_dma_in_addr;
-                        dma_sram_addr <= 16'd0;  // First tile always loads to Bank[0]
-                        dma_xfer_len  <= tile_in_words;  // per-tile when DB_EN, full when not
+                        dma_ext_addr  <= cfg_dma_in_addr;  // tile(0,0) = base
+                        dma_sram_addr <= 16'd0;
+                        dma_xfer_len  <= tile_in_words;
+                        // 2D load when in_stride != 0 (NHWC chain mode)
+                        if (use_2d_load) begin
+                            dma_row_len   <= load_row_len[15:0];
+                            dma_row_count <= load_row_count;
+                            dma_out_stride<= load_in_stride;
+                        end else begin
+                            dma_row_len   <= 16'd0;
+                            dma_row_count <= 16'd0;
+                            dma_out_stride<= 32'd0;
+                        end
                         state         <= S_WAIT_ACT;
                     end
                 end
@@ -405,15 +460,26 @@ module npu_ctrl (
                                 dma_start      <= 1'b1;
                                 dma_dir        <= 1'b0;  // load
                                 dma_sram_sel   <= 2'd1;  // activation
-                                dma_ext_addr   <= next_tile_ddr_addr;
+                                dma_ext_addr   <= use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr;
                                 dma_sram_addr  <= next_sram_offset;
                                 dma_xfer_len   <= tile_in_words;
+                                // 2D load when in_stride != 0 (NHWC chain mode)
+                                if (use_2d_load) begin
+                                    dma_row_len   <= load_row_len[15:0];
+                                    dma_row_count <= load_row_count;
+                                    dma_out_stride<= load_in_stride;
+                                end else begin
+                                    dma_row_len   <= 16'd0;
+                                    dma_row_count <= 16'd0;
+                                    dma_out_stride<= 32'd0;
+                                end
                                 prefetch_active  <= 1'b1;
                                 prefetch_pending <= 1'b1;
                                 db_prefetch_done <= 1'b0;
-                                cur_tile_ddr_offset <= next_tile_ddr_addr - cfg_dma_in_addr;
-                                next_tile_ddr_addr <= next_tile_ddr_addr
-                                    + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                                cur_tile_ddr_offset <= (use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr) - cfg_dma_in_addr;
+                                if (!use_2d_load)
+                                    next_tile_ddr_addr <= next_tile_ddr_addr
+                                        + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
                                 next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
                                                     16'd0 : cfg_act_bank_offset;
                             end
@@ -538,20 +604,34 @@ module npu_ctrl (
                                 dma_start      <= 1'b1;
                                 dma_dir        <= 1'b0;
                                 dma_sram_sel   <= 2'd1;  // activation
-                                dma_ext_addr   <= next_tile_ddr_addr;
+                                // 2D mode: use computed next tile address
+                                dma_ext_addr   <= use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr;
                                 dma_sram_addr  <= next_sram_offset;
                                 dma_xfer_len   <= tile_in_words;
+                                // 2D load when in_stride != 0 (NHWC chain mode)
+                                if (use_2d_load) begin
+                                    dma_row_len   <= load_row_len[15:0];
+                                    dma_row_count <= load_row_count;
+                                    dma_out_stride<= load_in_stride;
+                                end else begin
+                                    dma_row_len   <= 16'd0;
+                                    dma_row_count <= 16'd0;
+                                end
                                 prefetch_active  <= 1'b1;
                                 prefetch_pending <= 1'b1;
                                 db_prefetch_done <= 1'b0;
-                                cur_tile_ddr_offset <= next_tile_ddr_addr - cfg_dma_in_addr;
+                                cur_tile_ddr_offset <= (use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr) - cfg_dma_in_addr;
                                 `ifndef SYNTHESIS
-                                $display("[PTS_PREFETCH] t=%0t ddr=0x%08x sram=%0d len=%0d offset=%0d",
-                                         $time, next_tile_ddr_addr, next_sram_offset, tile_in_words,
-                                         next_tile_ddr_addr - cfg_dma_in_addr);
+                                $display("[PTS_PREFETCH] t=%0t ddr=0x%08x sram=%0d len=%0d offset=%0d 2d=%0d",
+                                         $time, use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr,
+                                         next_sram_offset, tile_in_words,
+                                         (use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr) - cfg_dma_in_addr,
+                                         use_2d_load);
                                 `endif
-                                next_tile_ddr_addr <= next_tile_ddr_addr
-                                    + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                                // In 2D mode, next_tile_ddr_addr is computed from tile coords
+                                if (!use_2d_load)
+                                    next_tile_ddr_addr <= next_tile_ddr_addr
+                                        + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
                                 // Toggle target bank for next prefetch
                                 next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
                                                     16'd0 : cfg_act_bank_offset;
