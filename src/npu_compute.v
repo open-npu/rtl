@@ -928,9 +928,10 @@ module npu_compute #(
                                 elem_off = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c + conv_ch_cnt;
                             end else begin
                                 // Tiled: use row/col within input tile, with channel offset
-                                // 2D load mode: SRAM row 0 = input row 0 (no padding in SRAM)
-                                //   add pad_top/pad_left to elem_off so compute reads correct row
-                                // 1D (pre-packed): SRAM row 0 = padding row (golden includes padding)
+                                `ifdef DBG_DOTBUF
+                                if (sp_oh == 0 && sp_ow == 0 && k_pass == 0 && conv_fh == 0 && conv_fw == 0)
+                                    $display("[TILED_DBG] cfg_2d=%0d tile_h=%0d pad=%0d/%0d", cfg_2d_load, cfg_tile_h, cfg_pad_top, cfg_pad_left);
+                                `endif
                                 if (cfg_2d_load) begin
                                     // 2D mode: SRAM row 0 = input row 0 (no padding in SRAM)
                                     // SRAM row = (sp_oh*stride + conv_fh - pad_top)
@@ -938,6 +939,11 @@ module npu_compute #(
                                     elem_off = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh} - {8'd0, cfg_pad_top}) * tile_in_w
                                              + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw} - {8'd0, cfg_pad_left}) * cfg_in_c
                                              + {8'd0, conv_ch_cnt};
+                                    `ifdef DBG_DOTBUF
+                                    if (sp_oh == 0 && sp_ow == 0 && k_pass == 0)
+                                        $display("[2D_EOFF] cfg_2d=%0d fh=%0d fw=%0d pad=%0d/%0d elem_off=%0d",
+                                                cfg_2d_load, conv_fh, conv_fw, cfg_pad_top, cfg_pad_left, elem_off);
+                                    `endif
                                 end else begin
                                     elem_off = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh}) * tile_in_w
                                              + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw}) * cfg_in_c
