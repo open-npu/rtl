@@ -79,6 +79,8 @@ module npu_ctrl (
     input  wire [7:0]   cfg_stride_w,          // stride width (for tile_in_w calc)
     input  wire [7:0]   cfg_kernel_h,          // kernel height (for tile_in_h calc)
     input  wire [7:0]   cfg_kernel_w,          // kernel width (for tile_in_w calc)
+    input  wire [7:0]   cfg_pad_top,           // padding top (for 2D load offset)
+    input  wire [7:0]   cfg_pad_left,          // padding left (for 2D load offset)
     input  wire [31:0]  cfg_pool_cfg,          // pool config [19:16]=sw [15:12]=sh [11:8]=w [7:4]=h
     input  wire [15:0]  cfg_tile_h,            // tile height (for tile sequencing)
     input  wire [15:0]  cfg_tile_w,            // tile width (for tile sequencing)
@@ -208,6 +210,7 @@ module npu_ctrl (
     // Pool: row_start = ty * tile_h * pool_sh, col_start = tx * tile_w * pool_sw
     wire [7:0] tile_stride_h = is_pool ? {4'd0, pool_sh} : cfg_stride_h;
     wire [7:0] tile_stride_w = is_pool ? {4'd0, pool_sw} : cfg_stride_w;
+    // Tile input start in NHWC (no pad offset — compute handles padding via cfg_2d_load)
     wire [31:0] tile_in_addr_2d = cfg_dma_in_addr
         + ({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {8'd0, tile_stride_h}) * load_in_stride
         + ({16'd0, tile_x_seq} * {16'd0, cfg_tile_w} * {8'd0, tile_stride_w})

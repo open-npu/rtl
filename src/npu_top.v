@@ -285,6 +285,8 @@ module npu_top #(
         .cfg_stride_w          (reg_stride[15:8]),
         .cfg_kernel_h          (reg_kernel_size[7:0]),
         .cfg_kernel_w          (reg_kernel_size[11:8]),
+        .cfg_pad_top           (reg_padding[7:0]),
+        .cfg_pad_left          (reg_padding[15:8]),
         .cfg_pool_cfg          (reg_pool_cfg),
         .cfg_tile_h            (reg_tile_cfg[15:0]),
         .cfg_tile_w            (reg_tile_cfg[31:16]),
@@ -667,6 +669,7 @@ module npu_top #(
         .cfg_resize_cfg (reg_resize_cfg),
         .cfg_deconv_cfg (reg_deconv_cfg),
         .cfg_concat_cfg (reg_concat_cfg),
+        .cfg_2d_load    (reg_dma_in_stride != 32'd0),  // 2D load when in_stride set
         // Weight SRAM Port B
         .wgt_rd_en      (wgt_b_en),
         .wgt_rd_addr    (wgt_b_addr),

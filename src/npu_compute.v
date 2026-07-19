@@ -71,6 +71,7 @@ module npu_compute #(
     input  wire [31:0]                  cfg_resize_cfg, // Resize config register
     input  wire [31:0]                  cfg_deconv_cfg, // Deconv config: [7:0]=INSERT_H, [15:8]=INSERT_W
     input  wire [31:0]                  cfg_concat_cfg, // Concat config: [15:0]=OFFSET, [31:16]=TOTAL_C
+    input  wire                         cfg_2d_load,    // 2D DMA load mode (chain: SRAM row 0 = input row 0, not padding)
 
     // ─── Weight SRAM Port B (read-only) ───
     output reg                          wgt_rd_en,
@@ -927,9 +928,21 @@ module npu_compute #(
                                 elem_off = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c + conv_ch_cnt;
                             end else begin
                                 // Tiled: use row/col within input tile, with channel offset
-                                elem_off = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh}) * tile_in_w
-                                         + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw}) * cfg_in_c
-                                         + {8'd0, conv_ch_cnt};
+                                // 2D load mode: SRAM row 0 = input row 0 (no padding in SRAM)
+                                //   add pad_top/pad_left to elem_off so compute reads correct row
+                                // 1D (pre-packed): SRAM row 0 = padding row (golden includes padding)
+                                if (cfg_2d_load) begin
+                                    // 2D mode: SRAM row 0 = input row 0 (no padding in SRAM)
+                                    // SRAM row = (sp_oh*stride + conv_fh - pad_top)
+                                    // conv_is_pad handles conv_fh < pad_top (ih < 0)
+                                    elem_off = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh} - {8'd0, cfg_pad_top}) * tile_in_w
+                                             + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw} - {8'd0, cfg_pad_left}) * cfg_in_c
+                                             + {8'd0, conv_ch_cnt};
+                                end else begin
+                                    elem_off = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh}) * tile_in_w
+                                             + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw}) * cfg_in_c
+                                             + {8'd0, conv_ch_cnt};
+                                end
                             end
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_word_addr <= {2'd0, act_base} + byte_off[17:2];
@@ -1080,8 +1093,13 @@ module npu_compute #(
                             if (cfg_tile_h == 17'd0) begin
                                 elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c;
                             end else begin
-                                elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh}) * tile_in_w
-                                           + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw}) * cfg_in_c;
+                                if (cfg_2d_load) begin
+                                    elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh} - {8'd0, cfg_pad_top}) * tile_in_w
+                                               + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw} - {8'd0, cfg_pad_left}) * cfg_in_c;
+                                end else begin
+                                    elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh}) * tile_in_w
+                                               + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw}) * cfg_in_c;
+                                end
                             end
                             byte_off_n = cfg_int16 ? (elem_off_n << 1) : elem_off_n;
                             act_word_addr <= {2'd0, act_base} + byte_off_n[17:2];
