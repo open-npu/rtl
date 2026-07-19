@@ -88,6 +88,7 @@ module npu_top #(
     wire [31:0] reg_dma_in_addr, reg_dma_out_addr;
     wire [31:0] reg_dma_wgt_addr, reg_dma_param_addr;
     wire [31:0] reg_dma_in_stride, reg_dma_out_stride;
+    wire        npu_2d_load = (reg_dma_in_stride != 32'd0);
     wire [31:0] reg_dma_ctrl, reg_dma_add_b_addr;
     wire [31:0] reg_dma_add_param_addr;
     wire [31:0] reg_dma_in_size, reg_dma_wgt_size;
@@ -669,7 +670,7 @@ module npu_top #(
         .cfg_resize_cfg (reg_resize_cfg),
         .cfg_deconv_cfg (reg_deconv_cfg),
         .cfg_concat_cfg (reg_concat_cfg),
-        .cfg_2d_load    (reg_dma_in_stride != 32'd0),  // 2D load when in_stride set
+        .cfg_2d_load    (npu_2d_load),  // 2D load when in_stride set
         // Weight SRAM Port B
         .wgt_rd_en      (wgt_b_en),
         .wgt_rd_addr    (wgt_b_addr),

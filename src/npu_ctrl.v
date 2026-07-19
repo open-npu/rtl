@@ -356,8 +356,8 @@ module npu_ctrl (
                         // 2D load when in_stride != 0 (NHWC chain mode)
                         if (use_2d_load) begin
                             `ifndef SYNTHESIS
-                            $display("[2D_LOAD_INIT] t=%0t use_2d=%0d rlen=%0d rcnt=%0d stride=%0d addr=0x%08x",
-                                     $time, use_2d_load, load_row_len, load_row_count, load_in_stride, cfg_dma_in_addr);
+                            $display("[2D_LOAD_INIT] t=%0t use_2d=%0d in_stride=%0d rlen=%0d rcnt=%0d stride=%0d addr=0x%08x",
+                                     $time, use_2d_load, cfg_dma_in_stride, load_row_len, load_row_count, load_in_stride, cfg_dma_in_addr);
                             `endif
                             dma_row_len   <= load_row_len[15:0];
                             dma_row_count <= load_row_count;

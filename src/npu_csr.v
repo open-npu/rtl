@@ -370,7 +370,12 @@ module npu_csr #(
                         12'h104: r_dma_out_addr  <= wb_dat_i;
                         12'h108: r_dma_wgt_addr  <= wb_dat_i;
                         12'h10C: r_dma_param_addr<= wb_dat_i; // dual-map w/ 0x184
-                        12'h110: r_dma_in_stride <= wb_dat_i;
+                        12'h110: begin
+                            r_dma_in_stride <= wb_dat_i;
+                            `ifndef SYNTHESIS
+                            $display("[CSR_IN_STRIDE] write 0x%08x", wb_dat_i);
+                            `endif
+                        end
                         12'h114: r_dma_out_stride<= wb_dat_i;
                         12'h118: r_dma_ctrl      <= wb_dat_i;
                         12'h120: r_dma_add_b_addr<= wb_dat_i; // dual-map w/ 0x198
