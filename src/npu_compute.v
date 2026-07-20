@@ -598,6 +598,12 @@ module npu_compute #(
                         kw_inc = {8'd0, cfg_kernel_w} * cfg_in_c;
                         kw_x_inc_r <= kw_inc;
                         in_c_r <= cfg_in_c;
+                        `ifndef SYNTHESIS
+                        $display("[S_IDLE_RECIP] kw=%0d in_c=%0d kw_inc=%0d recip=%0d",
+                                cfg_kernel_w, cfg_in_c, kw_inc,
+                                (kw_inc > 1) ? (32'hFFFF_FFFF / kw_inc) + 1 :
+                                (kw_inc == 1) ? 32'hFFFF_FFFF : 0);
+                        `endif
                         // Compute recip_kw_x_inc = ceil((1<<32) / kw_inc) iteratively
                         // Simple: use division here (once per layer, not critical path)
                         recip_kw_x_inc <= (kw_inc > 1) ? (32'hFFFF_FFFF / kw_inc) + 1 :
@@ -953,10 +959,10 @@ module npu_compute #(
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_word_addr <= {2'd0, act_base} + byte_off[17:2];
 `ifdef DBG_DOTBUF
-                            if (sp_oh == 0 && sp_ow == 0 && k_pass < 2 && ((tile_x == 0 && tile_y == 0) || (tile_x == 1 && tile_y == 0)))
-                                $fwrite(dbg_fh, "[RTL_CMD] t=%0d tile(%0d,%0d) pass=%0d fh=%0d fw=%0d elem_off=%0d act_addr=%0d\n",
+                            if (sp_oh == 0 && sp_ow == 0 && k_pass < 20 && ((tile_x == 0 && tile_y == 0) || (tile_x == 1 && tile_y == 0)))
+                                $fwrite(dbg_fh, "[RTL_CMD] t=%0d tile(%0d,%0d) pass=%0d fh=%0d fw=%0d elem_off=%0d act_addr=%0d 2d=%0d\n",
                                         $time, tile_y, tile_x, k_pass, conv_fh, conv_fw, elem_off,
-                                        {2'd0, act_base} + byte_off[17:2]);
+                                        {2'd0, act_base} + byte_off[17:2], cfg_2d_load);
 `endif
                             act_byte_sel <= byte_off[1:0];
                         end
@@ -1449,6 +1455,11 @@ module npu_compute #(
                             q_full = (flat_start * recip_kw_x_inc) >> 32;
                             conv_fh <= q_full[7:0];
                             rem_kw = flat_start - q_full[15:0] * kw_x_inc_r;
+                            `ifdef DBG_DOTBUF
+                            if (sp_oh == 0 && sp_ow == 0 && (k_pass == 0 || k_pass == 8 || k_pass == 16))
+                                $display("[KP_DECOMP] kp=%0d flat=%0d recip=%0d kw_inc=%0d q=%0d fh=%0d rem=%0d",
+                                        k_pass, flat_start, recip_kw_x_inc, kw_x_inc_r, q_full, q_full[7:0], rem_kw);
+                            `endif
                             // fw = rem_kw / in_c (special case in_c=1)
                             if (in_c_r == 16'd1) begin
                                 conv_fw <= rem_kw[7:0];
