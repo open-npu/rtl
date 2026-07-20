@@ -968,6 +968,12 @@ module npu_compute #(
             S_ACT_LOAD: begin
                 // Read one SRAM word (4 activation bytes)
                 // If padding or deconv_skip, skip read and go directly to emit zeros
+                `ifdef DBG_DOTBUF
+                if (cfg_2d_load && sp_oh == 0 && sp_ow == 0 && (k_pass == 0 || k_pass == 16 || k_pass == 17))
+                    $display("[ACT_LD2D] kp=%0d fh=%0d fw=%0d ih=%0d iw=%0d pad=%0d addr=%0d",
+                            k_pass, conv_fh, conv_fw, conv_ih_base + $signed({8'd0, conv_fh}),
+                            conv_iw_base + $signed({8'd0, conv_fw}), conv_is_pad, act_word_addr);
+                `endif
                 if (conv_is_pad || deconv_skip) begin
                     // Use cfg_in_zp for padding, matching CSIM dma_extract_tile behavior
                     if (cfg_int16)
