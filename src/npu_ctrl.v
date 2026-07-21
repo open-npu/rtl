@@ -210,19 +210,24 @@ module npu_ctrl (
     // Pool: row_start = ty * tile_h * pool_sh, col_start = tx * tile_w * pool_sw
     wire [7:0] tile_stride_h = is_pool ? {4'd0, pool_sh} : cfg_stride_h;
     wire [7:0] tile_stride_w = is_pool ? {4'd0, pool_sw} : cfg_stride_w;
-    // Tile input start in NHWC (no pad offset — compute handles padding via cfg_2d_load)
+    // Tile input start in NHWC (col halo: subtract pad_left for 2D load)
+    // For tile_x=0: no subtract (SRAM col 0 = DDR col 0, compute elem_off subtracts pad_left)
+    // For tile_x>0: subtract pad_left (SRAM col 0 = DDR col (tile_x*tile_w*stride - pad_left))
+    //   This includes halo col in SRAM for border tiles.
     wire [31:0] tile_in_addr_2d = cfg_dma_in_addr
         + ({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {8'd0, tile_stride_h}) * load_in_stride
-        + ({16'd0, tile_x_seq} * {16'd0, cfg_tile_w} * {8'd0, tile_stride_w})
-          * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1);
+        + ((tile_x_seq == 16'd0) ? 32'd0 :
+           (({16'd0, tile_x_seq} * {16'd0, cfg_tile_w} * {8'd0, tile_stride_w} - {24'd0, cfg_pad_left})
+           * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1)));
 
     // Next tile (ty', tx') address for 2D prefetch
     wire [15:0] next_tx_2d = (tile_x_seq + 1 >= cfg_tile_num_w) ? 16'd0 : tile_x_seq + 16'd1;
     wire [15:0] next_ty_2d = (tile_x_seq + 1 >= cfg_tile_num_w) ? tile_y_seq + 16'd1 : tile_y_seq;
     wire [31:0] next_tile_in_addr_2d = cfg_dma_in_addr
         + ({16'd0, next_ty_2d} * {16'd0, cfg_tile_h} * {8'd0, tile_stride_h}) * load_in_stride
-        + ({16'd0, next_tx_2d} * {16'd0, cfg_tile_w} * {8'd0, tile_stride_w})
-          * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1);
+        + ((next_tx_2d == 16'd0) ? 32'd0 :
+           (({16'd0, next_tx_2d} * {16'd0, cfg_tile_w} * {8'd0, tile_stride_w} - {24'd0, cfg_pad_left})
+          * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1)));
     // Per-tile output words (total) — use clipped row_len * row_count for
     // correct border tile DMA transfer length (avoid over-writing adjacent tiles)
     wire [15:0] tile_out_words_padded = cfg_dma_tile_out_size[17:2];

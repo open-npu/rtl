@@ -939,12 +939,19 @@ module npu_compute #(
                                     $display("[TILED_DBG] cfg_2d=%0d tile_h=%0d pad=%0d/%0d", cfg_2d_load, cfg_tile_h, cfg_pad_top, cfg_pad_left);
                                 `endif
                                 if (cfg_2d_load) begin
-                                    // 2D mode: SRAM row 0 = input row 0 (no padding in SRAM)
-                                    // SRAM row = (sp_oh*stride + conv_fh - pad_top)
-                                    // conv_is_pad handles conv_fh < pad_top (ih < 0)
-                                    elem_off = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh} - {8'd0, cfg_pad_top}) * tile_in_w
-                                             + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw} - {8'd0, cfg_pad_left}) * cfg_in_c
-                                             + {8'd0, conv_ch_cnt};
+                                    // 2D mode: SRAM layout depends on tile_x:
+                                    //   tile_x=0: SRAM col 0 = DDR col 0 (no halo), elem_off col -= pad_left
+                                    //   tile_x>0: SRAM col 0 = DDR col (tile_x*tile_w*stride - pad_left) [halo included]
+                                    //             elem_off col = sp_ow*stride + fw (no pad subtract)
+                                    if (tile_ow_origin == 16'd0) begin
+                                        elem_off = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh} - {8'd0, cfg_pad_top}) * tile_in_w
+                                                 + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw} - {8'd0, cfg_pad_left}) * cfg_in_c
+                                                 + {8'd0, conv_ch_cnt};
+                                    end else begin
+                                        elem_off = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh} - {8'd0, cfg_pad_top}) * tile_in_w
+                                                 + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw}) * cfg_in_c
+                                                 + {8'd0, conv_ch_cnt};
+                                    end
                                     `ifdef DBG_DOTBUF
                                     if (sp_oh == 0 && sp_ow == 0 && k_pass == 0)
                                         $display("[2D_EOFF] cfg_2d=%0d fh=%0d fw=%0d pad=%0d/%0d elem_off=%0d",
@@ -1116,8 +1123,13 @@ module npu_compute #(
                                 elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c;
                             end else begin
                                 if (cfg_2d_load) begin
-                                    elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh} - {8'd0, cfg_pad_top}) * tile_in_w
-                                               + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw} - {8'd0, cfg_pad_left}) * cfg_in_c;
+                                    if (tile_ow_origin == 16'd0) begin
+                                        elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh} - {8'd0, cfg_pad_top}) * tile_in_w
+                                                   + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw} - {8'd0, cfg_pad_left}) * cfg_in_c;
+                                    end else begin
+                                        elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh} - {8'd0, cfg_pad_top}) * tile_in_w
+                                                   + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw}) * cfg_in_c;
+                                    end
                                 end else begin
                                     elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh}) * tile_in_w
                                                + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw}) * cfg_in_c;
