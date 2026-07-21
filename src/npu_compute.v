@@ -939,18 +939,20 @@ module npu_compute #(
                                     $display("[TILED_DBG] cfg_2d=%0d tile_h=%0d pad=%0d/%0d", cfg_2d_load, cfg_tile_h, cfg_pad_top, cfg_pad_left);
                                 `endif
                                 if (cfg_2d_load) begin
-                                    // 2D mode: SRAM layout depends on tile_x:
-                                    //   tile_x=0: SRAM col 0 = DDR col 0 (no halo), elem_off col -= pad_left
-                                    //   tile_x>0: SRAM col 0 = DDR col (tile_x*tile_w*stride - pad_left) [halo included]
-                                    //             elem_off col = sp_ow*stride + fw (no pad subtract)
-                                    if (tile_ow_origin == 16'd0) begin
-                                        elem_off = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh} - {8'd0, cfg_pad_top}) * tile_in_w
-                                                 + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw} - {8'd0, cfg_pad_left}) * cfg_in_c
-                                                 + {8'd0, conv_ch_cnt};
-                                    end else begin
-                                        elem_off = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh} - {8'd0, cfg_pad_top}) * tile_in_w
-                                                 + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw}) * cfg_in_c
-                                                 + {8'd0, conv_ch_cnt};
+                                    // 2D mode: SRAM layout depends on tile_x/tile_y:
+                                    //   tile_y=0: no row halo, elem_off row -= pad_top
+                                    //   tile_y>0: row halo in SRAM, elem_off row = sp_oh*stride + fh
+                                    //   tile_x=0: no col halo, elem_off col -= pad_left
+                                    //   tile_x>0: col halo in SRAM, elem_off col = sp_ow*stride + fw
+                                    begin : act_addr_2d_blk
+                                        reg [17:0] row_rel, col_rel;
+                                        row_rel = {2'd0, sp_oh} * {10'd0, cfg_stride_h} + {10'd0, conv_fh};
+                                        col_rel = {2'd0, sp_ow} * {10'd0, cfg_stride_w} + {10'd0, conv_fw};
+                                        if (tile_oh_origin == 16'd0)
+                                            row_rel = row_rel - {8'd0, cfg_pad_top};
+                                        if (tile_ow_origin == 16'd0)
+                                            col_rel = col_rel - {8'd0, cfg_pad_left};
+                                        elem_off = (row_rel[15:0] * tile_in_w + col_rel[15:0]) * cfg_in_c + {16'd0, conv_ch_cnt};
                                     end
                                     `ifdef DBG_DOTBUF
                                     if (sp_oh == 0 && sp_ow == 0 && k_pass == 0)
@@ -1123,12 +1125,15 @@ module npu_compute #(
                                 elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c;
                             end else begin
                                 if (cfg_2d_load) begin
-                                    if (tile_ow_origin == 16'd0) begin
-                                        elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh} - {8'd0, cfg_pad_top}) * tile_in_w
-                                                   + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw} - {8'd0, cfg_pad_left}) * cfg_in_c;
-                                    end else begin
-                                        elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh} - {8'd0, cfg_pad_top}) * tile_in_w
-                                                   + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw}) * cfg_in_c;
+                                    begin : act_addr_n_2d_blk
+                                        reg [17:0] row_rel_n, col_rel_n;
+                                        row_rel_n = {2'd0, sp_oh} * {10'd0, cfg_stride_h} + {10'd0, next_fh};
+                                        col_rel_n = {2'd0, sp_ow} * {10'd0, cfg_stride_w} + {10'd0, next_fw};
+                                        if (tile_oh_origin == 16'd0)
+                                            row_rel_n = row_rel_n - {8'd0, cfg_pad_top};
+                                        if (tile_ow_origin == 16'd0)
+                                            col_rel_n = col_rel_n - {8'd0, cfg_pad_left};
+                                        elem_off_n = (row_rel_n[15:0] * tile_in_w + col_rel_n[15:0]) * cfg_in_c;
                                     end
                                 end else begin
                                     elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh}) * tile_in_w
