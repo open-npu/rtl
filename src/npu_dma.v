@@ -160,6 +160,11 @@ module npu_dma #(
                         r_sram_addr<= sram_addr;
                         r_xfer_len <= xfer_len;
                         r_dir      <= dir;
+                        `ifndef SYNTHESIS
+                        $display("[DMA_START] ext=0x%08x sram=%0d len=%0d row_len=%0d row_cnt=%0d stride=%0d",
+                                ext_addr, sram_addr, xfer_len, cfg_row_len, cfg_row_count,
+                                (cfg_row_len != 0) ? cfg_out_stride : (dir ? cfg_out_stride : cfg_in_stride));
+                        `endif
                         // Latch stride: use cfg_out_stride for 2D mode (set by ctrl for
                         // both load and store), cfg_in_stride only for 1D load.
                         r_stride   <= (cfg_row_len != 0) ? cfg_out_stride :
@@ -236,8 +241,8 @@ module npu_dma #(
                         // Within 2D row: contiguous (4 bytes per word)
                         r_ext_addr  <= r_ext_addr + 32'd4;
                     end else begin
-                        // 1D mode: advance by stride (or 4 if stride==0)
-                        r_ext_addr  <= r_ext_addr + (r_stride != 0 ? r_stride : 32'd4);
+                        // 1D mode: contiguous (4 bytes per word)
+                        r_ext_addr  <= r_ext_addr + 32'd4;
                     end
                     if (xfer_count + 1 >= r_xfer_len)
                         state <= S_DONE;
