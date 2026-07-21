@@ -958,11 +958,11 @@ module npu_compute #(
                             end
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_word_addr <= {2'd0, act_base} + byte_off[17:2];
-`ifdef DBG_DOTBUF
-                            if (sp_oh == 0 && sp_ow == 0 && k_pass < 20 && ((tile_x == 0 && tile_y == 0) || (tile_x == 1 && tile_y == 0)))
-                                $fwrite(dbg_fh, "[RTL_CMD] t=%0d tile(%0d,%0d) pass=%0d fh=%0d fw=%0d elem_off=%0d act_addr=%0d 2d=%0d\n",
-                                        $time, tile_y, tile_x, k_pass, conv_fh, conv_fw, elem_off,
-                                        {2'd0, act_base} + byte_off[17:2], cfg_2d_load);
+`ifndef SYNTHESIS
+                            if (cfg_2d_load && sp_oh == 0 && sp_ow == 0 && k_pass < 20)
+                                $display("[L2CMD] ty=%0d tx=%0d pass=%0d fh=%0d fw=%0d ch=%0d in_c=%0d elem=%0d addr=%0d remain=%0d",
+                                        tile_y, tile_x, k_pass, conv_fh, conv_fw, conv_ch_cnt, cfg_in_c, elem_off,
+                                        {2'd0, act_base} + byte_off[17:2], k_pass_remain);
 `endif
                             act_byte_sel <= byte_off[1:0];
                         end

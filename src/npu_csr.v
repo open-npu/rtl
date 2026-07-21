@@ -351,7 +351,12 @@ module npu_csr #(
                         // Group 1: Layer Parameters
                         12'h040: r_layer_mode <= wb_dat_i;
                         12'h044: r_in_dim_hw  <= wb_dat_i;
-                        12'h048: r_in_dim_c   <= wb_dat_i;
+                        12'h048: begin
+                            r_in_dim_c   <= wb_dat_i;
+                            `ifndef SYNTHESIS
+                            $display("[CSR_IN_C] write 0x%08x", wb_dat_i);
+                            `endif
+                        end
                         12'h04C: r_out_dim_hw <= wb_dat_i;
                         12'h050: r_out_dim_c  <= wb_dat_i;
                         12'h054: r_kernel_size<= wb_dat_i;
