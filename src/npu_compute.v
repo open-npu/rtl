@@ -999,6 +999,10 @@ module npu_compute #(
                 end else begin
                     // Data available
                     act_buf <= act_rd_data;
+`ifndef SYNTHESIS
+                    if (cfg_2d_load && sp_oh == 0 && sp_ow == 0 && k_pass == 16 && tile_x == 0 && tile_y == 0 && act_cnt < 4)
+                        $display("[L2RD] addr=%0d data=0x%08x cnt=%0d", act_word_addr[ACT_ADDR_W-1:0], act_rd_data, act_cnt);
+`endif
 `ifdef DBG_DOTBUF
                     if (sp_oh == 0 && sp_ow == 0 && k_pass < 2 && ((tile_x == 0 && tile_y == 0) || (tile_x == 1 && tile_y == 0)))
                         $fwrite(dbg_fh, "[RTL_RD] t=%0d tile(%0d,%0d) sp(%0d,%0d) pass=%0d act_addr=%0d act_data=0x%08x\n",
