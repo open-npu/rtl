@@ -322,6 +322,10 @@ module npu_ctrl (
                         // Per-oc_group: load only first group if wgt_per_oc != 0
                         dma_xfer_len  <= (cfg_dma_wgt_per_oc != 0) ? cfg_dma_wgt_per_oc[15:0] : wgt_words;
                         dma_sram_sel  <= 2'd0;  // weight bank
+                        // Clear 2D mode — weight is contiguous 1D transfer
+                        dma_row_len   <= 16'd0;
+                        dma_row_count <= 16'd0;
+                        dma_out_stride<= 32'd0;
                         state         <= S_WAIT_WGT;
                     end else begin
                         state <= S_LOAD_ACT;
@@ -393,6 +397,10 @@ module npu_ctrl (
                         dma_ext_addr  <= cfg_dma_param_addr;
                         dma_sram_addr <= 16'd0;
                         dma_xfer_len  <= param_words;
+                        // Clear 2D mode — param is contiguous 1D transfer
+                        dma_row_len   <= 16'd0;
+                        dma_row_count <= 16'd0;
+                        dma_out_stride<= 32'd0;
                         state         <= S_WAIT_PARAM;
                     end else begin
                         state <= S_COMPUTE;
