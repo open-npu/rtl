@@ -1183,11 +1183,10 @@ module npu_compute #(
                     // Accumulate reduced dot product into dot_buf[drain_col]
                     dot_buf[drain_col] <= dot_buf[drain_col]
                         + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
-`ifdef DBG_DOTBUF
-                    if (drain_col == 0 && ((tile_x == 0 && tile_y == 0) || (tile_x == 1 && tile_y == 0)) && sp_oh == 0 && sp_ow == 0)
-                        $fwrite(dbg_fh, "[RTL_DB] t=%0d tile(%0d,%0d) sp(%0d,%0d) col=0 pass=%0d kpr=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d\n",
-                                $time, tile_y, tile_x, sp_oh, sp_ow, k_pass, k_pass_remain,
-                                dot_acc, acc_buf[reduce_cnt[COL_W-1:0]],
+`ifndef SYNTHESIS
+                    if (cfg_2d_load && drain_col == 0 && tile_x == 0 && tile_y == 0 && sp_oh == 0 && sp_ow == 0 && k_pass < 3)
+                        $display("[L2DB] pass=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d",
+                                k_pass, dot_acc, acc_buf[reduce_cnt[COL_W-1:0]],
                                 dot_buf[drain_col] + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]]);
 `endif
                     // Next column or decide next step
@@ -1228,6 +1227,10 @@ module npu_compute #(
                     param_data_ready <= 1'b1;
                 end else begin
                     param_buf[param_word_idx] <= param_rd_data;
+`ifndef SYNTHESIS
+                    if (cfg_2d_load && drain_col == 0 && tile_x == 0 && tile_y == 0 && sp_oh == 0 && sp_ow == 0)
+                        $display("[L2PRM] idx=%0d addr=%0d data=0x%08x", param_word_idx, param_rd_addr, param_rd_data);
+`endif
                     if (param_word_idx == 3'd3) begin
                         ppu_mult_m     <= param_buf[0][14:0];
                         ppu_shift_s    <= param_buf[0][21:16];
@@ -1249,10 +1252,10 @@ module npu_compute #(
             S_PPU_FEED: begin
                 ppu_acc_in   <= dot_buf[drain_col];
                 ppu_in_valid <= 1'b1;
-`ifdef DBG_DOTBUF
-                if (drain_col == 9 && ((tile_x == 0 && tile_y == 0) || (tile_x == 3 && tile_y == 6)) && sp_oh == 0 && sp_ow == 0)
-                    $fwrite(dbg_fh, "[RTL_PPU] t=%0d drain=%0d acc_in=%0d bias=%0d M=%0d S=%0d zp=%0d\n",
-                            $time, drain_col, dot_buf[drain_col],
+`ifndef SYNTHESIS
+                if (cfg_2d_load && drain_col == 0 && tile_x == 0 && tile_y == 0 && sp_oh == 0 && sp_ow == 0)
+                    $display("[L2PPU] drain=%0d acc=%0d bias=%0d M=%0d S=%0d zp=%0d",
+                            drain_col, dot_buf[drain_col],
                             $signed({param_buf[3][15:0], param_buf[2], param_buf[1][31:16]}),
                             param_buf[0][14:0], param_buf[0][21:16],
                             $signed(param_buf[1][15:0]));
