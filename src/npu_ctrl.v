@@ -387,9 +387,10 @@ module npu_ctrl (
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else if (dma_done) begin
-                        if (cfg_layer_mode[3:0] == 4'd4)
+                        if (cfg_layer_mode[3:0] == 4'd4) begin
+                            cur_tile_ddr_offset <= 32'd0;  // Reset for Add B
                             state <= S_LOAD_ADD_B;
-                        else
+                        end else
                             state <= S_LOAD_PARAM;
                     end
                 end

@@ -161,8 +161,8 @@ module npu_dma #(
                         r_xfer_len <= xfer_len;
                         r_dir      <= dir;
                         `ifndef SYNTHESIS
-                        $display("[DMA_START] ext=0x%08x sram=%0d len=%0d row_len=%0d row_cnt=%0d stride=%0d",
-                                ext_addr, sram_addr, xfer_len, cfg_row_len, cfg_row_count,
+                        $display("[DMA_START] t=%0t ext=0x%08x sram=%0d len=%0d row_len=%0d row_cnt=%0d stride=%0d",
+                                $time, ext_addr, sram_addr, xfer_len, cfg_row_len, cfg_row_count,
                                 (cfg_row_len != 0) ? cfg_out_stride : (dir ? cfg_out_stride : cfg_in_stride));
                         `endif
                         // Latch stride: use cfg_out_stride for 2D mode (set by ctrl for
