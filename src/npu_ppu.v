@@ -223,6 +223,9 @@ module npu_ppu #(
                 // s2_product already includes rounding bit (added in S2)
                 if (shift_amt > 0 && shift_amt < PROD_W)
                     shifted_full = s2_product >>> shift_amt;
+                else if (shift_amt >= PROD_W)
+                    // Shift by >= PROD_W: result is 0 (positive) or -1 (negative)
+                    shifted_full = s2_product[PROD_W-1] ? -56'sd1 : 56'sd0;
                 else
                     shifted_full = s2_product;
                 // Saturate to 17-bit signed range to avoid truncation overflow
