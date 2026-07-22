@@ -389,6 +389,7 @@ module npu_ctrl (
                     end else if (dma_done) begin
                         if (cfg_layer_mode[3:0] == 4'd4) begin
                             cur_tile_ddr_offset <= 32'd0;  // Reset for Add B
+                            ping_pong_flag <= 1'b0;  // Tile 0,0 uses bank 0
                             state <= S_LOAD_ADD_B;
                         end else
                             state <= S_LOAD_PARAM;
@@ -760,6 +761,11 @@ module npu_ctrl (
                         dma_ext_addr  <= cfg_dma_add_b_addr + cur_tile_ddr_offset;
                         dma_sram_addr <= cfg_out_base + (db_en && ping_pong_flag ? cfg_act_bank_offset : 16'd0);
                         dma_xfer_len  <= tile_in_words;
+                        `ifndef SYNTHESIS
+                        if (tile_x_seq == 0 && tile_y_seq == 0)
+                            $display("[ADD_B_GO] t=%0t ext=0x%08x offset=%0d start=%0d dma_busy=%0d",
+                                    $time, cfg_dma_add_b_addr + cur_tile_ddr_offset, cur_tile_ddr_offset, dma_start, dma_busy);
+                        `endif
                         // 2D load when in_stride != 0 (same as input A)
                         if (use_2d_load) begin
                             dma_row_len   <= load_row_len[15:0];
