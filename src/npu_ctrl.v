@@ -759,6 +759,16 @@ module npu_ctrl (
                         dma_ext_addr  <= cfg_dma_add_b_addr + cur_tile_ddr_offset;
                         dma_sram_addr <= cfg_out_base + (db_en && ping_pong_flag ? cfg_act_bank_offset : 16'd0);
                         dma_xfer_len  <= tile_in_words;
+                        // 2D load when in_stride != 0 (same as input A)
+                        if (use_2d_load) begin
+                            dma_row_len   <= load_row_len[15:0];
+                            dma_row_count <= load_row_count;
+                            dma_out_stride<= load_in_stride;
+                        end else begin
+                            dma_row_len   <= 16'd0;
+                            dma_row_count <= 16'd0;
+                            dma_out_stride<= 32'd0;
+                        end
                         state         <= S_WAIT_ADD_B;
                     end else begin
                         state <= S_LOAD_PARAM;
