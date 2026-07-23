@@ -153,24 +153,29 @@ module npu_compute #(
     // Q32 fixed-point: result = (dividend * recip) >>> 32
     // For pool_count=1: recip = 0x80000000 (shift 31 instead of 32 to fit 32-bit)
     function [31:0] recip_pool;
-        input [3:0] idx;
+        input [5:0] idx;
         case (idx)
-            4'd1:  recip_pool = 32'h8000_0000;  // 1/1 with >>31
-            4'd2:  recip_pool = 32'h8000_0000;  // 1/2 with >>32
-            4'd3:  recip_pool = 32'h5555_5556;
-            4'd4:  recip_pool = 32'h4000_0000;
-            4'd5:  recip_pool = 32'h3333_3333;
-            4'd6:  recip_pool = 32'h2AAA_AAAB;
-            4'd7:  recip_pool = 32'h2492_4925;
-            4'd8:  recip_pool = 32'h2000_0000;
-            4'd9:  recip_pool = 32'h1C71_C71C;
-            4'd10: recip_pool = 32'h1999_999A;
-            4'd11: recip_pool = 32'h1745_D174;
-            4'd12: recip_pool = 32'h1555_5555;
-            4'd13: recip_pool = 32'h13B1_3B14;
-            4'd14: recip_pool = 32'h1249_2492;
-            4'd15: recip_pool = 32'h1111_1111;
-            default: recip_pool = 32'h0;
+            6'd1:  recip_pool = 32'h8000_0000;  // 1/1 with >>31
+            6'd2:  recip_pool = 32'h8000_0000;  // 1/2 with >>32
+            6'd3:  recip_pool = 32'h5555_5556;
+            6'd4:  recip_pool = 32'h4000_0000;
+            6'd5:  recip_pool = 32'h3333_3333;
+            6'd6:  recip_pool = 32'h2AAA_AAAB;
+            6'd7:  recip_pool = 32'h2492_4925;
+            6'd8:  recip_pool = 32'h2000_0000;
+            6'd9:  recip_pool = 32'h1C71_C71C;
+            6'd10: recip_pool = 32'h1999_999A;
+            6'd11: recip_pool = 32'h1745_D174;
+            6'd12: recip_pool = 32'h1555_5555;
+            6'd13: recip_pool = 32'h13B1_3B14;
+            6'd14: recip_pool = 32'h1249_2492;
+            6'd15: recip_pool = 32'h1111_1111;
+            6'd16: recip_pool = 32'h1000_0000;
+            6'd25: recip_pool = 32'h0A3D_70A4;  // 1/25
+            6'd36: recip_pool = 32'h071C_71C7;  // 1/36
+            6'd49: recip_pool = 32'h0540_5405;  // 1/49 (7x7 global pool)
+            6'd64: recip_pool = 32'h0400_0000;  // 1/64 (8x8 global pool)
+            default: recip_pool = 32'h0100_0000;  // fallback: 1/256 (avoid div-by-zero)
         endcase
     endfunction
 
@@ -2159,7 +2164,7 @@ module npu_compute #(
                             rounded = pool_acc - half_count;
                         // Multiply by reciprocal: q = (rounded * recip) >>> 32
                         // pool_count=1 is special: recip=0x80000000, shift 31
-                        prod = rounded * $signed(recip_pool(pool_count[3:0]));
+                        prod = rounded * $signed(recip_pool(pool_count[5:0]));
                         if (pool_count == 17'd1)
                             pool_acc <= prod >>> 31;
                         else
