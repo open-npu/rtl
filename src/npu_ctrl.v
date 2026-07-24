@@ -270,7 +270,7 @@ module npu_ctrl (
             next_tile_ddr_addr <= 32'd0;
             cur_tile_ddr_offset <= 32'd0;
             add_b_reload <= 1'b0;
-            next_sram_offset <= 16'd0;
+            next_sram_offset <= cfg_act_bank_offset;  // Start prefetch to bank 1 (bank 0 has tile 0)
             tile_y_seq <= 16'd0;
             tile_x_seq <= 16'd0;
             last_tile_store <= 1'b0;
