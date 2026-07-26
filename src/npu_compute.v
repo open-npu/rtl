@@ -1757,7 +1757,8 @@ module npu_compute #(
                         ppu_mult_m     <= param_buf[0][14:0];
                         ppu_shift_s    <= param_buf[0][21:16];
                         ppu_zero_point <= $signed(param_buf[1][15:0]);
-                        ppu_bias       <= $signed({param_buf[3][15:0], param_buf[2],
+                        // Use param_rd_data for word 3 (param_buf[3] not yet updated this cycle)
+                        ppu_bias       <= $signed({param_rd_data[15:0], param_buf[2],
                                                    param_buf[1][31:16]});
                         state <= S_DW_COMPUTE;
                     end else begin
