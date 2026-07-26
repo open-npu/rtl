@@ -209,7 +209,7 @@ module npu_ppu #(
                     end else if (zp_result > clamp_hi) begin
                         out_data <= {{8{clamp_hi[7]}}, clamp_hi[7:0]};
                     end else begin
-                        if (s3_relu_en && zp_result < $signed(17'sd0))
+                        if ((s3_relu_en || s3_relu6_en) && zp_result < $signed(17'sd0))
                             out_data <= 16'sd0;
                         else
                             out_data <= {{8{zp_result[7]}}, zp_result[7:0]};
