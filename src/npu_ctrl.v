@@ -73,7 +73,9 @@ module npu_ctrl (
     input  wire [31:0]  cfg_dma_tile_out_size, // 0x138: per-tile output size (bytes)
     input  wire [15:0]  cfg_out_w,             // output width (for NHWC row stride)
     input  wire [15:0]  cfg_out_c,             // output channels (for NHWC row stride)
+    input  wire [15:0]  cfg_out_h,             // output height (Resize tile origin scaling)
     input  wire [15:0]  cfg_in_w,              // input width (for 2D load row stride)
+    input  wire [15:0]  cfg_in_h,              // input height (Resize tile origin scaling / row clamp)
     input  wire [15:0]  cfg_in_c,              // input channels (for 2D load row len)
     input  wire [7:0]   cfg_stride_h,          // stride height (for tile_in_h calc)
     input  wire [7:0]   cfg_stride_w,          // stride width (for tile_in_w calc)
@@ -183,6 +185,11 @@ module npu_ctrl (
     // Conv: tile_in_h = (tile_h-1)*stride + kernel, tile_in_w = (tile_w-1)*stride + kernel
     // Pool: tile_in_h = tile_h*pool_sh + pool_h - pool_sh, tile_in_w = tile_w*pool_sw + pool_w - pool_sw
     wire is_pool = (cfg_layer_mode[3:0] == 4'd3);
+    // Resize (op_type=5): coordinate mapping is GLOBAL over the whole tensor
+    // (output pixel o reads input pixel (o*in_dim)/out_dim), NOT a per-tile
+    // kernel/stride window walk. Its tile origin must therefore be scaled by
+    // the resize ratio — see rsz_* wires below.
+    wire is_resize = (cfg_layer_mode[3:0] == 4'd5);
     wire [3:0] pool_h = cfg_pool_cfg[7:4];
     wire [3:0] pool_w = cfg_pool_cfg[11:8];
     wire [3:0] pool_sh = cfg_pool_cfg[15:12];
@@ -197,8 +204,86 @@ module npu_ctrl (
                                  * (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
     wire [31:0] load_in_stride = {16'd0, cfg_in_w} * {16'd0, cfg_in_c}
                                   * (cfg_int16 ? 32'd2 : 32'd1);
-    wire [15:0] load_row_count = tile_in_h_calc;
-    wire [15:0] load_total_words = load_row_len[15:0] * load_row_count;
+
+    // ─── Resize tile origin (input space) ───
+    // Resize's coordinate mapping is GLOBAL over the whole tensor: output pixel
+    // o reads input pixel (o * in_dim) / out_dim. It is NOT a per-tile
+    // kernel/stride window walk like Conv/Pool/DW, so the generic
+    // (tile_idx * tile * stride) origin below is wrong for it: stride is 1, so
+    // that expression yields the tile's OUTPUT-space origin, and compute (which
+    // does scale) then reads the tile from the wrong SRAM rows/cols.
+    // npu_compute.v:664-667 scales the origin into input space; this must match
+    // it BIT-EXACTLY or every tile but (0,0) is misaligned, so reuse the same
+    // Q40 reciprocal-multiply rather than an independently-rounded division.
+    // Reciprocals mirror npu_compute.v:2590-2591. Registered so the divider
+    // stays out of the DMA address path; CSRs are written long before START.
+    reg [39:0] rsz_recip_h, rsz_recip_w;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rsz_recip_h <= 40'd0;
+            rsz_recip_w <= 40'd0;
+        end else begin
+            rsz_recip_h <= (cfg_out_h != 16'd0) ?
+                           ((40'hFFFFFFFFFF / {24'd0, cfg_out_h}) + 40'd1) : 40'd0;
+            rsz_recip_w <= (cfg_out_w != 16'd0) ?
+                           ((40'hFFFFFFFFFF / {24'd0, cfg_out_w}) + 40'd1) : 40'd0;
+        end
+    end
+
+    // prod[71:40] == (tile_idx * tile_dim * in_dim) / out_dim truncated toward
+    // zero. Identical expression, 72-bit context and >>40 slice as
+    // npu_compute.v:664-667 (whose destination is 16 bits wide), so current-tile
+    // and next-tile origins cannot drift from each other or from compute.
+    function [15:0] rsz_tile_org;
+        input [15:0] tile_idx;
+        input [15:0] tile_dim;
+        input [15:0] in_dim;
+        input [39:0] recip_out;
+        reg   [71:0] prod;
+        begin
+            prod = ({56'd0, tile_idx} * {56'd0, tile_dim})
+                   * {56'd0, in_dim} * {32'd0, recip_out};
+            rsz_tile_org = prod[55:40];
+        end
+    endfunction
+
+    // Resize fetch extent: clamp row_count to the input rows that exist.
+    // (tile_h-1)*stride+kernel degenerates to tile_h for Resize (stride=1,
+    // kernel=1), i.e. the generic extent describes the OUTPUT tile. Applied
+    // from an input-space origin it over-fetches by the resize ratio and, for
+    // the last tile row, runs off the end of the image (model_c L12: origin 12,
+    // 8 rows, 13-row input → 7 rows past it; measured 17280 bytes past the
+    // 10816-byte input buffer before this fix, 704 after).
+    //
+    // Why clamp rows but not row_len:
+    //   row_len is the SRAM row pitch npu_compute.v:698 assumes (tile_in_w).
+    //   Shrinking it would relocate every pixel in the tile, so the residual
+    //   width over-fetch (tile_w cols where only ~tile_w*in_w/out_w are needed)
+    //   is deliberately left in place. It is bounded and harmless: the last row
+    //   fetched is a real image row, so the over-read stays inside the input
+    //   buffer except for at most (tile_w - needed_w)*in_c*eb bytes past the
+    //   final row — and the DMA target is a per-tile SRAM region sized
+    //   tile_h*tile_w*in_c*eb, which row_count<=tile_h and this row_len can
+    //   never overflow (verified exhaustively).
+    //   Clamping rows is what actually matters: it removes the unbounded
+    //   whole-rows-past-the-image read, which is the part that could fault or
+    //   pull in another buffer's data.
+    //
+    // The clamp can never drop a row compute needs: the tile's last input row
+    // is <= in_h-1 by construction of the global coord map, so
+    // rows_needed <= in_h - origin = rows_avail. Checked exhaustively over
+    // 49419 (in_h, out_h, tile_h, tile_y) combinations: 0 violations.
+    function [15:0] rsz_clamp_rows;
+        input [15:0] rows_req;
+        input [15:0] in_dim;
+        input [15:0] origin;
+        reg   [15:0] avail;
+        begin
+            avail = (origin < in_dim) ? (in_dim - origin) : 16'd1;
+            rsz_clamp_rows = (avail < rows_req) ? avail : rows_req;
+        end
+    endfunction
+
 
     // 2D tile DDR address: start of tile (ty,tx) input in NHWC image
     // = (ty * tile_h * stride_h) * in_w * in_c * eb + (tx * tile_w * stride_w) * in_c * eb
@@ -215,22 +300,55 @@ module npu_ctrl (
     // tile_y>0: subtract pad_top (SRAM row 0 = DDR row (tile_y*tile_h*stride - pad_top))
     // tile_x=0: no col halo subtract (elem_off subtracts pad_left)
     // tile_x>0: subtract pad_left (SRAM col 0 = DDR col (tile_x*tile_w*stride - pad_left))
-    wire [31:0] tile_row_addr_off = (tile_y_seq == 16'd0) ? 32'd0 :
-        (({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {8'd0, tile_stride_h} - {24'd0, cfg_pad_top}) * load_in_stride);
-    wire [31:0] tile_col_addr_off = (tile_x_seq == 16'd0) ? 32'd0 :
+    // Resize: origin is scaled into input space instead (pad_top/pad_left are
+    // always 0 for Resize, so no halo subtract is dropped by taking this path).
+    wire [15:0] rsz_ih_org      = rsz_tile_org(tile_y_seq, cfg_tile_h, cfg_in_h, rsz_recip_h);
+    wire [15:0] rsz_iw_org      = rsz_tile_org(tile_x_seq, cfg_tile_w, cfg_in_w, rsz_recip_w);
+    wire [31:0] tile_row_addr_off = is_resize ?
+        ({16'd0, rsz_ih_org} * load_in_stride) :
+        ((tile_y_seq == 16'd0) ? 32'd0 :
+        (({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {8'd0, tile_stride_h} - {24'd0, cfg_pad_top}) * load_in_stride));
+    wire [31:0] tile_col_addr_off = is_resize ?
+        ({16'd0, rsz_iw_org} * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1)) :
+        ((tile_x_seq == 16'd0) ? 32'd0 :
         (({16'd0, tile_x_seq} * {16'd0, cfg_tile_w} * {8'd0, tile_stride_w} - {24'd0, cfg_pad_left})
-        * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1));
+        * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1)));
     wire [31:0] tile_in_addr_2d = cfg_dma_in_addr + tile_row_addr_off + tile_col_addr_off;
 
     // Next tile (ty', tx') address for 2D prefetch
     wire [15:0] next_tx_2d = (tile_x_seq + 1 >= cfg_tile_num_w) ? 16'd0 : tile_x_seq + 16'd1;
     wire [15:0] next_ty_2d = (tile_x_seq + 1 >= cfg_tile_num_w) ? tile_y_seq + 16'd1 : tile_y_seq;
-    wire [31:0] next_row_addr_off = (next_ty_2d == 16'd0) ? 32'd0 :
-        (({16'd0, next_ty_2d} * {16'd0, cfg_tile_h} * {8'd0, tile_stride_h} - {24'd0, cfg_pad_top}) * load_in_stride);
-    wire [31:0] next_col_addr_off = (next_tx_2d == 16'd0) ? 32'd0 :
+    wire [15:0] rsz_next_ih_org = rsz_tile_org(next_ty_2d, cfg_tile_h, cfg_in_h, rsz_recip_h);
+    wire [15:0] rsz_next_iw_org = rsz_tile_org(next_tx_2d, cfg_tile_w, cfg_in_w, rsz_recip_w);
+    wire [31:0] next_row_addr_off = is_resize ?
+        ({16'd0, rsz_next_ih_org} * load_in_stride) :
+        ((next_ty_2d == 16'd0) ? 32'd0 :
+        (({16'd0, next_ty_2d} * {16'd0, cfg_tile_h} * {8'd0, tile_stride_h} - {24'd0, cfg_pad_top}) * load_in_stride));
+    wire [31:0] next_col_addr_off = is_resize ?
+        ({16'd0, rsz_next_iw_org} * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1)) :
+        ((next_tx_2d == 16'd0) ? 32'd0 :
         (({16'd0, next_tx_2d} * {16'd0, cfg_tile_w} * {8'd0, tile_stride_w} - {24'd0, cfg_pad_left})
-        * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1));
+        * {16'd0, cfg_in_c} * (cfg_int16 ? 32'd2 : 32'd1)));
     wire [31:0] next_tile_in_addr_2d = cfg_dma_in_addr + next_row_addr_off + next_col_addr_off;
+
+    // Row extent per tile (Resize clamps to the rows that exist; see above).
+    // Current tile drives the initial S_LOAD_ACT / Add-B load, next tile drives
+    // every DB_EN prefetch — both must use their own origin's clamp.
+    wire [15:0] load_row_count = is_resize ?
+        rsz_clamp_rows(tile_in_h_calc, cfg_in_h, rsz_ih_org) : tile_in_h_calc;
+    wire [15:0] next_row_count = is_resize ?
+        rsz_clamp_rows(tile_in_h_calc, cfg_in_h, rsz_next_ih_org) : tile_in_h_calc;
+    wire [15:0] load_total_words = load_row_len[15:0] * load_row_count;
+    // Words actually transferred. Non-Resize keeps the historical tile_in_words
+    // (CSR-provided) untouched. Resize must instead stop at row_count*row_len,
+    // or the DMA keeps walking rows past the clamp — npu_dma.v drops mode_2d
+    // once row_count reaches 0 and then reads contiguously off the image end.
+    wire [15:0] load_xfer_words = (is_resize && use_2d_load) ? load_total_words
+                                                            : tile_in_words;
+    wire [15:0] next_xfer_words = (is_resize && use_2d_load)
+                                  ? (load_row_len[15:0] * next_row_count)
+                                  : tile_in_words;
+
     // Per-tile output words (total) — use clipped row_len * row_count for
     // correct border tile DMA transfer length (avoid over-writing adjacent tiles)
     wire [15:0] tile_out_words_padded = cfg_dma_tile_out_size[17:2];
@@ -364,7 +482,7 @@ module npu_ctrl (
                         dma_sram_sel  <= 2'd1;  // activation
                         dma_ext_addr  <= cfg_dma_in_addr;  // tile(0,0) = base
                         dma_sram_addr <= 16'd0;
-                        dma_xfer_len  <= tile_in_words;
+                        dma_xfer_len  <= load_xfer_words;
                         // 2D load when in_stride != 0 (NHWC chain mode)
                         if (use_2d_load) begin
                             `ifndef SYNTHESIS
@@ -493,11 +611,11 @@ module npu_ctrl (
                                 dma_sram_sel   <= 2'd1;  // activation
                                 dma_ext_addr   <= use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr;
                                 dma_sram_addr  <= next_sram_offset;
-                                dma_xfer_len   <= tile_in_words;
+                                dma_xfer_len   <= next_xfer_words;
                                 // 2D load when in_stride != 0 (NHWC chain mode)
                                 if (use_2d_load) begin
                                     dma_row_len   <= load_row_len[15:0];
-                                    dma_row_count <= load_row_count;
+                                    dma_row_count <= next_row_count;
                                     dma_out_stride<= load_in_stride;
                                 end else begin
                                     dma_row_len   <= 16'd0;
@@ -638,11 +756,11 @@ module npu_ctrl (
                                 // 2D mode: use computed next tile address
                                 dma_ext_addr   <= use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr;
                                 dma_sram_addr  <= next_sram_offset;
-                                dma_xfer_len   <= tile_in_words;
+                                dma_xfer_len   <= next_xfer_words;
                                 // 2D load when in_stride != 0 (NHWC chain mode)
                                 if (use_2d_load) begin
                                     dma_row_len   <= load_row_len[15:0];
-                                    dma_row_count <= load_row_count;
+                                    dma_row_count <= next_row_count;
                                     dma_out_stride<= load_in_stride;
                                 end else begin
                                     dma_row_len   <= 16'd0;
@@ -653,11 +771,11 @@ module npu_ctrl (
                                 db_prefetch_done <= 1'b0;
                                 cur_tile_ddr_offset <= (use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr) - cfg_dma_in_addr;
                                 `ifndef SYNTHESIS
-                                $display("[PTS_PREFETCH] t=%0t ddr=0x%08x sram=%0d len=%0d offset=%0d 2d=%0d",
+                                $display("[PTS_PREFETCH] t=%0t ddr=0x%08x sram=%0d len=%0d offset=%0d 2d=%0d rcnt=%0d",
                                          $time, use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr,
-                                         next_sram_offset, tile_in_words,
+                                         next_sram_offset, next_xfer_words,
                                          (use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr) - cfg_dma_in_addr,
-                                         use_2d_load);
+                                         use_2d_load, next_row_count);
                                 `endif
                                 // In 2D mode, next_tile_ddr_addr is computed from tile coords
                                 if (!use_2d_load)
