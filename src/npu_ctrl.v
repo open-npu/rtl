@@ -158,6 +158,22 @@ module npu_ctrl (
     wire skip_act_load = fuse_mid | fuse_end;   // Input already in SRAM
     wire skip_store    = fuse_start | fuse_mid;  // Output stays in SRAM
 
+    // ─── Op-type decode ───
+    wire is_add_op    = (cfg_layer_mode[3:0] == 4'd4);
+    wire is_concat_op = (cfg_layer_mode[3:0] == 4'd7);
+
+    // Concat phase-2 out-region preload geometry. The preload source is the
+    // previous concat phase's DDR output — a full out_c-wide NHWC tensor —
+    // NOT this layer's in_c-wide input, so it needs output-geometry DMA
+    // parameters (row pitch/stride in out_c, per-tile offset in out_c).
+    wire [31:0] concat_b_row_stride = {16'd0, cfg_out_w} * {16'd0, cfg_out_c}
+                                      * (cfg_int16 ? 32'd2 : 32'd1);
+    wire [15:0] concat_b_row_len    = ({16'd0, cfg_tile_w} * {16'd0, cfg_out_c}
+                                       * (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
+    wire [15:0] concat_b_xfer_words = (cfg_tile_h != 16'd0)
+                                      ? (concat_b_row_len * cfg_tile_h)
+                                      : out_words;
+
     // ─── Double-buffer control ───
     wire db_en = cfg_dma_ctrl[0];
     wire per_tile_store_en = cfg_dma_store_mode[0];  // Per-tile store to NHWC DDR layout
@@ -472,7 +488,7 @@ module npu_ctrl (
                         state <= S_DONE;
                     end else if (skip_act_load || in_words == 0) begin
                         // Fused mid/end: input already in SRAM, skip load
-                        if (cfg_layer_mode[3:0] == 4'd4)
+                        if (is_add_op || is_concat_op)
                             state <= S_LOAD_ADD_B;
                         else
                             state <= S_LOAD_PARAM;
@@ -505,7 +521,7 @@ module npu_ctrl (
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else if (dma_done) begin
-                        if (cfg_layer_mode[3:0] == 4'd4) begin
+                        if (is_add_op || is_concat_op) begin
                             cur_tile_ddr_offset <= 32'd0;  // Reset for Add B
                             ping_pong_flag <= 1'b0;  // Tile 0,0 uses bank 0
                             state <= S_LOAD_ADD_B;
@@ -702,19 +718,22 @@ module npu_ctrl (
                         dma_dir       <= 1'b1;  // store
                         dma_sram_sel  <= 2'd1;  // activation
                         dma_ext_addr  <= cfg_dma_out_addr + r_tile_ddr_offset;
-                        // Source SRAM: output region in current bank
-                        if (cfg_dma_add_b_addr != 0)
+                        // Source SRAM: output region in current bank.
+                        // Add (op 4) computes in-place in the input region;
+                        // everything else (incl. Concat, which also has
+                        // add_b != 0 for its preload) stores from out region.
+                        if (is_add_op)
                             dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
                         else
                             dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
                         dma_xfer_len  <= r_tile_row_len * r_tile_row_count;
                         // 2D parameters: all layers use clipped tile dims for DDR row_len.
-                        // Add layers: SRAM uses padded tile_w, so src_row_len = padded.
+                        // Add/Concat layers: SRAM uses padded tile_w, so src_row_len = padded.
                         // Conv: src_row_len = 0 (same as row_len, no padding).
                         dma_row_len    <= r_tile_row_len;
                         dma_row_count  <= r_tile_row_count;
                         dma_out_stride <= r_nhwc_row_stride;
-                        if (cfg_dma_add_b_addr != 0 && cfg_tile_w != 0)
+                        if ((is_add_op || is_concat_op) && cfg_tile_w != 0)
                             dma_src_row_len <= ({16'd0, cfg_tile_w} * {16'd0, cfg_out_c} *
                                                  (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
                         else
@@ -844,13 +863,15 @@ module npu_ctrl (
                         dma_dir       <= 1'b1;  // store
                         dma_sram_sel  <= 2'd1;  // activation
                         dma_ext_addr  <= cfg_dma_out_addr;
-                        // Conv2D: store from cfg_out_base; Add: store from cfg_act_base (in-place)
-                        if (cfg_dma_add_b_addr != 0)
+                        // Conv2D/Concat: store from cfg_out_base; Add: store from
+                        // cfg_act_base (in-place). Key on op_type, not add_b_addr:
+                        // Concat has add_b != 0 (preload) but stores from out_base.
+                        if (is_add_op)
                             dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
                         else
                             dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
                         // For DB_EN Add: use tile_in_words (same as output size per tile)
-                        dma_xfer_len  <= (db_en && cfg_dma_add_b_addr != 0) ? tile_in_words : out_words;
+                        dma_xfer_len  <= (db_en && is_add_op) ? tile_in_words : out_words;
                         // 1D mode for final store (clear any 2D params)
                         dma_row_len   <= 16'd0;
                         dma_row_count <= 16'd0;
@@ -868,7 +889,12 @@ module npu_ctrl (
                     end
                 end
 
-                // ─── Phase 2b: Load Add Branch B (op_type==4 only) ───
+                // ─── Phase 2b: Load Add Branch B / Concat out-region preload ───
+                // Add (op 4): load branch B (in_c geometry, cur_tile_ddr_offset).
+                // Concat (op 7): preload the previous phase's DDR output into
+                // the OUT region so this phase's scatter preserves the channels
+                // it doesn't own. Source tensor is out_c-wide → output geometry
+                // (tile_ddr_offset, concat_b_row_len/row_stride, out_words).
                 S_LOAD_ADD_B: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;
@@ -876,19 +902,21 @@ module npu_ctrl (
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;  // load
                         dma_sram_sel  <= 2'd1;  // activation
-                        dma_ext_addr  <= cfg_dma_add_b_addr + cur_tile_ddr_offset;
+                        dma_ext_addr  <= cfg_dma_add_b_addr
+                                         + (is_concat_op ? tile_ddr_offset : cur_tile_ddr_offset);
                         dma_sram_addr <= cfg_out_base + (db_en && ping_pong_flag ? cfg_act_bank_offset : 16'd0);
-                        dma_xfer_len  <= tile_in_words;
+                        dma_xfer_len  <= is_concat_op ? concat_b_xfer_words : tile_in_words;
                         `ifndef SYNTHESIS
                         if (tile_x_seq == 0 && tile_y_seq == 0)
                             $display("[ADD_B_GO] t=%0t ext=0x%08x offset=%0d start=%0d dma_busy=%0d",
                                     $time, cfg_dma_add_b_addr + cur_tile_ddr_offset, cur_tile_ddr_offset, dma_start, dma_busy);
                         `endif
-                        // 2D load when in_stride != 0 (same as input A)
+                        // 2D load when in_stride != 0 (same as input A).
+                        // Concat preload walks the out_c-wide source tensor.
                         if (use_2d_load) begin
-                            dma_row_len   <= load_row_len[15:0];
-                            dma_row_count <= load_row_count;
-                            dma_out_stride<= load_in_stride;
+                            dma_row_len   <= is_concat_op ? concat_b_row_len : load_row_len[15:0];
+                            dma_row_count <= is_concat_op ? cfg_tile_h : load_row_count;
+                            dma_out_stride<= is_concat_op ? concat_b_row_stride : load_in_stride;
                         end else begin
                             dma_row_len   <= 16'd0;
                             dma_row_count <= 16'd0;
