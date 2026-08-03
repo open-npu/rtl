@@ -165,7 +165,29 @@ module npu_ppu #(
             out_valid <= s3_valid;
 
             if (s3_mode == MODE_PASSTHROUGH) begin
-                out_data <= zp_result[DATA_W-1:0];
+                // Passthrough still must saturate to the data-type range — the
+                // FSM (Add/Concat) produces full-precision values that would
+                // otherwise wrap (e.g. 132 -> 0x84 == -124 in INT8) instead of
+                // clamping to +127 like the CSIM golden does.
+                if (s3_int16) begin
+                    if ((s3_relu_en || s3_relu6_en) && zp_result < $signed(17'sd0))
+                        out_data <= 16'sd0;
+                    else if (zp_result < -$signed(17'sd32768))
+                        out_data <= -16'sd32768;
+                    else if (zp_result > clamp_hi)
+                        out_data <= clamp_hi[DATA_W-1:0];
+                    else
+                        out_data <= zp_result[DATA_W-1:0];
+                end else begin
+                    if ((s3_relu_en || s3_relu6_en) && zp_result < $signed(17'sd0))
+                        out_data <= 16'sd0;
+                    else if (zp_result < -$signed(17'sd128))
+                        out_data <= {{8{1'b1}}, 8'h80};  // -128 sign-extended
+                    else if (zp_result > clamp_hi)
+                        out_data <= {{8{clamp_hi[7]}}, clamp_hi[7:0]};
+                    else
+                        out_data <= {{8{zp_result[7]}}, zp_result[7:0]};
+                end
             end else if (s3_mode == MODE_RELU_ONLY || s3_mode == MODE_ADD) begin
                 if (s3_int16) begin
                     // INT16 clamp+relu/relu6
