@@ -2280,7 +2280,10 @@ module npu_compute #(
             // Flow: SETUP → PARAM → [READ_A → READ_B → COMPUTE → PPU → PPU_WAIT → WB → NEXT]*
             // ══════════════════════════════════════════════════════════════
             S_ADD_SETUP: begin
-                add_total_elems <= cfg_out_h * cfg_out_w * cfg_out_c;
+                // Concat scatters its INPUT elements (in_c per pixel) into a
+                // wider output buffer — the loop must cover in_c, not out_c.
+                // Add is element-wise 1:1 and legitimately uses out_c.
+                add_total_elems <= cfg_out_h * cfg_out_w * (is_concat ? cfg_in_c : cfg_out_c);
                 add_elem_cnt <= 0;
                 add_tile_elem_cnt <= 0;
                 concat_pixel_cnt <= 0;
@@ -2515,7 +2518,9 @@ module npu_compute #(
                 act_wr_en <= 1'b0;  // Clear write enable
                 ppu_in_valid <= 1'b0;  // Clear PPU input valid
                 // Use padded tile size for SRAM layout (DMA skips padding via src_row_len)
-                elems_per_tile = {17'd0, cfg_tile_h} * {17'd0, cfg_tile_w} * {17'd0, cfg_out_c};
+                // Concat iterates input elements (in_c per pixel), not out_c.
+                elems_per_tile = {17'd0, cfg_tile_h} * {17'd0, cfg_tile_w}
+                                 * {17'd0, (is_concat ? cfg_in_c : cfg_out_c)};
                 if (cfg_tile_h == 17'd0 || elems_per_tile == 0) begin
                     // Non-tiled: original logic
                     if ({17'd0, add_elem_cnt} + 32'd1 >= {17'd0, add_total_elems}) begin
