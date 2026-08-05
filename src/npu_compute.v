@@ -155,8 +155,8 @@ module npu_compute #(
     function [31:0] recip_pool;
         input [5:0] idx;
         case (idx)
-            6'd1:  recip_pool = 32'h8000_0000;  // 1/1 with >>31
-            6'd2:  recip_pool = 32'h8000_0000;  // 1/2 with >>32
+            6'd1:  recip_pool = 32'h4000_0000;  // 1/1 identity (unused, count=1 special-cased)
+            6'd2:  recip_pool = 32'h4000_0000;  // 1/2 with >>31 (avoid 0x80000000 signed)
             6'd3:  recip_pool = 32'h5555_5556;
             6'd4:  recip_pool = 32'h4000_0000;
             6'd5:  recip_pool = 32'h3333_3333;
@@ -2154,22 +2154,30 @@ module npu_compute #(
                 // AvgPool: symmetric rounding division (reciprocal LUT)
                 // MaxPool: pass through
                 if (pool_mode && pool_count > 0) begin
-                    begin : pool_div_blk
-                        reg signed [ACC_W-1:0] rounded;
-                        reg signed [ACC_W-1:0] half_count;
-                        reg signed [71:0] prod;  // 40-bit * 32-bit = 72-bit
-                        half_count = pool_count >> 1;
-                        if (pool_acc >= 0)
-                            rounded = pool_acc + half_count;
-                        else
-                            rounded = pool_acc - half_count;
-                        // Multiply by reciprocal: q = (rounded * recip) >>> 32
-                        // pool_count=1 is special: recip=0x80000000, shift 31
-                        prod = rounded * $signed(recip_pool(pool_count[5:0]));
-                        if (pool_count == 17'd1)
-                            pool_acc <= prod >>> 31;
-                        else
-                            pool_acc <= prod >>> 32;
+                    // pool_count=1 is identity (e.g. 1x1 global avg pool): skip
+                    // reciprocal multiply — LUT can't represent 1.0 in 32-bit
+                    // signed Q0.32 (0x80000000 reads back as -2^31 under $signed).
+                    if (pool_count == 17'd1) begin
+                        pool_acc <= pool_acc;  // identity
+                    end else begin
+                        begin : pool_div_blk
+                            reg signed [ACC_W-1:0] rounded;
+                            reg signed [ACC_W-1:0] half_count;
+                            reg signed [71:0] prod;  // 40-bit * 32-bit = 72-bit
+                            half_count = pool_count >> 1;
+                            if (pool_acc >= 0)
+                                rounded = pool_acc + half_count;
+                            else
+                                rounded = pool_acc - half_count;
+                            // Multiply by reciprocal: q = (rounded * recip) >>> N
+                            // count=2 uses recip=0x40000000 (2^30) >>> 31 since
+                            // 0x80000000 would be negative under $signed.
+                            prod = rounded * $signed(recip_pool(pool_count[5:0]));
+                            if (pool_count == 17'd2)
+                                pool_acc <= prod >>> 31;
+                            else
+                                pool_acc <= prod >>> 32;
+                        end
                     end
                 end
                 state <= S_POOL_PPU;
