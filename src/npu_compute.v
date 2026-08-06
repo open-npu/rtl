@@ -1824,10 +1824,24 @@ module npu_compute #(
                                 // Tiled: tile-local address (dw_oh/dw_ow are tile-local
                                 // output coords; input row = dw_oh*stride + dw_fh,
                                 // input col = dw_ow*stride + dw_fw, both within tile_in_h/w)
-                                elem_off = ({17'd0, dw_oh} * cfg_stride_h + {17'd0, dw_fh}) * tile_in_w
-                                         + ({17'd0, dw_ow} * cfg_stride_w + {17'd0, dw_fw})
-                                         ;
-                                elem_off = elem_off * cfg_in_c + oc_group;
+                                begin : dw_addr_2d_blk
+                                    reg [17:0] row_rel, col_rel;
+                                    row_rel = {2'd0, dw_oh} * {10'd0, cfg_stride_h} + {14'd0, dw_fh};
+                                    col_rel = {2'd0, dw_ow} * {10'd0, cfg_stride_w} + {14'd0, dw_fw};
+                                    if (cfg_2d_load) begin
+                                        // 2D chained load: border tiles have no halo in
+                                        // SRAM (image starts at buffer row/col 0). Match
+                                        // the Conv systolic path (S_ACT_CMD): subtract
+                                        // pad so the tile-local coord maps onto the
+                                        // clipped window the 2D load actually wrote.
+                                        if (tile_oh_origin == 16'd0)
+                                            row_rel = row_rel - {10'd0, cfg_pad_top};
+                                        if (tile_ow_origin == 16'd0)
+                                            col_rel = col_rel - {10'd0, cfg_pad_left};
+                                    end
+                                    elem_off = (row_rel[15:0] * tile_in_w + col_rel[15:0])
+                                               * cfg_in_c + oc_group;
+                                end
                             end
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_rd_en   <= 1'b1;
