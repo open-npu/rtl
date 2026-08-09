@@ -2097,10 +2097,24 @@ module npu_compute #(
                                          + pool_ch;
                             end else begin
                                 // Tiled: use tile-local coords (matching Conv2D fix)
-                                elem_off = ({8'd0, pool_oh} * pool_sh + {8'd0, pool_fh}) * tile_in_w
-                                         + {8'd0, pool_ow} * pool_sw + {8'd0, pool_fw};
-                                // Add channel offset for multi-channel pooling
-                                elem_off = elem_off * cfg_in_c + pool_ch;
+                                begin : pool_addr_2d_blk
+                                    reg [17:0] row_rel, col_rel;
+                                    row_rel = {2'd0, pool_oh} * {10'd0, pool_sh} + {14'd0, pool_fh};
+                                    col_rel = {2'd0, pool_ow} * {10'd0, pool_sw} + {14'd0, pool_fw};
+                                    if (cfg_2d_load) begin
+                                        // 2D chained load: border tiles have no halo in
+                                        // SRAM (image starts at buffer row/col 0). Match
+                                        // the Conv systolic + DW paths: subtract pad so the
+                                        // tile-local coord maps onto the clipped window the
+                                        // 2D load actually wrote. (model_e L1 Pool pad=1)
+                                        if (tile_oh_origin == 16'd0)
+                                            row_rel = row_rel - {10'd0, cfg_pad_top};
+                                        if (tile_ow_origin == 16'd0)
+                                            col_rel = col_rel - {10'd0, cfg_pad_left};
+                                    end
+                                    elem_off = (row_rel[15:0] * tile_in_w + col_rel[15:0])
+                                               * cfg_in_c + pool_ch;
+                                end
                             end
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_rd_en   <= 1'b1;
