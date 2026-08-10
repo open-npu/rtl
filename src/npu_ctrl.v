@@ -128,6 +128,8 @@ module npu_ctrl (
     localparam S_TILE_STORE_WAIT = 6'd17; // Per-tile store: wait for DMA done
     localparam S_RELOAD_WGT     = 6'd18; // Per-oc_group: reload weights
     localparam S_WAIT_RELOAD_WGT= 6'd19;
+    localparam S_RELOAD_PARAM   = 6'd20; // Per-oc_group: reload PPU params (for out_c > param SRAM capacity)
+    localparam S_WAIT_RELOAD_PARAM=6'd21;
 
     reg [5:0] state;
     reg       aborted;  // Latched abort flag — prevents auto-restart in S_DONE
@@ -136,6 +138,12 @@ module npu_ctrl (
     wire [15:0] param_words = (cfg_layer_mode[3:0] == 4'd4 || cfg_layer_mode[3:0] == 4'd7)
                               ? cfg_param_count        // Add/Concat: direct word count
                               : cfg_param_count * 4;  // Conv2D: 4 words per channel
+
+    // Param SRAM capacity = PARAM_DEPTH = SPAD_KB*16 words. Params are read
+    // 4 words/channel, so only (SPAD_KB*16/4) channels fit at once. When a
+    // layer's channel count exceeds this (e.g. model_e L30 FC out_c=1000 > 768),
+    // the params must be reloaded per oc_group (like per-OC weight reload).
+    wire param_needs_reload = ({17'd0, param_words} > (`SPAD_KB * 16));
 
     // Weight words = wgt_size / 4 (32-bit to handle large models)
     wire [31:0] wgt_words = cfg_dma_wgt_size >> 2;
@@ -540,7 +548,11 @@ module npu_ctrl (
                         dma_sram_sel  <= 2'd2;  // param
                         dma_ext_addr  <= cfg_dma_param_addr;
                         dma_sram_addr <= 16'd0;
-                        dma_xfer_len  <= param_words;
+                        // Per-oc reload: load only the FIRST oc_group's params
+                        // (ARRAY_SIZE*4 words); the rest reload per oc_group in
+                        // S_RELOAD_PARAM (param SRAM holds only ~768 channels, so
+                        // out_c>768 layers like model_e L30 FC must not load all).
+                        dma_xfer_len  <= param_needs_reload ? 16'd64 : param_words;
                         // Clear 2D mode — param is contiguous 1D transfer
                         dma_row_len   <= 16'd0;
                         dma_row_count <= 16'd0;
@@ -831,7 +843,45 @@ module npu_ctrl (
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else if (dma_done) begin
-                        wgt_reload_done <= 1'b1;
+                        // Chain into per-oc param reload ONLY if params overflow the
+                        // param SRAM (out_c > ~768). If params fit, skip straight to
+                        // done (keeps per-OC weight-reload layers like model_d L13
+                        // on the original single-load param path — no regression).
+                        if (param_needs_reload)
+                            state <= S_RELOAD_PARAM;
+                        else begin
+                            wgt_reload_done <= 1'b1;
+                            state <= S_WAIT_COMP;
+                        end
+                    end
+                end
+
+                // ─── Per-oc_group param reload ───
+                // DDR layout: 4 words per channel, 16 channels per oc_group =
+                // 64 words (256 bytes) per oc_group. Load oc_group_idx's params to
+                // param SRAM[0] (compute reads param_base=0 for per-oc reload).
+                S_RELOAD_PARAM: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else begin
+                        dma_start     <= 1'b1;
+                        dma_dir       <= 1'b0;  // load
+                        dma_sram_sel  <= 2'd2;  // param bank
+                        dma_ext_addr  <= cfg_dma_param_addr + oc_group_idx * 32'd256;
+                        dma_sram_addr <= 16'd0;  // always load to param SRAM[0]
+                        dma_xfer_len  <= 16'd64;  // 16 channels * 4 words
+                        dma_row_len   <= 16'd0;
+                        dma_row_count <= 16'd0;
+                        dma_out_stride<= 32'd0;
+                        state         <= S_WAIT_RELOAD_PARAM;
+                    end
+                end
+
+                S_WAIT_RELOAD_PARAM: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else if (dma_done) begin
+                        wgt_reload_done <= 1'b1;  // both weights + params reloaded
                         state <= S_WAIT_COMP;
                     end
                 end

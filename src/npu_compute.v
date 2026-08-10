@@ -747,8 +747,15 @@ module npu_compute #(
                              $time, tile_y, tile_x, oc_group, k_depth,
                              (k_depth - 1) / ARRAY_SIZE_16, col_last, act_base + cfg_out_base);
                 `endif
-                // Param base: 4 words per channel, ARRAY_SIZE channels per group
-                param_base <= oc_group * ARRAY_SIZE_16 * 4;
+                // Param base: 4 words per channel, ARRAY_SIZE channels per group.
+                // When per-oc PARAM reload is active (weights reload per oc_group
+                // AND out_c exceeds the param SRAM capacity of SPAD_KB*16/4
+                // channels), the controller reloads this oc_group's params to
+                // param SRAM[0], so param_base must be 0 (not oc_group*64).
+                if (cfg_wgt_per_oc != 0 && ({17'd0, cfg_out_c} * 4 > (`SPAD_KB * 16)))
+                    param_base <= 16'd0;  // per-oc param reload → params at SRAM[0]
+                else
+                    param_base <= oc_group * ARRAY_SIZE_16 * 4;
 
                 // Multi-pass setup
                 k_pass <= 0;
