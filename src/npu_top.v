@@ -558,7 +558,7 @@ module npu_top #(
     npu_dw_conv #(
         .DATA_W  (`DATA_WIDTH),
         .ACC_W   (`ACC_WIDTH),
-        .MAX_KSZ (7)
+        .MAX_KSZ (16)
     ) u_dw_conv (
         .clk        (clk),
         .rst_n      (rst_n),

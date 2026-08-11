@@ -37,6 +37,14 @@
 `define ELEM_BYTES_INT8   1   // Bytes per element in INT8 mode
 `define ELEM_BYTES_INT16  2   // Bytes per element in INT16 mode
 
+// ─── DW global-pool streaming ───
+// Non-tiled DW Conv whose kernel covers the whole input (global-pool style,
+// e.g. model_a L61: 14x14x512 -> 1x1x512) is streamed in 16-channel groups:
+// per group the controller DMA-loads a [pos][ch_local] act slice plus a
+// 16-channel weight block; the 1x1xC output accumulates in a fixed high
+// region of act SRAM (top 1024 words), decoupled from the slice at SRAM[0].
+`define DW_STREAM_OUT_BASE (`SPAD_KB * 64 - 1024)
+
 // ─── Bus configuration ───
 `define WB_DATA_WIDTH  32     // Wishbone data bus width
 `define WB_ADDR_WIDTH  32     // Wishbone address bus width

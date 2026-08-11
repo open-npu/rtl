@@ -130,6 +130,11 @@ module npu_ctrl (
     localparam S_WAIT_RELOAD_WGT= 6'd19;
     localparam S_RELOAD_PARAM   = 6'd20; // Per-oc_group: reload PPU params (for out_c > param SRAM capacity)
     localparam S_WAIT_RELOAD_PARAM=6'd21;
+    localparam S_DWS_RELOAD_WGT     = 6'd22; // DW stream: reload 16-ch weight block
+    localparam S_DWS_RELOAD_WGT_WAIT= 6'd23;
+    localparam S_DWS_RELOAD_ACT     = 6'd24; // DW stream: reload 16-ch act slice (2D)
+    localparam S_DWS_RELOAD_ACT_WAIT= 6'd25;
+    localparam S_DWS_RELOAD_ACK     = 6'd26; // DW stream: wait oc_group_done deassert
 
     reg [5:0] state;
     reg       aborted;  // Latched abort flag — prevents auto-restart in S_DONE
@@ -169,6 +174,27 @@ module npu_ctrl (
     // ─── Op-type decode ───
     wire is_add_op    = (cfg_layer_mode[3:0] == 4'd4);
     wire is_concat_op = (cfg_layer_mode[3:0] == 4'd7);
+
+    // ─── DW global-pool streaming detect ───
+    // Non-tiled DW Conv with kernel == whole input and 1x1 output whose
+    // input tensor overflows act SRAM (e.g. model_a L61 14x14x512→1x1x512:
+    // 25088 words > 12288; weights equally 25088 > 24576 wgt SRAM).
+    // Streamed in 16-channel groups: each group DMA-loads a [pos][ch_local]
+    // act slice (2D: row = ARRAY_SIZE ch at one spatial position, stride =
+    // in_c*esz) plus a contiguous 16-ch weight block. Group boundaries use
+    // the oc_group_done/wgt_reload_done handshake (S_DWS_RELOAD_* states).
+    wire [31:0] dws_esz       = cfg_int16 ? 32'd2 : 32'd1;
+    wire        dw_stream     = (cfg_layer_mode[3:0] == 4'd1) && (cfg_tile_h == 16'd0)
+                             && ({8'd0, cfg_kernel_h} == cfg_in_h)
+                             && ({8'd0, cfg_kernel_w} == cfg_in_w)
+                             && (cfg_out_h == 16'd1) && (cfg_out_w == 16'd1)
+                             && ((cfg_dma_in_size >> 2) > (`SPAD_KB * 64));
+    wire [15:0] dws_row_len   = (`ARRAY_SIZE * dws_esz[15:0]) >> 2;  // 4 (int8) / 8 (int16) words
+    wire [15:0] dws_row_count = cfg_in_h * cfg_in_w;                 // spatial positions
+    wire [31:0] dws_stride    = {16'd0, cfg_in_c} * dws_esz;         // bytes between positions
+    wire [31:0] dws_act_words32 = {16'd0, dws_row_len} * {16'd0, dws_row_count};
+    wire [15:0] dws_wgt_words = (`ARRAY_SIZE * {8'd0, cfg_kernel_h} * {8'd0, cfg_kernel_w}
+                                 * dws_esz[15:0]) >> 2;
 
     // Concat phase-2 out-region preload geometry. The preload source is the
     // previous concat phase's DDR output — a full out_c-wide NHWC tensor —
@@ -470,7 +496,11 @@ module npu_ctrl (
                         dma_ext_addr  <= cfg_dma_wgt_addr;
                         dma_sram_addr <= 16'd0;
                         // Per-oc_group: load only first group if wgt_per_oc != 0
-                        dma_xfer_len  <= (cfg_dma_wgt_per_oc != 0) ? cfg_dma_wgt_per_oc[15:0] : wgt_words;
+                        // DW stream: load only group 0's 16-ch weight block
+                        if (dw_stream)
+                            dma_xfer_len <= dws_wgt_words;
+                        else
+                            dma_xfer_len <= (cfg_dma_wgt_per_oc != 0) ? cfg_dma_wgt_per_oc[15:0] : wgt_words;
                         dma_sram_sel  <= 2'd0;  // weight bank
                         // Clear 2D mode — weight is contiguous 1D transfer
                         dma_row_len   <= 16'd0;
@@ -506,6 +536,19 @@ module npu_ctrl (
                         dma_sram_sel  <= 2'd1;  // activation
                         dma_ext_addr  <= cfg_dma_in_addr;  // tile(0,0) = base
                         dma_sram_addr <= 16'd0;
+                        if (dw_stream) begin
+                            // DW stream: 2D load of group 0's channel slice.
+                            // Row = ARRAY_SIZE channels at one spatial position
+                            // (contiguous in NHWC), row stride = in_c*esz bytes.
+                            dma_xfer_len   <= dws_act_words32[15:0];
+                            dma_row_len    <= dws_row_len;
+                            dma_row_count  <= dws_row_count;
+                            dma_out_stride <= dws_stride;
+                            `ifndef SYNTHESIS
+                            $display("[DWS_LOAD_INIT] t=%0t slice0 rlen=%0d rcnt=%0d stride=%0d addr=0x%08x",
+                                     $time, dws_row_len, dws_row_count, dws_stride, cfg_dma_in_addr);
+                            `endif
+                        end else begin
                         dma_xfer_len  <= load_xfer_words;
                         // 2D load when in_stride != 0 (NHWC chain mode)
                         if (use_2d_load) begin
@@ -521,6 +564,7 @@ module npu_ctrl (
                             dma_row_count <= 16'd0;
                             dma_out_stride<= 32'd0;
                         end
+                        end  // !dw_stream
                         state         <= S_WAIT_ACT;
                     end
                 end
@@ -682,9 +726,11 @@ module npu_ctrl (
                         end
 
                         // ─── oc_group_done: reload weights for next oc_group ───
-                        if (oc_group_done && cfg_dma_wgt_per_oc != 0) begin
-                            `ifndef SYNTHESIS
-                            `endif
+                        if (oc_group_done && dw_stream) begin
+                            // DW stream: reload act slice + weight block for
+                            // the next 16-channel group (oc_group_idx = base)
+                            state <= S_DWS_RELOAD_WGT;
+                        end else if (oc_group_done && cfg_dma_wgt_per_oc != 0) begin
                             state <= S_RELOAD_WGT;
                         end
 
@@ -696,7 +742,10 @@ module npu_ctrl (
                             end else begin
                                 if (skip_store)
                                     state <= S_DONE;
-                                else if (per_tile_store_en) begin
+                                else if (per_tile_store_en && !dw_stream) begin
+                                    // (PTS is only meaningful for tiled DB_EN
+                                    // layers; dw_stream stores via S_STORE_OUT
+                                    // from DW_STREAM_OUT_BASE)
                                     // Last tile NOT yet stored (tile_done doesn't fire
                                     // for final tile). Go to S_TILE_STORE to store it,
                                     // then S_TILE_STORE_WAIT → S_DONE (skip prefetch).
@@ -886,6 +935,82 @@ module npu_ctrl (
                     end
                 end
 
+                // ─── DW stream: per-group act slice + weight block reload ───
+                // oc_group_idx = next group's base channel (multiple of 16).
+                // Weight block: 16ch * kh*kw*esz bytes contiguous from DDR
+                // (channel-major layout) → wgt SRAM[0]. Act slice: 2D load,
+                // row = ARRAY_SIZE ch at one spatial position (stride in_c*esz),
+                // starting at byte offset base_ch*esz → act SRAM[0]. Always
+                // load the full 16-ch slice even when fewer channels remain
+                // (residual lanes read harmless garbage; compute stops at
+                // oc_groups_total and never uses them).
+                S_DWS_RELOAD_WGT: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else begin
+                        dma_start     <= 1'b1;
+                        dma_dir       <= 1'b0;  // load
+                        dma_sram_sel  <= 2'd0;  // weight bank
+                        dma_ext_addr  <= cfg_dma_wgt_addr
+                                         + ({16'd0, oc_group_idx} * {8'd0, cfg_kernel_h}
+                                            * {8'd0, cfg_kernel_w} * dws_esz);
+                        dma_sram_addr <= 16'd0;
+                        dma_xfer_len  <= dws_wgt_words;
+                        dma_row_len   <= 16'd0;
+                        dma_row_count <= 16'd0;
+                        dma_out_stride<= 32'd0;
+                        state         <= S_DWS_RELOAD_WGT_WAIT;
+                    end
+                end
+
+                S_DWS_RELOAD_WGT_WAIT: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else if (dma_done) begin
+                        state <= S_DWS_RELOAD_ACT;
+                    end
+                end
+
+                S_DWS_RELOAD_ACT: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else begin
+                        dma_start      <= 1'b1;
+                        dma_dir        <= 1'b0;  // load
+                        dma_sram_sel   <= 2'd1;  // activation
+                        dma_ext_addr   <= cfg_dma_in_addr
+                                          + ({16'd0, oc_group_idx} * dws_esz);
+                        dma_sram_addr  <= 16'd0;
+                        dma_xfer_len   <= dws_act_words32[15:0];
+                        dma_row_len    <= dws_row_len;
+                        dma_row_count  <= dws_row_count;
+                        dma_out_stride <= dws_stride;
+                        state          <= S_DWS_RELOAD_ACT_WAIT;
+                    end
+                end
+
+                S_DWS_RELOAD_ACT_WAIT: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else if (dma_done) begin
+                        wgt_reload_done <= 1'b1;  // slice + block resident
+                        state <= S_DWS_RELOAD_ACK;
+                    end
+                end
+
+                // Compute deasserts oc_group_done one cycle AFTER seeing
+                // wgt_reload_done. Without this wait, S_WAIT_COMP re-samples
+                // the still-asserted oc_group_done and double-triggers the
+                // reload — by then compute has advanced several channels, so
+                // the stale oc_group_idx loads the WRONG slice over live data.
+                S_DWS_RELOAD_ACK: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else if (!oc_group_done) begin
+                        state <= S_WAIT_COMP;
+                    end
+                end
+
                 // ─── DB_EN: Wait for prefetch DMA to complete ───
                 S_WAIT_PREFETCH: begin
                     if (ctrl_abort) begin
@@ -916,8 +1041,11 @@ module npu_ctrl (
                         // Conv2D/Concat: store from cfg_out_base; Add: store from
                         // cfg_act_base (in-place). Key on op_type, not add_b_addr:
                         // Concat has add_b != 0 (preload) but stores from out_base.
+                        // DW stream: output accumulated in the fixed high region.
                         if (is_add_op)
                             dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
+                        else if (dw_stream)
+                            dma_sram_addr <= `DW_STREAM_OUT_BASE;
                         else
                             dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
                         // For DB_EN Add: use tile_in_words (same as output size per tile)

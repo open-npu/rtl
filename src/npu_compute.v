@@ -325,18 +325,19 @@ module npu_compute #(
 
     // ─── DW state ───
     reg [15:0] dw_ch_idx;
-    reg [5:0]  dw_cnt;
+    reg [7:0]  dw_cnt;
     reg        dw_read_issued;
     reg [1:0]  dw_init_phase;          // 0=setup, 1=acc_clear, 2=feeding
     reg [15:0] dw_oh, dw_ow;          // Output pixel coordinates
     reg [3:0]  dw_fh, dw_fw;          // Filter position (0..6)
     reg signed [ACC_W-1:0] dw_acc_buf; // Captured DW output accumulator
-    reg [5:0]  dw_kernel_size;         // kh * kw (cached)
+    reg [7:0]  dw_kernel_size;         // kh * kw (cached, up to 16x16=256)
     reg [1:0]  dw_wb_phase;            // 0=issue read, 1=wait, 2=merge+write
     reg [15:0] dw_wb_byte;             // PPU output element to write (up to 16-bit)
     reg [1:0]  dw_wb_bytesel;          // byte position within word
     reg [ACT_ADDR_W-1:0] dw_wb_addr;  // target word address
     reg [1:0]  dw_wgt_bsel_base;       // starting byte offset for weight reads
+    reg [15:0] dw_grp_base;            // stream mode: first channel of resident 16-ch group
 
     // ─── Spatial pixel loop (Conv2D Plan A) ───
     reg [15:0] sp_oh, sp_ow;                  // Current output pixel coordinates (tile-local)
@@ -381,6 +382,17 @@ module npu_compute #(
     wire [3:0]  pool_cfg_sh   = cfg_pool_cfg[15:12];
     wire [3:0]  pool_cfg_sw   = cfg_pool_cfg[19:16];
     wire        global_pool   = cfg_pool_cfg[20];
+    // ─── DW global-pool streaming detect ───
+    // Non-tiled DW Conv with kernel == whole input and 1x1 output whose
+    // input/weight tensor (H*W*C words each) overflows act SRAM
+    // (SPAD_KB*64 words). Streamed in 16-channel groups (see npu_ctrl).
+    wire [31:0] dws_total_words = ({16'd0, cfg_in_h} * {16'd0, cfg_in_w}
+                                   * {16'd0, cfg_in_c}) >> (cfg_int16 ? 2'd1 : 2'd2);
+    wire        dw_stream = (cfg_op_type == 8'd1) && (cfg_tile_h == 16'd0)
+                         && ({8'd0, cfg_kernel_h} == cfg_in_h)
+                         && ({8'd0, cfg_kernel_w} == cfg_in_w)
+                         && (cfg_out_h == 16'd1) && (cfg_out_w == 16'd1)
+                         && (dws_total_words > (`SPAD_KB * 64));
     wire        resize_mode   = cfg_resize_cfg[0];   // 0=nearest, 1=bilinear
     // ─── Deconv state ───
     wire [7:0]  cfg_insert_h  = cfg_deconv_cfg[7:0];
@@ -530,6 +542,7 @@ module npu_compute #(
             dw_acc_buf <= 0; dw_kernel_size <= 0;
             dw_wb_phase <= 0; dw_wb_byte <= 0; dw_wb_bytesel <= 0; dw_wb_addr <= 0;
             dw_wgt_bsel_base <= 0;
+            dw_grp_base <= 0;
             flush_cnt <= 0;
             sp_oh <= 0; sp_ow <= 0; tile_oh_origin <= 0; tile_ow_origin <= 0;
             dot_acc <= 0; reduce_cnt <= 0; pixel_act_base <= 0;
@@ -701,7 +714,15 @@ module npu_compute #(
                 // Output base: add bank offset so output doesn't overlap input
                 // For DB_EN: out_base = effective_act_base + cfg_out_base
                 // This ensures output is written after input within the same bank
-                out_base <= cfg_act_base + cfg_out_base;
+                // DW stream mode: act SRAM[0] holds the resident 16-ch slice;
+                // the 1x1xC output accumulates in the fixed high region
+                // (npu_ctrl stores from DW_STREAM_OUT_BASE for these layers).
+                if (dw_stream) begin
+                    out_base    <= `DW_STREAM_OUT_BASE;
+                    dw_grp_base <= 16'd0;
+                end else begin
+                    out_base <= cfg_act_base + cfg_out_base;
+                end
 
                 oc_group <= 0;
 
@@ -1563,11 +1584,20 @@ module npu_compute #(
                 end else begin
                     oc_group <= oc_group + 1;
                     if (cfg_op_type == 8'd1) begin
-                        // DW Conv: next channel
-                        dw_cnt <= 0;
-                        dw_read_issued <= 1'b0;
-                        dw_init_phase <= 2'd0;
-                        state <= S_DW_WGT_LOAD;
+                        if (dw_stream && ((oc_group + 1) % ARRAY_SIZE == 0)) begin
+                            // Stream mode group boundary: oc_group+1 is the next
+                            // 16-channel group's base. Request act slice + weight
+                            // block reload from the controller.
+                            dw_grp_base <= oc_group + 1;
+                            oc_group_done <= 1'b1;
+                            state <= S_WAIT_WGT_RELOAD;
+                        end else begin
+                            // DW Conv: next channel
+                            dw_cnt <= 0;
+                            dw_read_issued <= 1'b0;
+                            dw_init_phase <= 2'd0;
+                            state <= S_DW_WGT_LOAD;
+                        end
                     end else if (cfg_op_type == 8'd5) begin
                         rsz_ch <= rsz_ch + 1;
                         param_word_idx <= 0;
@@ -1588,9 +1618,17 @@ module npu_compute #(
 
             S_WAIT_WGT_RELOAD: begin
                 // Wait for controller to DMA next oc_group's weights
+                // (DW stream mode: act slice + weight block for next 16-ch group)
                 if (wgt_reload_done) begin
                     oc_group_done <= 1'b0;
-                    state <= S_OC_SETUP;
+                    if (dw_stream) begin
+                        dw_cnt <= 0;
+                        dw_read_issued <= 1'b0;
+                        dw_init_phase <= 2'd0;
+                        state <= S_DW_WGT_LOAD;
+                    end else begin
+                        state <= S_OC_SETUP;
+                    end
                 end
             end
 
@@ -1666,8 +1704,16 @@ module npu_compute #(
                     begin : dw_wgt_addr_setup
                         reg [15:0] wgt_elem_start;
                         reg [15:0] wgt_byte_start;
-                        wgt_elem_start = oc_group * {2'd0, cfg_kernel_h[3:0]}
-                                       * {2'd0, cfg_kernel_w[3:0]};
+                        // Stream mode: weights for the resident 16-channel group
+                        // were DMA-loaded as a block at wgt SRAM[0] — index by
+                        // group-local channel. Normal mode: whole tensor resident,
+                        // index by global channel.
+                        if (dw_stream)
+                            wgt_elem_start = (oc_group - dw_grp_base) * {2'd0, cfg_kernel_h[3:0]}
+                                           * {2'd0, cfg_kernel_w[3:0]};
+                        else
+                            wgt_elem_start = oc_group * {2'd0, cfg_kernel_h[3:0]}
+                                           * {2'd0, cfg_kernel_w[3:0]};
                         wgt_byte_start = cfg_int16 ? (wgt_elem_start << 1) : wgt_elem_start;
                         wgt_word_addr <= {7'd0, wgt_base} + wgt_byte_start[15:2];
                         dw_wgt_bsel_base <= wgt_byte_start[1:0];
@@ -1822,7 +1868,13 @@ module npu_compute #(
                         begin : dw_addr_calc
                             reg [ACT_ADDR_W+15:0] elem_off;
                             reg [ACT_ADDR_W+15:0] byte_off;
-                            if (cfg_tile_h == 17'd0) begin
+                            if (dw_stream) begin
+                                // Stream mode: resident slice is packed
+                                // [pos][ch_local], ARRAY_SIZE channels per
+                                // spatial position (ch_local = oc_group - base)
+                                elem_off = (ih_s[15:0] * cfg_in_w + iw_s[15:0])
+                                         * ARRAY_SIZE + (oc_group - dw_grp_base);
+                            end else if (cfg_tile_h == 17'd0) begin
                                 // Non-tiled: full image address
                                 elem_off = (ih_s[15:0] * cfg_in_w * cfg_in_c)
                                          + (iw_s[15:0] * cfg_in_c)
