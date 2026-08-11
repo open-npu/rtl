@@ -19,7 +19,7 @@
 module npu_dw_conv #(
     parameter DATA_W    = `DATA_WIDTH,     // 8-bit input
     parameter ACC_W     = `ACC_WIDTH,      // 40-bit accumulator
-    parameter MAX_KSZ   = 7               // Max kernel dimension (7×7)
+    parameter MAX_KSZ   = 16              // Max kernel dimension (16×16; DW global pool needs 14×14)
 )(
     input  wire                     clk,
     input  wire                     rst_n,
@@ -45,11 +45,11 @@ module npu_dw_conv #(
 
     // ─── Weight storage ───
     reg signed [DATA_W-1:0] weights [0:MAX_KSZ*MAX_KSZ-1];
-    reg [5:0] wgt_idx;   // Weight load index (0 to k_h*k_w-1)
+    reg [7:0] wgt_idx;   // Weight load index (0 to k_h*k_w-1)
 
     // ─── Compute state ───
-    reg [5:0] compute_idx;  // Current MAC index within kernel window
-    wire [5:0] kernel_size = kernel_h * kernel_w;
+    reg [7:0] compute_idx;  // Current MAC index within kernel window
+    wire [7:0] kernel_size = kernel_h * kernel_w;
 
     // ─── MAC computation ───
     wire signed [2*DATA_W-1:0] product = in_data * weights[compute_idx];
