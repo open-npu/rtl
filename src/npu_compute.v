@@ -258,7 +258,9 @@ module npu_compute #(
     reg        tile_done_r;
     reg        tile_wait_delay;  // DB_EN wait: skip 1 cycle, then wait for prefetch
     assign tile_done = tile_done_r;
-    assign oc_group_out = oc_group;
+    // Pool stream iterates pool_ch (not oc_group) — report the pool group
+    // base so the controller reloads the right slice.
+    assign oc_group_out = pool_stream ? pool_grp_base : oc_group;
     // Expose actual (border-clipped) tile output dims for per-tile store DMA
     assign tile_out_h_actual = out_tile_h;
     assign tile_out_w_actual = out_tile_w;
@@ -338,6 +340,7 @@ module npu_compute #(
     reg [ACT_ADDR_W-1:0] dw_wb_addr;  // target word address
     reg [1:0]  dw_wgt_bsel_base;       // starting byte offset for weight reads
     reg [15:0] dw_grp_base;            // stream mode: first channel of resident 16-ch group
+    reg [15:0] pool_grp_base;          // pool stream mode: ditto
 
     // ─── Spatial pixel loop (Conv2D Plan A) ───
     reg [15:0] sp_oh, sp_ow;                  // Current output pixel coordinates (tile-local)
@@ -393,6 +396,31 @@ module npu_compute #(
                          && ({8'd0, cfg_kernel_w} == cfg_in_w)
                          && (cfg_out_h == 16'd1) && (cfg_out_w == 16'd1)
                          && (dws_total_words > (`SPAD_KB * 64));
+
+    // ─── Per-OC 8-channel sub-group detect ───
+    // When a 16-channel weight block would overflow the weight SRAM
+    // (SPAD_KB*128 words), the packer emits per-oc blocks of 8 channels
+    // (e.g. model_e int16 L23: 16ch×3x3x512×2B = 36864 words > 24576).
+    // Detect from config: per-oc reload active AND 16-ch block doesn't fit.
+    // grp_oc drives group count, param/WB channel indexing. Lanes ≥ grp_oc
+    // read garbage weights but are never drained (col_last bounds the WB
+    // loop), so no feed-path change is needed.
+    wire [31:0] kd_bytes = ({24'd0, cfg_kernel_h} * {24'd0, cfg_kernel_w}
+                            * {16'd0, cfg_in_c}) << (cfg_int16 ? 1 : 0);
+    wire        grp8_mode = (cfg_wgt_per_oc != 32'd0)
+                         && ((kd_bytes << 2) > (`SPAD_KB * 128));  // 16ch words = kd_bytes*16/4
+    wire [4:0]  grp_oc    = grp8_mode ? 5'd8 : 5'd16;
+
+    // ─── Pool global-pool streaming detect ───
+    // Same SRAM-capacity problem as dw_stream but on the Pool path
+    // (model_e int16 L29: AvgPool 7x7x512→1x1x512, input 12544 words >
+    // 12288-word act SRAM; int8 6272 fits). Same 16-channel slice
+    // streaming; Pool has no weights so the reload only refetches the
+    // act slice.
+    wire        pool_stream = (cfg_op_type == 8'd3) && global_pool
+                           && (cfg_tile_h == 16'd0)
+                           && (dws_total_words > (`SPAD_KB * 64));
+    wire        slice_stream = dw_stream | pool_stream;
     wire        resize_mode   = cfg_resize_cfg[0];   // 0=nearest, 1=bilinear
     // ─── Deconv state ───
     wire [7:0]  cfg_insert_h  = cfg_deconv_cfg[7:0];
@@ -543,6 +571,7 @@ module npu_compute #(
             dw_wb_phase <= 0; dw_wb_byte <= 0; dw_wb_bytesel <= 0; dw_wb_addr <= 0;
             dw_wgt_bsel_base <= 0;
             dw_grp_base <= 0;
+            pool_grp_base <= 0;
             flush_cnt <= 0;
             sp_oh <= 0; sp_ow <= 0; tile_oh_origin <= 0; tile_ow_origin <= 0;
             dot_acc <= 0; reduce_cnt <= 0; pixel_act_base <= 0;
@@ -601,6 +630,8 @@ module npu_compute #(
                 if (start) begin
                     if (cfg_op_type == 8'd1 || cfg_op_type == 8'd3 || cfg_op_type == 8'd5)
                         oc_groups_total <= cfg_out_c;
+                    else if (grp8_mode)
+                        oc_groups_total <= (cfg_out_c + 16'd7) >> 3;
                     else
                         oc_groups_total <= (cfg_out_c + ARRAY_SIZE_16 - 1) / ARRAY_SIZE_16;
 
@@ -717,7 +748,7 @@ module npu_compute #(
                 // DW stream mode: act SRAM[0] holds the resident 16-ch slice;
                 // the 1x1xC output accumulates in the fixed high region
                 // (npu_ctrl stores from DW_STREAM_OUT_BASE for these layers).
-                if (dw_stream) begin
+                if (slice_stream) begin
                     out_base    <= `DW_STREAM_OUT_BASE;
                     dw_grp_base <= 16'd0;
                 end else begin
@@ -776,7 +807,8 @@ module npu_compute #(
                 if (cfg_wgt_per_oc != 0 && ({17'd0, cfg_out_c} * 4 > (`SPAD_KB * 16)))
                     param_base <= 16'd0;  // per-oc param reload → params at SRAM[0]
                 else
-                    param_base <= oc_group * ARRAY_SIZE_16 * 4;
+                    // 4 words per channel; grp_oc channels per group (8 in grp8 mode)
+                    param_base <= oc_group * {11'd0, grp_oc} * 16'd4;
 
                 // Multi-pass setup
                 k_pass <= 0;
@@ -785,9 +817,9 @@ module npu_compute #(
                 // Last valid drain column for this oc_group
                 begin : col_last_blk
                     reg [15:0] remaining_oc;
-                    remaining_oc = cfg_out_c - oc_group * ARRAY_SIZE_16;
-                    if (remaining_oc >= ARRAY_SIZE_16)
-                        col_last <= COL_MAX;
+                    remaining_oc = cfg_out_c - oc_group * {11'd0, grp_oc};
+                    if (remaining_oc >= {11'd0, grp_oc})
+                        col_last <= grp_oc[3:0] - 4'd1;
                     else
                         col_last <= remaining_oc[$clog2(ARRAY_SIZE)-1:0] - 1;
                 end
@@ -1337,7 +1369,7 @@ module npu_compute #(
                             act_wr_en   <= 1'b1;
                             act_wr_addr <= out_base +
                                 (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
-                                  + oc_group * ARRAY_SIZE_16
+                                  + oc_group * {11'd0, grp_oc}
                                   + ({12'd0, drain_col} & ~17'd1)) >> 1);
                             act_wr_data <= {ppu_out_data, wb_pack[15:0]};
                             `ifndef SYNTHESIS
@@ -1345,21 +1377,21 @@ module npu_compute #(
                                 $display("[CMP_WB] t=%0t drain=%0d col_last=%0d addr=%0d data=0x%04x%04x",
                                          $time, drain_col, col_last,
                                          out_base + (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
-                                           + oc_group * ARRAY_SIZE_16
+                                           + oc_group * {11'd0, grp_oc}
                                            + ({12'd0, drain_col} & ~17'd1)) >> 1),
                                          ppu_out_data, wb_pack[15:0]);
                             if (tile_x == 3 && tile_y == 0 && sp_oh == 0 && sp_ow == 0)
                                 $display("[CMP_WB_BORDER] t=%0t drain=%0d col_last=%0d out_tw=%0d addr=%0d data=0x%04x%04x",
                                          $time, drain_col, col_last, out_tile_w,
                                          out_base + (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
-                                           + oc_group * ARRAY_SIZE_16
+                                           + oc_group * {11'd0, grp_oc}
                                            + ({12'd0, drain_col} & ~17'd1)) >> 1),
                                          ppu_out_data, wb_pack[15:0]);
                             if (tile_x == 0 && tile_y == 1 && sp_oh == 0 && sp_ow == 0)
                                 $display("[CMP_WB_ROW2] t=%0t drain=%0d col_last=%0d out_th=%0d out_tw=%0d addr=%0d data=0x%04x%04x",
                                          $time, drain_col, col_last, out_tile_h, out_tile_w,
                                          out_base + (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
-                                           + oc_group * ARRAY_SIZE_16
+                                           + oc_group * {11'd0, grp_oc}
                                            + ({12'd0, drain_col} & ~17'd1)) >> 1),
                                          ppu_out_data, wb_pack[15:0]);
                             `endif
@@ -1376,7 +1408,7 @@ module npu_compute #(
                             act_wr_en   <= 1'b1;
                             act_wr_addr <= out_base +
                                 (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
-                                  + oc_group * ARRAY_SIZE_16
+                                  + oc_group * {11'd0, grp_oc}
                                   + ({12'd0, drain_col} & ~17'd3)) >> 2);
                             act_wr_data <= {ppu_out_data[7:0], wb_pack[23:0]};
                         end
@@ -1396,7 +1428,7 @@ module npu_compute #(
                                 act_wr_en   <= 1'b1;
                                 act_wr_addr <= out_base +
                                     (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
-                                      + oc_group * ARRAY_SIZE_16
+                                      + oc_group * {11'd0, grp_oc}
                                       + ({12'd0, drain_col} & ~17'd1)) >> 1);
                                 act_wr_data <= {17'd0, ppu_out_data};
                             end
@@ -1409,7 +1441,7 @@ module npu_compute #(
                                 // for non-word-aligned OUT_C.
                                 act_wr_addr <= out_base +
                                     (((sp_oh * out_tile_w + sp_ow) * cfg_out_c
-                                      + oc_group * ARRAY_SIZE_16
+                                      + oc_group * {11'd0, grp_oc}
                                       + ({14'd0, drain_col} - {14'd0, wb_pos})) >> 2);
                                 case (wb_pos)
                                     2'd0: act_wr_data <= {24'd0, ppu_out_data[7:0]};
@@ -1619,6 +1651,7 @@ module npu_compute #(
             S_WAIT_WGT_RELOAD: begin
                 // Wait for controller to DMA next oc_group's weights
                 // (DW stream mode: act slice + weight block for next 16-ch group)
+                // (Pool stream mode: act slice only)
                 if (wgt_reload_done) begin
                     oc_group_done <= 1'b0;
                     if (dw_stream) begin
@@ -1626,6 +1659,10 @@ module npu_compute #(
                         dw_read_issued <= 1'b0;
                         dw_init_phase <= 2'd0;
                         state <= S_DW_WGT_LOAD;
+                    end else if (pool_stream) begin
+                        param_word_idx <= 0;
+                        param_read_issued <= 1'b0;
+                        state <= S_POOL_CH_SETUP;
                     end else begin
                         state <= S_OC_SETUP;
                     end
@@ -2062,7 +2099,13 @@ module npu_compute #(
                 end
                 // Set output base (same as S_TILE_SETUP — Pool also goes through S_TILE_SETUP
                 // which sets tile_oh/ow_origin and out_tile_h/w, so don't override here)
-                out_base <= cfg_act_base + cfg_out_base;
+                // Pool stream: fixed high region (slice at SRAM[0]).
+                if (pool_stream) begin
+                    out_base      <= `DW_STREAM_OUT_BASE;
+                    pool_grp_base <= 16'd0;
+                end else begin
+                    out_base <= cfg_act_base + cfg_out_base;
+                end
                 pool_ch <= 0;
                 param_word_idx <= 0;
                 param_read_issued <= 1'b0;
@@ -2149,7 +2192,11 @@ module npu_compute #(
                         begin : pool_addr_calc
                             reg [31:0] elem_off;
                             reg [31:0] byte_off;
-                            if (cfg_tile_h == 17'd0) begin
+                            if (pool_stream) begin
+                                // Slice packed [pos][ch_local], 16 ch per position
+                                elem_off = (ih_s[15:0] * cfg_in_w + iw_s[15:0])
+                                         * ARRAY_SIZE + (pool_ch - pool_grp_base);
+                            end else if (cfg_tile_h == 17'd0) begin
                                 // Non-tiled: full image in SRAM, absolute coords
                                 elem_off = (ih_s[15:0] * cfg_in_w * cfg_in_c)
                                          + (iw_s[15:0] * cfg_in_c)
@@ -2362,6 +2409,12 @@ module npu_compute #(
             S_POOL_CH_NEXT: begin
                 if (pool_ch + 1 >= cfg_out_c) begin
                     state <= S_TILE_NEXT;
+                end else if (pool_stream && ((pool_ch + 1) % ARRAY_SIZE == 0)) begin
+                    // Stream group boundary: request next act slice reload
+                    pool_ch <= pool_ch + 1;
+                    pool_grp_base <= pool_grp_base + ARRAY_SIZE;
+                    oc_group_done <= 1'b1;
+                    state <= S_WAIT_WGT_RELOAD;
                 end else begin
                     pool_ch <= pool_ch + 1;
                     param_word_idx <= 0;
