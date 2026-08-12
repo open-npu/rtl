@@ -195,6 +195,13 @@ module npu_ctrl (
     wire [31:0] dws_act_words32 = {16'd0, dws_row_len} * {16'd0, dws_row_count};
     wire [15:0] dws_wgt_words = (`ARRAY_SIZE * {8'd0, cfg_kernel_h} * {8'd0, cfg_kernel_w}
                                  * dws_esz[15:0]) >> 2;
+    // Pool global-pool streaming: same act-SRAM overflow class on the Pool
+    // path (model_e int16 L29: 7x7x512 int16 = 12544w > 12288w). Pool has
+    // no weights — the per-group reload refetches only the act slice.
+    wire        pool_stream  = (cfg_layer_mode[3:0] == 4'd3) && cfg_pool_cfg[20]
+                            && (cfg_tile_h == 16'd0)
+                            && ((cfg_dma_in_size >> 2) > (`SPAD_KB * 64));
+    wire        slice_stream = dw_stream | pool_stream;
 
     // Concat phase-2 out-region preload geometry. The preload source is the
     // previous concat phase's DDR output — a full out_c-wide NHWC tensor —
@@ -536,8 +543,8 @@ module npu_ctrl (
                         dma_sram_sel  <= 2'd1;  // activation
                         dma_ext_addr  <= cfg_dma_in_addr;  // tile(0,0) = base
                         dma_sram_addr <= 16'd0;
-                        if (dw_stream) begin
-                            // DW stream: 2D load of group 0's channel slice.
+                        if (slice_stream) begin
+                            // Slice stream: 2D load of group 0's channel slice.
                             // Row = ARRAY_SIZE channels at one spatial position
                             // (contiguous in NHWC), row stride = in_c*esz bytes.
                             dma_xfer_len   <= dws_act_words32[15:0];
@@ -730,6 +737,9 @@ module npu_ctrl (
                             // DW stream: reload act slice + weight block for
                             // the next 16-channel group (oc_group_idx = base)
                             state <= S_DWS_RELOAD_WGT;
+                        end else if (oc_group_done && pool_stream) begin
+                            // Pool stream: no weights — act slice only
+                            state <= S_DWS_RELOAD_ACT;
                         end else if (oc_group_done && cfg_dma_wgt_per_oc != 0) begin
                             state <= S_RELOAD_WGT;
                         end
@@ -742,9 +752,9 @@ module npu_ctrl (
                             end else begin
                                 if (skip_store)
                                     state <= S_DONE;
-                                else if (per_tile_store_en && !dw_stream) begin
+                                else if (per_tile_store_en && !slice_stream) begin
                                     // (PTS is only meaningful for tiled DB_EN
-                                    // layers; dw_stream stores via S_STORE_OUT
+                                    // layers; slice_stream stores via S_STORE_OUT
                                     // from DW_STREAM_OUT_BASE)
                                     // Last tile NOT yet stored (tile_done doesn't fire
                                     // for final tile). Go to S_TILE_STORE to store it,
@@ -1041,10 +1051,10 @@ module npu_ctrl (
                         // Conv2D/Concat: store from cfg_out_base; Add: store from
                         // cfg_act_base (in-place). Key on op_type, not add_b_addr:
                         // Concat has add_b != 0 (preload) but stores from out_base.
-                        // DW stream: output accumulated in the fixed high region.
+                        // DW/Pool stream: output accumulated in the fixed high region.
                         if (is_add_op)
                             dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
-                        else if (dw_stream)
+                        else if (slice_stream)
                             dma_sram_addr <= `DW_STREAM_OUT_BASE;
                         else
                             dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
