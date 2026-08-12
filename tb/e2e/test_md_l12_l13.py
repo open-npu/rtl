@@ -15,10 +15,13 @@ async def test_md_l12_l13(dut):
     cocotb.start_soon(mem.run())
     md, ld = load_golden('model_d_int8')
 
-    # Populate L12 inputs: main input = L11 golden output (NHWC), add_b = L8 golden output.
+    # Populate L12 inputs: main input = L11 golden output (NHWC), add_b = L8 golden output,
+    # and L12's OWN params (Add needs param_cnt=2 requant params — omitting them zeroes output).
     m12 = md[12]
     mem.populate(m12['ddr_in_addr'], ld[11]['output'])
     mem.populate(m12['ddr_add_b_addr'], ld[8]['output'])
+    if len(ld[12]['wgt']) > 0: mem.populate(m12['ddr_wgt_addr'], ld[12]['wgt'])
+    if len(ld[12]['param']) > 0: mem.populate(m12['ddr_param_addr'], ld[12]['param'])
     # L13 weights/params
     m13 = md[13]
     if len(ld[13]['wgt']) > 0: mem.populate(m13['ddr_wgt_addr'], ld[13]['wgt'])
