@@ -208,6 +208,15 @@ module npu_ctrl (
                                * {16'd0, cfg_in_c}) << (cfg_int16 ? 1 : 0);
     wire        grp8_mode   = (cfg_dma_wgt_per_oc != 32'd0)
                            && ((kd_bytes << 2) > (`SPAD_KB * 128));
+    // Guard helpers (evaluated at S_IDLE, see E4-E7 below)
+    wire [31:0] kd_elems32  = {24'd0, cfg_kernel_h} * {24'd0, cfg_kernel_w}
+                              * {16'd0, cfg_in_c};
+    wire [31:0] pool_cnt32  = {16'd0, cfg_in_h} * {16'd0, cfg_in_w};
+    wire        avg_gpool_bad_cnt = (cfg_layer_mode[3:0] == 4'd3)
+                                 && cfg_pool_cfg[0] && cfg_pool_cfg[20]
+                                 && !((pool_cnt32 <= 32'd16) || (pool_cnt32 == 32'd25)
+                                   || (pool_cnt32 == 32'd36) || (pool_cnt32 == 32'd49)
+                                   || (pool_cnt32 == 32'd64));
 
     // Concat phase-2 out-region preload geometry. The preload source is the
     // previous concat phase's DDR output — a full out_c-wide NHWC tensor —
@@ -508,11 +517,26 @@ module npu_ctrl (
                         end else if (slice_stream && (dws_act_words32 > `DW_STREAM_OUT_BASE)) begin
                             hw_error_code <= 4'd3;
                             state <= S_ERROR;
-                        // E4: in_words (16-bit, cfg_dma_in_size[17:2]) truncates
-                        //     for inputs ≥ 256KB, which would silently skip the
-                        //     initial slice load (S_LOAD_ACT sees in_words==0)
-                        end else if (slice_stream && (in_words == 16'd0) && (cfg_dma_in_size != 32'd0)) begin
+                        // E4: non-tiled input >= 256KB truncates 16-bit
+                        //     in_words ([17:2]) — initial load would be short
+                        //     or skipped entirely (covers slice-stream too)
+                        end else if ((cfg_tile_h == 16'd0) && (cfg_dma_in_size[31:18] != 14'd0)
+                                     && (cfg_dma_in_size != 32'd0)) begin
                             hw_error_code <= 4'd4;
+                            state <= S_ERROR;
+                        // E5: non-tiled output >= 256KB truncates out_words
+                        end else if ((cfg_tile_h == 16'd0) && (cfg_dma_out_size[31:18] != 14'd0)) begin
+                            hw_error_code <= 4'd5;
+                            state <= S_ERROR;
+                        // E6: Conv/FC k_depth exceeds 16-bit k_depth register
+                        end else if ((cfg_layer_mode[3:0] == 4'd0 || cfg_layer_mode[3:0] == 4'd2)
+                                     && (kd_elems32 > 32'd65535)) begin
+                            hw_error_code <= 4'd6;
+                            state <= S_ERROR;
+                        // E7: global AvgPool count not in the reciprocal LUT
+                        //     (would silently use the 1/256 fallback)
+                        end else if (avg_gpool_bad_cnt) begin
+                            hw_error_code <= 4'd7;
                             state <= S_ERROR;
                         end else begin
                             hw_busy  <= 1'b1;
