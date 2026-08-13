@@ -135,6 +135,7 @@ module npu_ctrl (
     localparam S_DWS_RELOAD_ACT     = 6'd24; // DW stream: reload 16-ch act slice (2D)
     localparam S_DWS_RELOAD_ACT_WAIT= 6'd25;
     localparam S_DWS_RELOAD_ACK     = 6'd26; // DW stream: wait oc_group_done deassert
+    localparam S_RELOAD_ACK         = 6'd27; // per-OC reload: wait oc_group_done deassert
 
     reg [5:0] state;
     reg       aborted;  // Latched abort flag — prevents auto-restart in S_DONE
@@ -202,6 +203,11 @@ module npu_ctrl (
                             && (cfg_tile_h == 16'd0)
                             && ((cfg_dma_in_size >> 2) > (`SPAD_KB * 64));
     wire        slice_stream = dw_stream | pool_stream;
+    // ctrl-side replica of compute's grp8_mode (16-ch per-oc block > WGT SRAM)
+    wire [31:0] kd_bytes    = ({24'd0, cfg_kernel_h} * {24'd0, cfg_kernel_w}
+                               * {16'd0, cfg_in_c}) << (cfg_int16 ? 1 : 0);
+    wire        grp8_mode   = (cfg_dma_wgt_per_oc != 32'd0)
+                           && ((kd_bytes << 2) > (`SPAD_KB * 128));
 
     // Concat phase-2 out-region preload geometry. The preload source is the
     // previous concat phase's DDR output — a full out_c-wide NHWC tensor —
@@ -485,11 +491,36 @@ module npu_ctrl (
             case (state)
                 S_IDLE: begin
                     if (ctrl_start) begin
-                        hw_busy  <= 1'b1;
-                        state    <= S_LOAD_WGT;
-                        // Reset per-tile store sequencing
-                        tile_y_seq <= 16'd0;
-                        tile_x_seq <= 16'd0;
+                        // ─── Unsupported-capacity guards (fail loudly instead of
+                        // silently computing garbage) ───
+                        // E1: slice-stream layers need all PPU params resident
+                        //     (no per-oc param reload on this path)
+                        if (slice_stream && ({17'd0, cfg_out_c} * 4 > (`SPAD_KB * 16))) begin
+                            hw_error_code <= 4'd1;
+                            state <= S_ERROR;
+                        // E2: 8-ch per-oc sub-groups incompatible with per-oc
+                        //     param reload (reload granularity is 16 ch)
+                        end else if (grp8_mode && ({17'd0, cfg_out_c} * 4 > (`SPAD_KB * 16))) begin
+                            hw_error_code <= 4'd2;
+                            state <= S_ERROR;
+                        // E3: channel slice must fit below the stream output
+                        //     region (DW_STREAM_OUT_BASE)
+                        end else if (slice_stream && (dws_act_words32 > `DW_STREAM_OUT_BASE)) begin
+                            hw_error_code <= 4'd3;
+                            state <= S_ERROR;
+                        // E4: in_words (16-bit, cfg_dma_in_size[17:2]) truncates
+                        //     for inputs ≥ 256KB, which would silently skip the
+                        //     initial slice load (S_LOAD_ACT sees in_words==0)
+                        end else if (slice_stream && (in_words == 16'd0) && (cfg_dma_in_size != 32'd0)) begin
+                            hw_error_code <= 4'd4;
+                            state <= S_ERROR;
+                        end else begin
+                            hw_busy  <= 1'b1;
+                            state    <= S_LOAD_WGT;
+                            // Reset per-tile store sequencing
+                            tile_y_seq <= 16'd0;
+                            tile_x_seq <= 16'd0;
+                        end
                     end
                 end
 
@@ -910,7 +941,10 @@ module npu_ctrl (
                             state <= S_RELOAD_PARAM;
                         else begin
                             wgt_reload_done <= 1'b1;
-                            state <= S_WAIT_COMP;
+                            // Wait for compute to drop oc_group_done before
+                            // re-entering S_WAIT_COMP, else the still-asserted
+                            // request re-fires a redundant DMA of the same block.
+                            state <= S_RELOAD_ACK;
                         end
                     end
                 end
@@ -941,6 +975,17 @@ module npu_ctrl (
                         state <= S_DONE;
                     end else if (dma_done) begin
                         wgt_reload_done <= 1'b1;  // both weights + params reloaded
+                        state <= S_RELOAD_ACK;
+                    end
+                end
+
+                // Per-OC reload handshake drain: compute deasserts oc_group_done
+                // one cycle after sampling wgt_reload_done; only then may we
+                // return to S_WAIT_COMP (same fix as S_DWS_RELOAD_ACK).
+                S_RELOAD_ACK: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else if (!oc_group_done) begin
                         state <= S_WAIT_COMP;
                     end
                 end
