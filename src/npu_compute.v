@@ -1281,29 +1281,33 @@ module npu_compute #(
 
             // ══════════════════════════════════════════════════════════════
             // REDUCE: sum k_pass_remain partial products into one dot product
-            // Accumulate across passes in dot_buf[drain_col]
+            // Parallel tree reduce (1 cycle): wraparound addition is
+            // associative → bit-exact with the old 16-cycle serial loop.
+            // Rows >= k_pass_remain are masked to zero (ragged last pass).
             // ══════════════════════════════════════════════════════════════
             S_REDUCE: begin
-                dot_acc <= dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
-                reduce_cnt <= reduce_cnt + 1;
-                if (reduce_cnt + 1 >= k_pass_remain) begin
+                begin : reduce_tree_blk
+                    reg signed [ACC_W-1:0] t;
+                    t = {ACC_W{1'b0}};
+                    for (i = 0; i < ARRAY_SIZE; i = i + 1)
+                        if (i < k_pass_remain)
+                            t = t + acc_buf[i];
                     // 1b: accumulate into per-block partial-sum buffer.
                     // pass 0 overwrites; later passes accumulate (same
                     // pass-sequential order as the old dot_buf schedule).
                     if (k_pass == 16'd0)
-                        px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}] <=
-                            dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
+                        px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}] <= t;
                     else
                         px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}] <=
-                            px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}]
-                            + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
+                            px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}] + t;
 `ifndef SYNTHESIS
                     if (cfg_2d_load && drain_col == 0 && tile_x == 0 && tile_y == 0 && sp_oh == 0 && sp_ow == 0 && k_pass < 3)
-                        $display("[L2DB] pass=%0d dot_acc=%0d acc_buf=%0d px_acc_next=%0d",
-                                k_pass, dot_acc, acc_buf[reduce_cnt[COL_W-1:0]],
-                                px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}]
-                                + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]]);
+                        $display("[L2DB] pass=%0d tree=%0d px_acc_next=%0d",
+                                k_pass, t,
+                                px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}] + t);
 `endif
+                end
+                begin : reduce_done_blk
                     if (drain_col == COL_MAX) begin
                         // All columns drained for this (pixel, pass)
                         if (px_in_blk + 1 < blk_px_cnt) begin
