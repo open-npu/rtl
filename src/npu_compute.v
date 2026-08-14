@@ -352,6 +352,19 @@ module npu_compute #(
     reg [ACT_ADDR_W-1:0] pixel_act_base;     // Per-pixel activation base address
     reg signed [ACC_W-1:0] dot_buf [0:ARRAY_SIZE-1]; // Reduced dot products per column
 
+    // ─── 1b pixel-block weight reuse ───
+    // Partial sums for a 16-pixel block × 16 columns. Weights are loaded once
+    // per (oc_group, k_pass) and reused across the block's pixels instead of
+    // being re-streamed per pixel (baseline: ~92% of conv cycles were weight
+    // re-streaming). Accumulation order per output element is unchanged
+    // (pass-sequential, wraparound add) → bit-exact with the old schedule.
+    reg signed [ACC_W-1:0] px_acc_buf [0:255];   // {px_in_blk[3:0], col[3:0]}
+    reg [15:0] blk_oh_start, blk_ow_start;       // sp of first pixel in block
+    reg [15:0] px_remaining;                     // pixels left in this oc_group/tile
+    reg [4:0]  px_in_blk;                        // pixel index within block (0..15)
+    reg [4:0]  blk_px_cnt;                       // pixels in current block (1..16)
+    reg [4:0]  ppu_px;                           // PPU-loop pixel index within block
+
     // ─── Multi-pass (k_depth > ARRAY_SIZE) ───
     reg [15:0] k_pass;           // Current pass index (0-based)
     reg [15:0] k_pass_max;       // Total passes - 1
@@ -828,6 +841,18 @@ module npu_compute #(
                 sp_oh <= 0;
                 sp_ow <= 0;
 
+                // 1b pixel-block init (block 0 starts at sp(0,0))
+                px_in_blk   <= 0;
+                ppu_px      <= 0;
+                blk_oh_start <= 0;
+                blk_ow_start <= 0;
+                begin : blk_init_blk
+                    reg [31:0] tpx;
+                    tpx = {16'd0, out_tile_h} * {16'd0, out_tile_w};
+                    px_remaining <= tpx[15:0];
+                    blk_px_cnt   <= (tpx >= 32'd16) ? 5'd16 : tpx[4:0];
+                end
+
                 // Reset writeback packing state for this OC group
                 wb_pack <= 0;
                 wb_pos  <= 2'd0;
@@ -1262,29 +1287,54 @@ module npu_compute #(
                 dot_acc <= dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
                 reduce_cnt <= reduce_cnt + 1;
                 if (reduce_cnt + 1 >= k_pass_remain) begin
-                    // Accumulate reduced dot product into dot_buf[drain_col]
-                    dot_buf[drain_col] <= dot_buf[drain_col]
-                        + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
+                    // 1b: accumulate into per-block partial-sum buffer.
+                    // pass 0 overwrites; later passes accumulate (same
+                    // pass-sequential order as the old dot_buf schedule).
+                    if (k_pass == 16'd0)
+                        px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}] <=
+                            dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
+                    else
+                        px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}] <=
+                            px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}]
+                            + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]];
 `ifndef SYNTHESIS
                     if (cfg_2d_load && drain_col == 0 && tile_x == 0 && tile_y == 0 && sp_oh == 0 && sp_ow == 0 && k_pass < 3)
-                        $display("[L2DB] pass=%0d dot_acc=%0d acc_buf=%0d dot_buf_next=%0d",
+                        $display("[L2DB] pass=%0d dot_acc=%0d acc_buf=%0d px_acc_next=%0d",
                                 k_pass, dot_acc, acc_buf[reduce_cnt[COL_W-1:0]],
-                                dot_buf[drain_col] + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]]);
+                                px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}]
+                                + dot_acc + acc_buf[reduce_cnt[COL_W-1:0]]);
 `endif
-                    // Next column or decide next step
                     if (drain_col == COL_MAX) begin
-                        // All columns drained for this pass
-                        if (k_pass >= k_pass_max) begin
-                            // Final pass — proceed to PPU
+                        // All columns drained for this (pixel, pass)
+                        if (px_in_blk + 1 < blk_px_cnt) begin
+                            // Next pixel in block — weights stay resident!
+                            px_in_blk <= px_in_blk + 1;
+                            drain_col <= 0;
+                            if (sp_ow + 1 >= out_tile_w) begin
+                                sp_ow <= 0;
+                                sp_oh <= sp_oh + 1;
+                            end else begin
+                                sp_ow <= sp_ow + 1;
+                            end
+                            state <= S_SPATIAL_SETUP;
+                        end else if (k_pass >= k_pass_max) begin
+                            // All passes done for this block → PPU loop
+                            ppu_px <= 0;
+                            drain_col <= 0;
                             param_word_idx <= 0;
                             param_read_issued <= 1'b0;
                             param_data_ready  <= 1'b0;
-                            drain_col <= 0;
+                            sp_oh <= blk_oh_start;
+                            sp_ow <= blk_ow_start;
                             state <= S_PARAM_LOAD;
                         end else begin
-                            // More passes needed — reload weights for next slice
+                            // Next pass — reload weights, restart block pixels
                             k_pass <= k_pass + 1;
                             wgt_col_idx <= 0;
+                            drain_col <= 0;
+                            px_in_blk <= 0;
+                            sp_oh <= blk_oh_start;
+                            sp_ow <= blk_ow_start;
                             state <= S_WGT_CMD;
                         end
                     end else begin
@@ -1332,12 +1382,12 @@ module npu_compute #(
             // PPU FEED: send ONE dot product (dot_buf[drain_col]) to PPU
             // ══════════════════════════════════════════════════════════════
             S_PPU_FEED: begin
-                ppu_acc_in   <= dot_buf[drain_col];
+                ppu_acc_in   <= px_acc_buf[{ppu_px[3:0], drain_col[3:0]}];
                 ppu_in_valid <= 1'b1;
 `ifndef SYNTHESIS
                 if (cfg_2d_load && drain_col == 0 && tile_x == 0 && tile_y == 0 && sp_oh == 0 && sp_ow == 0)
                     $display("[L2PPU] drain=%0d acc=%0d bias=%0d M=%0d S=%0d zp=%0d",
-                            drain_col, dot_buf[drain_col],
+                            drain_col, px_acc_buf[{ppu_px[3:0], drain_col[3:0]}],
                             $signed({param_buf[3][15:0], param_buf[2], param_buf[1][31:16]}),
                             param_buf[0][14:0], param_buf[0][21:16],
                             $signed(param_buf[1][15:0]));
@@ -1418,9 +1468,9 @@ module npu_compute #(
 
                 // Advance to next channel or finish pixel
                 if (drain_col == col_last) begin
-                    // Last channel of this pixel — check if we need partial flush
-                    // Flush only when this is the LAST pixel of the tile
-                    // (next pixel will be in same word if OUT_C not word-aligned)
+                    // Last channel of this PPU pixel — partial-word flush only
+                    // when this is the LAST pixel of the whole tile (sp tracks
+                    // the PPU pixel during the block PPU loop).
                     if (sp_ow + 1 >= out_tile_w && sp_oh + 1 >= out_tile_h) begin
                         // Last pixel — flush any partial word
                         if (cfg_int16) begin
@@ -1452,7 +1502,23 @@ module npu_compute #(
                             end
                         end
                     end
-                    state <= S_PIXEL_NEXT;
+                    // 1b: more PPU pixels left in this block?
+                    if (ppu_px + 1 < blk_px_cnt) begin
+                        ppu_px <= ppu_px + 1;
+                        drain_col <= 0;
+                        param_word_idx <= 0;
+                        param_read_issued <= 1'b0;
+                        param_data_ready  <= 1'b0;
+                        if (sp_ow + 1 >= out_tile_w) begin
+                            sp_ow <= 0;
+                            sp_oh <= sp_oh + 1;
+                        end else begin
+                            sp_ow <= sp_ow + 1;
+                        end
+                        state <= S_PARAM_LOAD;
+                    end else begin
+                        state <= S_PIXEL_NEXT;  // block done → block advance
+                    end
                 end else begin
                     drain_col <= drain_col + 1;
                     param_word_idx <= 0;
@@ -1581,31 +1647,37 @@ module npu_compute #(
             end
 
             // ══════════════════════════════════════════════════════════════
-            // PIXEL NEXT: advance spatial pixel or go to OC_NEXT
+            // PIXEL NEXT (1b): advance to the next 16-pixel block, or OC_NEXT
+            // when all blocks of this oc_group/tile are done.
+            // sp currently sits at the last pixel of the finished block.
             // ══════════════════════════════════════════════════════════════
             S_PIXEL_NEXT: begin
-                // Reset k_pass for next pixel
                 k_pass <= 0;
-                if (sp_ow + 1 >= out_tile_w) begin
-                    if (sp_oh + 1 >= out_tile_h) begin
-                        // All pixels done for this OC group
+                px_in_blk <= 0;
+                ppu_px <= 0;
+                begin : blk_adv_blk
+                    reg [15:0] rem_next;
+                    rem_next = px_remaining - {11'd0, blk_px_cnt};
+                    if (rem_next == 16'd0) begin
+                        // All blocks done for this oc_group
                         state <= S_OC_NEXT;
                     end else begin
-                        sp_ow <= 0;
-                        sp_oh <= sp_oh + 1;
-                        if (k_pass_max > 0) begin
-                            wgt_col_idx <= 0;
-                            state <= S_WGT_CMD;
-                        end else
-                            state <= S_SPATIAL_SETUP;
-                    end
-                end else begin
-                    sp_ow <= sp_ow + 1;
-                    if (k_pass_max > 0) begin
+                        px_remaining <= rem_next;
+                        blk_px_cnt   <= (rem_next >= 16'd16) ? 5'd16 : rem_next[4:0];
+                        // Advance sp to the next block's first pixel (row-major)
+                        if (sp_ow + 1 >= out_tile_w) begin
+                            sp_ow <= 0;
+                            sp_oh <= sp_oh + 1;
+                            blk_ow_start <= 0;
+                            blk_oh_start <= sp_oh + 1;
+                        end else begin
+                            sp_ow <= sp_ow + 1;
+                            blk_ow_start <= sp_ow + 1;
+                            blk_oh_start <= sp_oh;
+                        end
                         wgt_col_idx <= 0;
                         state <= S_WGT_CMD;
-                    end else
-                        state <= S_SPATIAL_SETUP;
+                    end
                 end
             end
 
