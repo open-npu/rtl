@@ -249,7 +249,9 @@ module npu_compute #(
         S_TILE_WAIT_DB    = 7'd62, // Wait for DB_EN prefetch before next tile
         S_WAIT_WGT_RELOAD = 7'd63, // Wait for controller to reload next oc_group weights
         S_RESIZE_INTERP1  = 7'd64, // Bilinear interp cycle 1 (4 mults: top/bot)
-        S_RESIZE_INTERP2  = 7'd65; // Bilinear interp cycle 2 (2 mults: val64)
+        S_RESIZE_INTERP2  = 7'd65, // Bilinear interp cycle 2 (2 mults: val64)
+        S_PARAM_CACHE     = 7'd66, // Burst-load per-group PPU params into cache
+        S_PPU_STREAM      = 7'd67; // Streamed PPU+WB for one 16-px block
     (* fsm_encoding = "one_hot" *)
     reg [6:0] state;
 
@@ -296,6 +298,19 @@ module npu_compute #(
 
     // ─── Drain state ───
     reg [$clog2(ARRAY_SIZE)-1:0] drain_col;
+    reg [$clog2(ARRAY_SIZE)-1:0] tree_col;   // column captured, being tree-reduced
+    // Act word prefetch age: 0=invalid, 1=addr issued this/last cycle,
+    // 2=data valid in act_rd_data. Saturating up-counter.
+    reg [1:0]    pf_age;
+
+    // ─── A: param cache + streamed PPU/WB (per oc_group params are
+    // pixel-invariant — load once per group, then feed PPU back-to-back)
+    reg [31:0]   param_cache [0:63];   // 16 ch × 4 words
+    reg [6:0]    cache_issue, cache_cap;
+    reg          feed_left;            // PPU stream feed side active
+    reg [4:0]    wb_px;                // WB-side pixel within block
+    reg [3:0]    wb_ch;                // WB-side channel
+    reg [15:0]   spw_oh, spw_ow;       // WB-side pixel coords
     reg [$clog2(ARRAY_SIZE)-1:0] col_last;  // last valid drain column for current oc_group
 
     // ─── PPU state ───
@@ -548,6 +563,7 @@ module npu_compute #(
             wgt_rd_addr <= 0;
             act_rd_en   <= 1'b0;
             act_rd_addr <= 0;
+            pf_age      <= 2'd0;
             act_wr_en   <= 1'b0;
             act_wr_addr <= 0;
             act_wr_data <= 32'd0;
@@ -621,6 +637,8 @@ module npu_compute #(
                 param_buf[i] <= 0;
         end else begin
             // ─── Default pulse deassertion ───
+            if (pf_age == 2'd1)
+                pf_age <= 2'd2;   // data valid in act_rd_data now
             done         <= 1'b0;
             tile_done_r  <= 1'b0;
             sa_cmd_valid <= 1'b0;
@@ -858,7 +876,135 @@ module npu_compute #(
                 wb_pos  <= 2'd0;
 
                 wgt_col_idx <= 0;
-                state <= S_WGT_CMD;
+                cache_issue <= 0;
+                cache_cap   <= 0;
+                state <= S_PARAM_CACHE;
+            end
+
+            // ══════════════════════════════════════════════════════════════
+            // PARAM CACHE: burst-read this group's PPU params (grp_oc × 4
+            // words) once per oc_group — they are identical for every pixel.
+            // ══════════════════════════════════════════════════════════════
+            S_PARAM_CACHE: begin
+                if (cache_issue < {2'b00, grp_oc, 2'b00}) begin
+                    param_rd_en   <= 1'b1;
+                    param_rd_addr <= param_base + {10'd0, cache_issue};
+                    cache_issue   <= cache_issue + 1;
+                end
+                if (cache_issue >= 2 && cache_cap < {2'b00, grp_oc, 2'b00}) begin
+                    param_cache[cache_cap[5:0]] <= param_rd_data;
+                    cache_cap <= cache_cap + 1;
+                end
+                if (cache_cap + 1 >= {2'b00, grp_oc, 2'b00}
+                    && cache_issue >= {2'b00, grp_oc, 2'b00}) begin
+                    state <= S_WGT_CMD;
+                end
+            end
+
+            // ══════════════════════════════════════════════════════════════
+            // PPU STREAM: feed all (px, ch) accs of the block back-to-back
+            // (PPU takes 1/cycle); WB consumes outputs as they emerge.
+            // Feed order px-major/ch-minor = old per-pixel order → bit-exact.
+            // ══════════════════════════════════════════════════════════════
+            S_PPU_STREAM: begin
+                if (feed_left) begin
+                    ppu_acc_in     <= px_acc_buf[{ppu_px[3:0], drain_col[3:0]}];
+                    ppu_mult_m     <= param_cache[{drain_col, 2'b00}][14:0];
+                    ppu_shift_s    <= param_cache[{drain_col, 2'b00}][21:16];
+                    ppu_zero_point <= $signed(param_cache[{drain_col, 2'b00} + 1][15:0]);
+                    ppu_bias       <= $signed({param_cache[{drain_col, 2'b00} + 3][15:0],
+                                               param_cache[{drain_col, 2'b00} + 2],
+                                               param_cache[{drain_col, 2'b00} + 1][31:16]});
+                    ppu_in_valid   <= 1'b1;
+                    if (drain_col == col_last) begin
+                        drain_col <= 0;
+                        if (ppu_px + 1 >= blk_px_cnt)
+                            feed_left <= 1'b0;
+                        else
+                            ppu_px <= ppu_px + 1;
+                    end else begin
+                        drain_col <= drain_col + 1;
+                    end
+                end
+                // WB side: one output per ppu_out_valid pulse
+                if (ppu_out_valid) begin
+                    if (cfg_int16) begin
+                        case (wb_pos[0])
+                            1'b0: wb_pack[15:0] <= ppu_out_data;
+                            1'b1: begin
+                                act_wr_en   <= 1'b1;
+                                act_wr_addr <= out_base +
+                                    (((spw_oh * out_tile_w + spw_ow) * cfg_out_c
+                                      + oc_group * {11'd0, grp_oc}
+                                      + ({12'd0, wb_ch} & ~17'd1)) >> 1);
+                                act_wr_data <= {ppu_out_data, wb_pack[15:0]};
+                            end
+                        endcase
+                        wb_pos <= {1'b0, ~wb_pos[0]};
+                    end else begin
+                        case (wb_pos)
+                            2'd0: wb_pack[7:0]   <= ppu_out_data[7:0];
+                            2'd1: wb_pack[15:8]  <= ppu_out_data[7:0];
+                            2'd2: wb_pack[23:16] <= ppu_out_data[7:0];
+                            2'd3: begin
+                                act_wr_en   <= 1'b1;
+                                act_wr_addr <= out_base +
+                                    (((spw_oh * out_tile_w + spw_ow) * cfg_out_c
+                                      + oc_group * {11'd0, grp_oc}
+                                      + ({12'd0, wb_ch} & ~17'd3)) >> 2);
+                                act_wr_data <= {ppu_out_data[7:0], wb_pack[23:0]};
+                            end
+                        endcase
+                        wb_pos <= wb_pos + 2'd1;
+                    end
+                    if (wb_ch == col_last) begin
+                        wb_ch <= 0;
+                        // Partial-word flush at the LAST pixel of the tile
+                        if (spw_ow + 1 >= out_tile_w && spw_oh + 1 >= out_tile_h) begin
+                            if (cfg_int16) begin
+                                if (wb_pos[0] != 1'b1) begin
+                                    act_wr_en   <= 1'b1;
+                                    act_wr_addr <= out_base +
+                                        (((spw_oh * out_tile_w + spw_ow) * cfg_out_c
+                                          + oc_group * {11'd0, grp_oc}
+                                          + ({12'd0, wb_ch} & ~17'd1)) >> 1);
+                                    act_wr_data <= {17'd0, ppu_out_data};
+                                end
+                            end else begin
+                                if (wb_pos != 2'd3) begin
+                                    act_wr_en   <= 1'b1;
+                                    act_wr_addr <= out_base +
+                                        (((spw_oh * out_tile_w + spw_ow) * cfg_out_c
+                                          + oc_group * {11'd0, grp_oc}
+                                          + ({14'd0, wb_ch} - {14'd0, wb_pos})) >> 2);
+                                    case (wb_pos)
+                                        2'd0: act_wr_data <= {24'd0, ppu_out_data[7:0]};
+                                        2'd1: act_wr_data <= {17'd0, ppu_out_data[7:0], wb_pack[7:0]};
+                                        2'd2: act_wr_data <= {8'd0,  ppu_out_data[7:0], wb_pack[15:0]};
+                                        default: act_wr_data <= 32'd0;
+                                    endcase
+                                end
+                            end
+                        end
+                        if (wb_px + 1 >= blk_px_cnt) begin
+                            // Block PPU done — leave sp at the block's last
+                            // pixel for S_PIXEL_NEXT's advance
+                            sp_oh <= spw_oh;
+                            sp_ow <= spw_ow;
+                            state <= S_PIXEL_NEXT;
+                        end else begin
+                            wb_px <= wb_px + 1;
+                            if (spw_ow + 1 >= out_tile_w) begin
+                                spw_ow <= 0;
+                                spw_oh <= spw_oh + 1;
+                            end else begin
+                                spw_ow <= spw_ow + 1;
+                            end
+                        end
+                    end else begin
+                        wb_ch <= wb_ch + 1;
+                    end
+                end
             end
 
             // ══════════════════════════════════════════════════════════════
@@ -996,6 +1142,7 @@ module npu_compute #(
                     act_byte_sel <= 2'd0;
                     act_read_issued <= 1'b0;
                     act_data_ready  <= 1'b0;
+                    pf_age          <= 2'd0;
 
                     // Compute activation address for current (conv_fh, conv_fw)
                     begin : act_addr_blk
@@ -1081,6 +1228,7 @@ module npu_compute #(
                 `endif
                 if (conv_is_pad || deconv_skip) begin
                     // Use cfg_in_zp for padding, matching CSIM dma_extract_tile behavior
+                    pf_age <= 2'd0;
                     if (cfg_int16)
                         act_buf <= {cfg_in_zp, cfg_in_zp};
                     else
@@ -1098,6 +1246,11 @@ module npu_compute #(
                 end else begin
                     // Data available
                     act_buf <= act_rd_data;
+                    // Prefetch next word in this run (pulse rd_en; data
+                    // arrives 2 cycles later, in time for the boundary).
+                    act_rd_en   <= 1'b1;
+                    act_rd_addr <= act_word_addr[ACT_ADDR_W-1:0] + 1;
+                    pf_age <= 2'd1;
 `ifndef SYNTHESIS
                     if (cfg_2d_load && sp_oh == 0 && sp_ow == 0 && k_pass == 16 && tile_x == 0 && tile_y == 0 && act_cnt < 4)
                         $display("[L2RD] addr=%0d data=0x%08x cnt=%0d", act_word_addr[ACT_ADDR_W-1:0], act_rd_data, act_cnt);
@@ -1146,6 +1299,7 @@ module npu_compute #(
                 if (act_cnt + 1 >= k_pass_remain) begin
                     // All K elements for this pass streamed → flush
                     flush_cnt <= 0;
+                    pf_age <= 2'd0;
                     state <= S_ACT_FLUSH;
                 end else if (conv_ch_cnt + 1 >= cfg_in_c) begin
                     // Reached end of channels for current (fh, fw)
@@ -1160,6 +1314,7 @@ module npu_compute #(
                     // Need to recompute address for new (fh, fw)
                     act_read_issued <= 1'b0;
                     act_data_ready  <= 1'b0;
+                    pf_age          <= 2'd0;   // prefetch is run-local; discard
                     state <= S_ACT_LOAD;
                     begin : next_pos_blk
                         reg signed [15:0] nih, niw;
@@ -1236,11 +1391,29 @@ module npu_compute #(
                         end
                     end
                 end else if (cfg_int16 ? (act_byte_sel[1] == 1'b1) : (act_byte_sel == 2'd3)) begin
-                    // Need next SRAM word
-                    act_byte_sel <= 2'd0;
-                    act_word_addr <= act_word_addr + 1;
-                    act_read_issued <= 1'b0;
-                    state <= S_ACT_LOAD;
+                    // Word boundary within the same (fh,fw) run
+                    if (pf_age == 2'd2 && !cfg_int16) begin
+                        // INT8 zero-bubble: prefetched word already in act_rd_data
+                        act_buf <= act_rd_data;
+                        act_byte_sel <= 2'd0;
+                        act_word_addr <= act_word_addr + 1;
+                        act_rd_en   <= 1'b1;   // re-arm next word
+                        act_rd_addr <= act_word_addr[ACT_ADDR_W-1:0] + 2;
+                        pf_age <= 2'd1;
+                    end else if (pf_age == 2'd2) begin
+                        // INT16: capture prefetched word via S_ACT_LOAD (1 cycle)
+                        act_read_issued <= 1'b1;
+                        act_data_ready  <= 1'b1;
+                        act_byte_sel <= 2'd0;
+                        act_word_addr <= act_word_addr + 1;
+                        state <= S_ACT_LOAD;
+                    end else begin
+                        // No prefetch (pad run / first word) — full-latency read
+                        act_byte_sel <= 2'd0;
+                        act_word_addr <= act_word_addr + 1;
+                        act_read_issued <= 1'b0;
+                        state <= S_ACT_LOAD;
+                    end
                 end else begin
                     // Next element in same word
                     act_byte_sel <= cfg_int16 ? (act_byte_sel + 2'd2) : (act_byte_sel + 2'd1);
@@ -1272,9 +1445,16 @@ module npu_compute #(
                     // Capture per-row results for this column
                     for (i = 0; i < ARRAY_SIZE; i = i + 1)
                         acc_buf[i] <= sa_acc_out[i];
-                    // Reduce: sum rows 0..k_depth-1 into dot product
-                    reduce_cnt <= 0;
-                    dot_acc <= 0;
+                    tree_col <= drain_col;
+                    // Pipelined drain: issue next column's DRAIN immediately
+                    // (array returns to READY after DRAIN_OUT); tree-reduce
+                    // for the captured column overlaps the next wait.
+                    if (drain_col != COL_MAX) begin
+                        sa_cmd           <= MODE_DRAIN;
+                        sa_cmd_valid     <= 1'b1;
+                        sa_drain_col_sel <= drain_col + 1;
+                        drain_col        <= drain_col + 1;
+                    end
                     state <= S_REDUCE;
                 end
             end
@@ -1296,19 +1476,19 @@ module npu_compute #(
                     // pass 0 overwrites; later passes accumulate (same
                     // pass-sequential order as the old dot_buf schedule).
                     if (k_pass == 16'd0)
-                        px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}] <= t;
+                        px_acc_buf[{px_in_blk[3:0], tree_col[3:0]}] <= t;
                     else
-                        px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}] <=
-                            px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}] + t;
+                        px_acc_buf[{px_in_blk[3:0], tree_col[3:0]}] <=
+                            px_acc_buf[{px_in_blk[3:0], tree_col[3:0]}] + t;
 `ifndef SYNTHESIS
-                    if (cfg_2d_load && drain_col == 0 && tile_x == 0 && tile_y == 0 && sp_oh == 0 && sp_ow == 0 && k_pass < 3)
+                    if (cfg_2d_load && tree_col == 0 && tile_x == 0 && tile_y == 0 && sp_oh == 0 && sp_ow == 0 && k_pass < 3)
                         $display("[L2DB] pass=%0d tree=%0d px_acc_next=%0d",
                                 k_pass, t,
-                                px_acc_buf[{px_in_blk[3:0], drain_col[3:0]}] + t);
+                                px_acc_buf[{px_in_blk[3:0], tree_col[3:0]}] + t);
 `endif
                 end
                 begin : reduce_done_blk
-                    if (drain_col == COL_MAX) begin
+                    if (tree_col == COL_MAX) begin
                         // All columns drained for this (pixel, pass)
                         if (px_in_blk + 1 < blk_px_cnt) begin
                             // Next pixel in block — weights stay resident!
@@ -1322,15 +1502,15 @@ module npu_compute #(
                             end
                             state <= S_SPATIAL_SETUP;
                         end else if (k_pass >= k_pass_max) begin
-                            // All passes done for this block → PPU loop
+                            // All passes done for this block → streamed PPU
                             ppu_px <= 0;
                             drain_col <= 0;
-                            param_word_idx <= 0;
-                            param_read_issued <= 1'b0;
-                            param_data_ready  <= 1'b0;
-                            sp_oh <= blk_oh_start;
-                            sp_ow <= blk_ow_start;
-                            state <= S_PARAM_LOAD;
+                            wb_px <= 0;
+                            wb_ch <= 0;
+                            spw_oh <= blk_oh_start;
+                            spw_ow <= blk_ow_start;
+                            feed_left <= 1'b1;
+                            state <= S_PPU_STREAM;
                         end else begin
                             // Next pass — reload weights, restart block pixels
                             k_pass <= k_pass + 1;
@@ -1342,8 +1522,8 @@ module npu_compute #(
                             state <= S_WGT_CMD;
                         end
                     end else begin
-                        drain_col <= drain_col + 1;
-                        state <= S_DRAIN_CMD;
+                        // Next column's DRAIN was already issued in S_DRAIN_WAIT
+                        state <= S_DRAIN_WAIT;
                     end
                 end
             end
