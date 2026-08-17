@@ -427,8 +427,11 @@ module npu_ctrl (
     wire [15:0] tile_out_words = tile_row_len * tile_row_count;
     // Per-tile row length (words) = actual_tile_w * out_c * eb / 4
     // Uses actual (border-clipped) tile width from compute for correct border tile store
+    // Fallback when actual width not yet available: cfg_tile_w-based computation
+    // (previous fallback tile_out_words created a combinational loop — ABC/UNOPTFLAT)
     wire [15:0] tile_row_len = (tile_out_w_actual != 0) ?
-        (({16'd0, tile_out_w_actual} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1)) >> 2) : tile_out_words;
+        (({16'd0, tile_out_w_actual} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1)) >> 2)
+      : (({16'd0, cfg_tile_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1)) >> 2);
     // Per-tile row count = actual tile height (clipped at border)
     wire [15:0] tile_row_count = (tile_out_h_actual != 0) ? tile_out_h_actual : cfg_tile_h;
     // DDR offset for current tile = (tile_y*tile_h*out_w + tile_x*tile_w) * out_c * eb
