@@ -22,6 +22,6 @@ tee -o stat_passA.txt stat
 
 # Pass B: SRAM → blackbox (would be macros in reality), map the rest
 blackbox npu_sram
-synth -top npu_top
+synth -top npu_top -noabc
 check -noinit
 tee -o stat_passB.txt stat
