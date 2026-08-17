@@ -1,0 +1,27 @@
+# Open-NPU Yosys synthesis sanity flow (2026-08-17)
+# Pass A: structural check + raw cell stat (memories as $mem cells)
+# Pass B: logic mapping with SRAM modules blackboxed (measures true logic)
+
+read_verilog -sv -DSYNTHESIS -I../include -DACC_WIDTH=44 \
+    ../src/npu_pe.v \
+    ../src/npu_systolic.v \
+    ../src/npu_sram.v \
+    ../src/npu_ppu.v \
+    ../src/npu_dw_conv.v \
+    ../src/npu_csr.v \
+    ../src/npu_dma.v \
+    ../src/npu_compute.v \
+    ../src/npu_ctrl.v \
+    ../src/npu_top.v
+
+hierarchy -check -top npu_top
+proc
+memory_collect
+check -noinit
+tee -o stat_passA.txt stat
+
+# Pass B: SRAM → blackbox (would be macros in reality), map the rest
+blackbox npu_sram
+synth -top npu_top
+check -noinit
+tee -o stat_passB.txt stat
