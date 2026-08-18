@@ -1727,17 +1727,47 @@ module npu_compute #(
                     // Precompute deconv address here (avoid deep combinational
                     // path in S_ACT_CMD). conv_ih_base is non-blocking so use
                     // local blocking vars for the deconv calc.
+                    // FIX (2026-08-18 deconv bit-rot): fh/fw/ch must be the
+                    // PASS-START values — conv_fh/conv_fw/conv_ch_cnt still
+                    // hold the previous pixel's last tap here (they are only
+                    // reassigned by spatial_setup_blk below, NBA). Decompose
+                    // flat_start locally, mirroring spatial_setup_blk.
                     begin : deconv_precompute_blk
                         reg signed [15:0] eh_local, ew_local;
                         reg [47:0] qh, qw;
                         reg [15:0] ih_u, iw_u;
                         reg signed [15:0] ih_s, iw_s;
+                        reg [15:0] flat_loc, rem_kw_loc;
+                        reg [15:0] kw_x_inc_loc;
+                        reg [47:0] q_full_loc, q_fw_loc, q_ch_loc;
+                        reg [7:0]  fh_loc, fw_loc;
+                        reg [15:0] ch_loc;
+                        flat_loc = k_pass * ARRAY_SIZE_16;
+                        kw_x_inc_loc = {8'd0, cfg_kernel_w} * cfg_in_c;
+                        if (cfg_kernel_h == 8'd1 && cfg_kernel_w == 8'd1) begin
+                            fh_loc = 8'd0;
+                            fw_loc = 8'd0;
+                            ch_loc = flat_loc;
+                        end else begin
+                            q_full_loc = (flat_loc * recip_kw_x_inc) >> 32;
+                            fh_loc = q_full_loc[7:0];
+                            rem_kw_loc = flat_loc - q_full_loc[15:0] * kw_x_inc_r;
+                            if (in_c_r == 16'd1) begin
+                                fw_loc = rem_kw_loc[7:0];
+                                ch_loc = 16'd0;
+                            end else begin
+                                q_fw_loc = (rem_kw_loc * recip_in_c) >> 32;
+                                fw_loc = q_fw_loc[7:0];
+                                q_ch_loc = (flat_loc * recip_in_c) >> 32;
+                                ch_loc = flat_loc - q_ch_loc[15:0] * in_c_r;
+                            end
+                        end
                         eh_local = $signed({1'b0, tile_oh_origin + sp_oh})
                                  + $signed({1'b0, cfg_pad_top[7:0]})
-                                 - $signed({8'd0, conv_fh});
+                                 - $signed({8'd0, fh_loc});
                         ew_local = $signed({1'b0, tile_ow_origin + sp_ow})
                                  + $signed({1'b0, cfg_pad_left[7:0]})
-                                 - $signed({8'd0, conv_fw});
+                                 - $signed({8'd0, fw_loc});
                         qh = (eh_local[15:0] * recip_deconv_h);
                         if (deconv_h_shift1) ih_u = qh[46:31];
                         else                  ih_u = qh[47:32];
@@ -1757,7 +1787,7 @@ module npu_compute #(
                                         || (iw_s < 0) || (iw_s >= $signed({1'b0, cfg_in_w}));
                             deconv_skip <= 1'b0;
                             deconv_addr_valid <= 1'b1;
-                            deconv_elem_off <= (ih_u * cfg_in_w + iw_u) * cfg_in_c + conv_ch_cnt;
+                            deconv_elem_off <= (ih_u * cfg_in_w + iw_u) * cfg_in_c + ch_loc;
                         end
                     end
                 end else begin
