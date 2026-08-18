@@ -2185,8 +2185,9 @@ async def program_deconv_layer(wb, meta, data):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-# KNOWN-ISSUE (2026-08-17, deconv bit-rot bug): RTL op6 bit-rotted during July tiling era; verified FAIL at ee8a9d1/4ca96ba (pre-perf-work). Fix scheduled as standalone phase-2 issue; remove this marker when fixed.
-@cocotb.test(expect_fail=True)
+# FIXED (2026-08-18): deconv bit-rot root cause was stale conv_fh/fw/ch in
+# S_SPATIAL_SETUP precompute (spatial_setup_blk reassigns them later, NBA).
+@cocotb.test()
 async def test_deconv_2x2_stride2(dut):
     """Deconv 2x2 stride-2: 3x3x4 -> 6x6x4, INT8."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
@@ -2231,8 +2232,9 @@ async def test_deconv_2x2_stride2(dut):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-# KNOWN-ISSUE (2026-08-17, deconv bit-rot bug): RTL op6 bit-rotted during July tiling era; verified FAIL at ee8a9d1/4ca96ba (pre-perf-work). Fix scheduled as standalone phase-2 issue; remove this marker when fixed.
-@cocotb.test(expect_fail=True)
+# FIXED (2026-08-18): deconv bit-rot root cause was stale conv_fh/fw/ch in
+# S_SPATIAL_SETUP precompute (spatial_setup_blk reassigns them later, NBA).
+@cocotb.test()
 async def test_deconv_3x3_stride2(dut):
     """Deconv 3x3 stride-2 with padding: 4x4x4 -> 7x7x4, INT8."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
@@ -2277,8 +2279,9 @@ async def test_deconv_3x3_stride2(dut):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-# KNOWN-ISSUE (2026-08-17, deconv bit-rot bug): RTL op6 bit-rotted during July tiling era; verified FAIL at ee8a9d1/4ca96ba (pre-perf-work). Fix scheduled as standalone phase-2 issue; remove this marker when fixed.
-@cocotb.test(expect_fail=True)
+# FIXED (2026-08-18): deconv bit-rot root cause was stale conv_fh/fw/ch in
+# S_SPATIAL_SETUP precompute (spatial_setup_blk reassigns them later, NBA).
+@cocotb.test()
 async def test_deconv_int16(dut):
     """Deconv 2x2 stride-2: 3x3x4 -> 6x6x4, INT16."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
@@ -2323,8 +2326,9 @@ async def test_deconv_int16(dut):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-# KNOWN-ISSUE (2026-08-17, deconv bit-rot bug): RTL op6 bit-rotted during July tiling era; verified FAIL at ee8a9d1/4ca96ba (pre-perf-work). Fix scheduled as standalone phase-2 issue; remove this marker when fixed.
-@cocotb.test(expect_fail=True)
+# FIXED (2026-08-18): deconv bit-rot root cause was stale conv_fh/fw/ch in
+# S_SPATIAL_SETUP precompute (spatial_setup_blk reassigns them later, NBA).
+@cocotb.test()
 async def test_deconv_multichannel(dut):
     """Deconv multichannel: 4x4x8 -> 8x8x16, kernel 2x2 stride-2, INT8."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
