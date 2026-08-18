@@ -1,12 +1,6 @@
-# Simulation build artifacts
+# sim artifacts
+tb/*.log
+tb/results.xml
 tb/sim_build/
-tb/results*.xml
-tb/__pycache__/
-tb/dump.vcd
-tb/coverage.dat
-tb/coverage_annotate/
-tb/unit/__pycache__/
-tb/integration/__pycache__/
-tb/e2e/__pycache__/
-tb/robustness/__pycache__/
-tb/golden/__pycache__/
+tb/golden/golden_dma_e2e/*_backup/
+synth/stat_*.txt
