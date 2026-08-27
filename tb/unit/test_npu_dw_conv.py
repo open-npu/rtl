@@ -8,8 +8,8 @@ import random
 
 
 def int8_to_bits(val):
-    """Convert signed int8 to unsigned 8-bit representation."""
-    return val & 0xFF
+    """Sign-extend an INT8 value onto the 16-bit engine port."""
+    return val & 0xFFFF
 
 
 def signed_acc(val, bits=40):
@@ -75,7 +75,7 @@ async def compute_pixel(dut, inputs, clear=True):
     # Output should be valid on the last input cycle
     await ReadOnly()
     valid = int(dut.out_valid.value)
-    result = signed_acc(dut.acc_out.value)
+    result = signed_acc(dut.acc_out.value, len(dut.acc_out))
     await Timer(1, unit="step")
     return result, valid
 

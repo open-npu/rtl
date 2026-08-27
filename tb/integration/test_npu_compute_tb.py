@@ -83,6 +83,11 @@ def pack_i8x4(b0, b1, b2, b3):
     return to_u8(b0) | (to_u8(b1) << 8) | (to_u8(b2) << 16) | (to_u8(b3) << 24)
 
 
+def sat_i8_bits(value):
+    """Apply the PPU's signed INT8 saturation and return packed bits."""
+    return min(127, max(-128, value)) & 0xFF
+
+
 async def wait_done(dut, timeout=5000):
     """Wait for done pulse, return True if seen within timeout cycles."""
     for _ in range(timeout):
@@ -603,7 +608,7 @@ async def test_conv_spatial_2x2(dut):
 
     # dot[pix] = pval * sum(1..ARRAY_SIZE) = pval * ARRAY_SIZE*(ARRAY_SIZE+1)/2
     sum_weights = ARRAY_SIZE * (ARRAY_SIZE + 1) // 2
-    expected = [(pval * sum_weights) & 0xFF for pval in pixel_vals]
+    expected = [sat_i8_bits(pval * sum_weights) for pval in pixel_vals]
     dut._log.info(f"ARRAY_SIZE={ARRAY_SIZE}, sum_w={sum_weights}, expected={expected}")
 
     for pix_idx, (oh, ow) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
@@ -671,7 +676,7 @@ async def test_conv_spatial_3x3(dut):
     assert await wait_done(dut, timeout=500000), "3x3 spatial done never asserted"
 
     # dot[pix] = pval * ARRAY_SIZE
-    expected = [(pval * ARRAY_SIZE) & 0xFF for pval in pixel_vals]
+    expected = [sat_i8_bits(pval * ARRAY_SIZE) for pval in pixel_vals]
     dut._log.info(f"Expected outputs: {expected}")
 
     for pix_idx in range(9):
@@ -770,11 +775,10 @@ async def test_dw_conv_3x3_golden(dut):
 
     assert await wait_done(dut, timeout=500), "DW 3x3 done never asserted"
 
-    # Passthrough PPU: out = acc[7:0]
-    # -240 & 0xFF = 16
+    # The PPU saturates to signed INT8: -240 becomes -128 (0x80).
     out_word = read_sram_word(dut, 'act', 0)
     out_byte = out_word & 0xFF
-    expected_byte = expected_acc & 0xFF
+    expected_byte = sat_i8_bits(expected_acc)
     assert out_byte == expected_byte, \
         f"DW 3x3: expected {expected_byte} (acc={expected_acc}), got {out_byte}"
 
@@ -819,7 +823,7 @@ async def test_dw_conv_multichannel(dut):
 
     assert await wait_done(dut, timeout=2000), "DW multichannel done never asserted"
 
-    # Expected: ch0=2*10=20, ch1=3*20=60, ch2=4*30=120, ch3=5*40=200
+    # Expected before saturation: [20, 60, 120, 200]; ch3 clamps to 127.
     # Output NHWC: pixel(0,0) ch0-3 packed in word at out_base
     # out_base = (0*1*4 + 0*4) >> 2 = 0 for tile(0,0)
     # byte_offset for ch c = (0*1+0)*4 + c = c
@@ -832,7 +836,7 @@ async def test_dw_conv_multichannel(dut):
     assert ch0 == 20, f"ch0: expected 20, got {ch0}"
     assert ch1 == 60, f"ch1: expected 60, got {ch1}"
     assert ch2 == 120, f"ch2: expected 120, got {ch2}"
-    assert ch3 == 200, f"ch3: expected 200, got {ch3}"
+    assert ch3 == 127, f"ch3: expected 127, got {ch3}"
 
 
 @cocotb.test()
@@ -888,7 +892,7 @@ async def test_conv1x1_kdepth_32(dut):
     ARRAY_SIZE=16, in_c=32, kh=1, kw=1 → k_depth=32, k_pass_max=1.
     All weights=1, activations=[1..32].
     Expected dot product = sum(1..32) = 528.
-    With passthrough PPU: 528 & 0xFF = 16 (0x10).
+    The PPU saturates this to signed INT8 maximum 127.
     """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
@@ -951,9 +955,9 @@ async def test_conv1x1_kdepth_32(dut):
 
     assert await wait_done(dut, timeout=50000), "done never asserted (k_depth=32)"
 
-    # Expected: dot = sum(1..32) = 528. Passthrough truncates to 528 & 0xFF = 16
+    # Expected: dot = sum(1..32) = 528, saturated to signed INT8 max.
     # All 16 output channels should have the same value (all weights=1)
-    expected = 528 & 0xFF  # = 16
+    expected = 127
     for word_idx in range(ARRAY_SIZE // 4):
         out_word = read_sram_word(dut, 'act', word_idx)
         for b in range(4):
@@ -972,7 +976,7 @@ async def test_conv1x1_kdepth_32_nonuniform(dut):
     activations = all-ones (value=1).
     dot_product[col=0] = sum(1..32) = 528.
     dot_product[col>0] = 32 (sum of 32 ones).
-    Passthrough: 528&0xFF=16, 32&0xFF=32.
+    PPU output: 528 saturates to 127, while 32 remains 32.
     """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
@@ -1015,10 +1019,10 @@ async def test_conv1x1_kdepth_32_nonuniform(dut):
 
     assert await wait_done(dut, timeout=50000), "done never asserted"
 
-    # Check col 0: sum(1..32) = 528, 528 & 0xFF = 16
+    # Check col 0: sum(1..32) = 528, saturated to 127.
     out_word0 = read_sram_word(dut, 'act', 0)
     ch0_val = out_word0 & 0xFF
-    assert ch0_val == 16, f"Col 0: got {ch0_val}, expected 16 (528 & 0xFF)"
+    assert ch0_val == 127, f"Col 0: got {ch0_val}, expected 127 (INT8 saturation)"
 
     # Check cols 1-3: sum = 32
     for b in range(1, 4):
@@ -1220,7 +1224,10 @@ async def test_conv3x3_with_padding(dut):
     # Activations: 2×2×1 = 4 bytes → values 1,2,3,4
     # Put input at word offset 64 to avoid overlap with output at word 0
     ACT_BASE = 64  # word address
+    OUT_BASE = 64  # offset from ACT_BASE; physical output starts at word 128
     write_sram_word(dut, 'act', ACT_BASE + 0, pack_i8x4(1, 2, 3, 4))
+    for word_idx in range(out_h * out_w * ARRAY_SIZE // 4):
+        write_sram_word(dut, 'act', ACT_BASE + OUT_BASE + word_idx, 0)
 
     # Params: passthrough (scale=1, shift=0, bias=0, zp=0)
     for ch in range(ARRAY_SIZE):
@@ -1237,7 +1244,7 @@ async def test_conv3x3_with_padding(dut):
     set_cfg(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=kh, kw=kw,
             out_h=out_h, out_w=out_w, in_h=in_h, in_w=in_w,
             stride_h=1, stride_w=1, pad_top=1, pad_left=1,
-            act_base=ACT_BASE, out_base=0)
+            act_base=ACT_BASE, out_base=OUT_BASE)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)
@@ -1256,7 +1263,8 @@ async def test_conv3x3_with_padding(dut):
             byte_offset = px * ARRAY_SIZE + ch
             word_idx = byte_offset // 4
             byte_pos = byte_offset % 4
-            out_word = read_sram_word(dut, 'act', word_idx)
+            out_word = read_sram_word(
+                dut, 'act', ACT_BASE + OUT_BASE + word_idx)
             byte_val = (out_word >> (byte_pos * 8)) & 0xFF
             assert byte_val == expected, \
                 f"Pixel {px}, ch {ch}: got {byte_val}, expected {expected}"

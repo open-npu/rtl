@@ -29,6 +29,40 @@ async def init_dut(dut):
     dut.cfg_layer_mode.value = 0
     dut.ctrl_auto_next.value = 0
     dut.cfg_layer_count.value = 0
+    # Untiled defaults: skip_act_load / skip_store require tile_h==0.
+    # Undriven X makes (cfg_tile_h == 0) false and breaks fusion tests.
+    dut.cfg_tile_h.value = 0
+    dut.cfg_tile_w.value = 0
+    dut.cfg_tile_num_h.value = 0
+    dut.cfg_tile_num_w.value = 0
+    dut.cfg_tile_in_size.value = 0
+    dut.cfg_dma_store_mode.value = 0
+    dut.cfg_dma_tile_out_size.value = 0
+    dut.cfg_dma_wgt_per_oc.value = 0
+    dut.cfg_dma_in_stride.value = 0
+    dut.cfg_dma_out_stride.value = 0
+    dut.cfg_dma_add_b_addr.value = 0
+    dut.cfg_out_base.value = 0
+    dut.cfg_out_h.value = 8
+    dut.cfg_out_w.value = 8
+    dut.cfg_out_c.value = 16
+    dut.cfg_in_h.value = 8
+    dut.cfg_in_w.value = 8
+    dut.cfg_in_c.value = 16
+    dut.cfg_stride_h.value = 1
+    dut.cfg_stride_w.value = 1
+    dut.cfg_kernel_h.value = 1
+    dut.cfg_kernel_w.value = 1
+    dut.cfg_pad_top.value = 0
+    dut.cfg_pad_left.value = 0
+    dut.cfg_pool_cfg.value = 0
+    dut.cfg_int16.value = 0
+    dut.tile_out_h_actual.value = 0
+    dut.tile_out_w_actual.value = 0
+    dut.oc_group_done.value = 0
+    dut.oc_group_idx.value = 0
+    dut.tile_done.value = 0
+    dut.cfg_act_bank_offset.value = 6144
 
     for _ in range(5):
         await RisingEdge(dut.clk)

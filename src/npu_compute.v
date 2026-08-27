@@ -149,32 +149,32 @@ module npu_compute #(
     localparam [$clog2(ARRAY_SIZE)-1:0] COL_MAX = ARRAY_SIZE - 1;  // last column index
     localparam [15:0] ARRAY_SIZE_16 = ARRAY_SIZE;  // 16-bit for comparisons
 
-    // ─── Reciprocal LUT for AvgPool division (pool_count 1..15) ───
+    // ─── Reciprocal LUT for AvgPool division (supported counts through 64) ───
     // Q32 fixed-point: result = (dividend * recip) >>> 32
-    // For pool_count=1: recip = 0x80000000 (shift 31 instead of 32 to fit 32-bit)
+    // pool_count=1 is bypassed; count=2 uses 0x40000000 with a 31-bit shift.
     function [31:0] recip_pool;
-        input [5:0] idx;
+        input [6:0] idx;
         case (idx)
-            6'd1:  recip_pool = 32'h4000_0000;  // 1/1 identity (unused, count=1 special-cased)
-            6'd2:  recip_pool = 32'h4000_0000;  // 1/2 with >>31 (avoid 0x80000000 signed)
-            6'd3:  recip_pool = 32'h5555_5556;
-            6'd4:  recip_pool = 32'h4000_0000;
-            6'd5:  recip_pool = 32'h3333_3333;
-            6'd6:  recip_pool = 32'h2AAA_AAAB;
-            6'd7:  recip_pool = 32'h2492_4925;
-            6'd8:  recip_pool = 32'h2000_0000;
-            6'd9:  recip_pool = 32'h1C71_C71C;
-            6'd10: recip_pool = 32'h1999_999A;
-            6'd11: recip_pool = 32'h1745_D174;
-            6'd12: recip_pool = 32'h1555_5555;
-            6'd13: recip_pool = 32'h13B1_3B14;
-            6'd14: recip_pool = 32'h1249_2492;
-            6'd15: recip_pool = 32'h1111_1111;
-            6'd16: recip_pool = 32'h1000_0000;
-            6'd25: recip_pool = 32'h0A3D_70A4;  // 1/25
-            6'd36: recip_pool = 32'h071C_71C7;  // 1/36
-            6'd49: recip_pool = 32'h0540_5405;  // 1/49 (7x7 global pool)
-            6'd64: recip_pool = 32'h0400_0000;  // 1/64 (8x8 global pool)
+            7'd1:  recip_pool = 32'h4000_0000;  // 1/1 identity (unused, count=1 special-cased)
+            7'd2:  recip_pool = 32'h4000_0000;  // 1/2 with >>31 (avoid 0x80000000 signed)
+            7'd3:  recip_pool = 32'h5555_5556;
+            7'd4:  recip_pool = 32'h4000_0000;
+            7'd5:  recip_pool = 32'h3333_3333;
+            7'd6:  recip_pool = 32'h2AAA_AAAB;
+            7'd7:  recip_pool = 32'h2492_4925;
+            7'd8:  recip_pool = 32'h2000_0000;
+            7'd9:  recip_pool = 32'h1C71_C71C;
+            7'd10: recip_pool = 32'h1999_999A;
+            7'd11: recip_pool = 32'h1745_D174;
+            7'd12: recip_pool = 32'h1555_5555;
+            7'd13: recip_pool = 32'h13B1_3B14;
+            7'd14: recip_pool = 32'h1249_2492;
+            7'd15: recip_pool = 32'h1111_1111;
+            7'd16: recip_pool = 32'h1000_0000;
+            7'd25: recip_pool = 32'h0A3D_70A4;  // 1/25
+            7'd36: recip_pool = 32'h071C_71C7;  // 1/36
+            7'd49: recip_pool = 32'h0540_5405;  // 1/49 (7x7 global pool)
+            7'd64: recip_pool = 32'h0400_0000;  // 1/64 (8x8 global pool)
             default: recip_pool = 32'h0100_0000;  // fallback: 1/256 (avoid div-by-zero)
         endcase
     endfunction
@@ -1176,21 +1176,11 @@ module npu_compute #(
                                     $display("[TILED_DBG] cfg_2d=%0d tile_h=%0d pad=%0d/%0d", cfg_2d_load, cfg_tile_h, cfg_pad_top, cfg_pad_left);
                                 `endif
                                 if (cfg_2d_load) begin
-                                    // 2D mode: SRAM layout depends on tile_x/tile_y:
-                                    //   tile_y=0: no row halo, elem_off row -= pad_top
-                                    //   tile_y>0: row halo in SRAM, elem_off row = sp_oh*stride + fh
-                                    //   tile_x=0: no col halo, elem_off col -= pad_left
-                                    //   tile_x>0: col halo in SRAM, elem_off col = sp_ow*stride + fw
-                                    begin : act_addr_2d_blk
-                                        reg [17:0] row_rel, col_rel;
-                                        row_rel = {2'd0, sp_oh} * {10'd0, cfg_stride_h} + {10'd0, conv_fh};
-                                        col_rel = {2'd0, sp_ow} * {10'd0, cfg_stride_w} + {10'd0, conv_fw};
-                                        if (tile_oh_origin == 16'd0)
-                                            row_rel = row_rel - {8'd0, cfg_pad_top};
-                                        if (tile_ow_origin == 16'd0)
-                                            col_rel = col_rel - {8'd0, cfg_pad_left};
-                                        elem_off = (row_rel[15:0] * tile_in_w + col_rel[15:0]) * cfg_in_c + {16'd0, conv_ch_cnt};
-                                    end
+                                    // SRAM is packed-tile layout (leading pad rows/cols
+                                    // left zero by 2D DMA). Same elem_off as 1D packed.
+                                    elem_off = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, conv_fh}) * tile_in_w
+                                             + {8'd0, sp_ow} * cfg_stride_w + {8'd0, conv_fw}) * cfg_in_c
+                                             + {8'd0, conv_ch_cnt};
                                     `ifdef DBG_DOTBUF
                                     if (sp_oh == 0 && sp_ow == 0 && k_pass == 0)
                                         $display("[2D_EOFF] cfg_2d=%0d fh=%0d fw=%0d pad=%0d/%0d elem_off=%0d",
@@ -1204,7 +1194,7 @@ module npu_compute #(
                             end
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
                             act_word_addr <= {2'd0, act_base} + byte_off[17:2];
-`ifndef SYNTHESIS
+`ifdef NPU_SIM_DEBUG
                             if (cfg_2d_load && sp_oh == 0 && sp_ow == 0 && k_pass < 20)
                                 $display("[L2CMD] ty=%0d tx=%0d pass=%0d fh=%0d fw=%0d ch=%0d in_c=%0d elem=%0d addr=%0d remain=%0d",
                                         tile_y, tile_x, k_pass, conv_fh, conv_fw, conv_ch_cnt, cfg_in_c, elem_off,
@@ -1370,16 +1360,8 @@ module npu_compute #(
                                 elem_off_n = (nih[15:0] * cfg_in_w + niw[15:0]) * cfg_in_c;
                             end else begin
                                 if (cfg_2d_load) begin
-                                    begin : act_addr_n_2d_blk
-                                        reg [17:0] row_rel_n, col_rel_n;
-                                        row_rel_n = {2'd0, sp_oh} * {10'd0, cfg_stride_h} + {10'd0, next_fh};
-                                        col_rel_n = {2'd0, sp_ow} * {10'd0, cfg_stride_w} + {10'd0, next_fw};
-                                        if (tile_oh_origin == 16'd0)
-                                            row_rel_n = row_rel_n - {8'd0, cfg_pad_top};
-                                        if (tile_ow_origin == 16'd0)
-                                            col_rel_n = col_rel_n - {8'd0, cfg_pad_left};
-                                        elem_off_n = (row_rel_n[15:0] * tile_in_w + col_rel_n[15:0]) * cfg_in_c;
-                                    end
+                                    elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh}) * tile_in_w
+                                               + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw}) * cfg_in_c;
                                 end else begin
                                     elem_off_n = (({8'd0, sp_oh} * cfg_stride_h + {8'd0, next_fh}) * tile_in_w
                                                + {8'd0, sp_ow} * cfg_stride_w + {8'd0, next_fw}) * cfg_in_c;
@@ -2210,17 +2192,6 @@ module npu_compute #(
                                     reg [17:0] row_rel, col_rel;
                                     row_rel = {2'd0, dw_oh} * {10'd0, cfg_stride_h} + {14'd0, dw_fh};
                                     col_rel = {2'd0, dw_ow} * {10'd0, cfg_stride_w} + {14'd0, dw_fw};
-                                    if (cfg_2d_load) begin
-                                        // 2D chained load: border tiles have no halo in
-                                        // SRAM (image starts at buffer row/col 0). Match
-                                        // the Conv systolic path (S_ACT_CMD): subtract
-                                        // pad so the tile-local coord maps onto the
-                                        // clipped window the 2D load actually wrote.
-                                        if (tile_oh_origin == 16'd0)
-                                            row_rel = row_rel - {10'd0, cfg_pad_top};
-                                        if (tile_ow_origin == 16'd0)
-                                            col_rel = col_rel - {10'd0, cfg_pad_left};
-                                    end
                                     elem_off = (row_rel[15:0] * tile_in_w + col_rel[15:0])
                                                * cfg_in_c + oc_group;
                                 end
@@ -2493,17 +2464,6 @@ module npu_compute #(
                                     reg [17:0] row_rel, col_rel;
                                     row_rel = {2'd0, pool_oh} * {10'd0, pool_sh} + {14'd0, pool_fh};
                                     col_rel = {2'd0, pool_ow} * {10'd0, pool_sw} + {14'd0, pool_fw};
-                                    if (cfg_2d_load) begin
-                                        // 2D chained load: border tiles have no halo in
-                                        // SRAM (image starts at buffer row/col 0). Match
-                                        // the Conv systolic + DW paths: subtract pad so the
-                                        // tile-local coord maps onto the clipped window the
-                                        // 2D load actually wrote. (model_e L1 Pool pad=1)
-                                        if (tile_oh_origin == 16'd0)
-                                            row_rel = row_rel - {10'd0, cfg_pad_top};
-                                        if (tile_ow_origin == 16'd0)
-                                            col_rel = col_rel - {10'd0, cfg_pad_left};
-                                    end
                                     elem_off = (row_rel[15:0] * tile_in_w + col_rel[15:0])
                                                * cfg_in_c + pool_ch;
                                 end
@@ -2592,7 +2552,7 @@ module npu_compute #(
                             // Multiply by reciprocal: q = (rounded * recip) >>> N
                             // count=2 uses recip=0x40000000 (2^30) >>> 31 since
                             // 0x80000000 would be negative under $signed.
-                            prod = rounded * $signed(recip_pool(pool_count[5:0]));
+                            prod = rounded * $signed(recip_pool(pool_count[6:0]));
                             if (pool_count == 17'd2)
                                 pool_acc <= prod >>> 31;
                             else

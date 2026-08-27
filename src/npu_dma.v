@@ -163,12 +163,13 @@ module npu_dma #(
                         `ifndef SYNTHESIS
                         $display("[DMA_START] t=%0t ext=0x%08x sram=%0d len=%0d row_len=%0d row_cnt=%0d stride=%0d",
                                 $time, ext_addr, sram_addr, xfer_len, cfg_row_len, cfg_row_count,
-                                (cfg_row_len != 0) ? cfg_out_stride : (dir ? cfg_out_stride : cfg_in_stride));
+                                (cfg_row_len != 0) ? cfg_out_stride : 32'd0);
                         `endif
-                        // Latch stride: use cfg_out_stride for 2D mode (set by ctrl for
-                        // both load and store), cfg_in_stride only for 1D load.
-                        r_stride   <= (cfg_row_len != 0) ? cfg_out_stride :
-                                      (dir ? cfg_out_stride : cfg_in_stride);
+                        // 2D (row_len!=0): ctrl puts NHWC row stride in cfg_out_stride.
+                        // 1D load/store is always contiguous (+4/word). CSR in_stride is
+                        // only the 2D row pitch — applying it here skipped through
+                        // weight/param blobs and zeroed chained conv (MODEL_B L2).
+                        r_stride   <= (cfg_row_len != 0) ? cfg_out_stride : 32'd0;
                         // 2D mode parameters (latched at start)
                         r_row_len  <= cfg_row_len;
                         r_row_count<= cfg_row_count;
@@ -195,13 +196,13 @@ module npu_dma #(
                         wb_stb_o <= 1'b1;
                         wb_we_o  <= 1'b0;
                         wb_adr_o <= r_ext_addr;
-                        `ifndef SYNTHESIS
+                        `ifdef NPU_SIM_DEBUG
                         if (xfer_count < 3 && r_sram_addr >= 16'd6144)
                             $display("[DMA_LD] t=%0t xfer=%0d addr=0x%08x sram=%0d", $time, xfer_count, r_ext_addr, r_sram_addr);
                         `endif
                         if (wb_ack_i) begin
                             r_data_buf <= wb_dat_i;
-                            `ifndef SYNTHESIS
+                            `ifdef NPU_SIM_DEBUG
                             if ((xfer_count < 3 || (mode_2d && r_row_word_count == 16'd0)) && !wb_we_o) begin
                                 if (!dma_ld_opened) begin
                                     dma_ld_fh = $fopen("dma_load.log", "w");
@@ -231,8 +232,11 @@ module npu_dma #(
                     r_row_word_count <= r_row_word_count + 1;
                     // Advance external address
                     if (mode_2d && (r_row_word_count + 1 >= r_row_len)) begin
-                        // End of 2D row: jump to next row in NHWC layout
-                        // r_stride = row stride (bytes between row starts)
+                        // End of 2D row: jump to next NHWC DDR row. Leave left-pad
+                        // holes in SRAM (src_row_len - row_len) so the buffer matches
+                        // packed-tile layout (pad zeros + in-bounds pixels).
+                        if (effective_src_len > r_row_len)
+                            r_sram_addr <= r_sram_addr + 1 + (effective_src_len - r_row_len);
                         r_ext_addr <= r_row_base + r_stride;
                         r_row_base <= r_row_base + r_stride;
                         r_row_count <= r_row_count - 1;
@@ -241,8 +245,9 @@ module npu_dma #(
                         // Within 2D row: contiguous (4 bytes per word)
                         r_ext_addr  <= r_ext_addr + 32'd4;
                     end else begin
-                        // 1D mode: contiguous (4 bytes per word)
-                        r_ext_addr  <= r_ext_addr + 32'd4;
+                        // 1D mode: configured per-word stride, default 4 bytes.
+                        r_ext_addr <= r_ext_addr
+                                      + ((r_stride != 0) ? r_stride : 32'd4);
                     end
                     if (xfer_count + 1 >= r_xfer_len)
                         state <= S_DONE;
@@ -274,7 +279,7 @@ module npu_dma #(
                         wb_stb_o <= 1'b1;
                         wb_we_o  <= 1'b1;
                         wb_adr_o <= r_ext_addr;
-                        `ifndef SYNTHESIS
+                        `ifdef NPU_SIM_DEBUG
                         if (mode_2d && (xfer_count < 8 || r_row_word_count == 16'd0 || r_row_word_count == 16'd1))
                             $display("[DMA_2D_WR] t=%0t xfer=%0d addr=0x%08x sram=%0d data=0x%08x row_word=%0d/%0d row_cnt=%0d",
                                      $time, xfer_count, r_ext_addr, r_sram_addr, sram_rdata,
@@ -282,7 +287,7 @@ module npu_dma #(
                         `endif
                         wb_dat_o <= sram_rdata;
                         if (wb_ack_i) begin
-                            `ifndef SYNTHESIS
+                            `ifdef NPU_SIM_DEBUG
                             if (wb_we_o && xfer_count < 20) begin
                                 if (!dma_st_opened) begin
                                     dma_st_fh = $fopen("dma_store.log", "w");

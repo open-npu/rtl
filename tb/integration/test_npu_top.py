@@ -162,9 +162,11 @@ async def test_csr_hw_config_read(dut):
     hw_cfg = await wb.read(0x018)
     # Dynamic: read ARRAY_SIZE from RTL parameter
     array_sz = int(dut.ARRAY_SIZE.value)
+    spad_kb = int(dut.SPAD_KB.value)
     import math
     dw_ch_log2 = int(math.log2(array_sz))
-    expected = (0 << 27) | (0 << 26) | (1 << 25) | (1 << 24) | (128 << 16) | (dw_ch_log2 << 12) | (1 << 8) | array_sz
+    expected = ((1 << 25) | (1 << 24) | (spad_kb << 16)
+                | (dw_ch_log2 << 12) | (1 << 8) | array_sz)
     assert hw_cfg == expected, f"Expected HW_CONFIG=0x{expected:08X}, got 0x{hw_cfg:08X}"
 
 

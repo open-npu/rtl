@@ -17,8 +17,8 @@ MODE_DRAIN    = 0b11
 
 
 def int8_to_unsigned(val):
-    """Convert signed int8 to unsigned 8-bit for driving DUT."""
-    return val & 0xFF
+    """Sign-extend an INT8 value onto the PE's 16-bit data port."""
+    return val & 0xFFFF
 
 
 def signed_acc(val, bits=40):
@@ -198,7 +198,7 @@ async def test_act_passthrough(dut):
         # Read act_out from previous cycle
         if dut.act_valid_out.value:
             out_raw = int(dut.act_out.value)
-            out_signed = out_raw if out_raw < 128 else out_raw - 256
+            out_signed = out_raw if out_raw < 0x8000 else out_raw - 0x10000
             received.append(out_signed)
 
     # One more cycle to capture last value
@@ -207,7 +207,7 @@ async def test_act_passthrough(dut):
     await RisingEdge(dut.clk)
     if dut.act_valid_out.value:
         out_raw = int(dut.act_out.value)
-        out_signed = out_raw if out_raw < 128 else out_raw - 256
+        out_signed = out_raw if out_raw < 0x8000 else out_raw - 0x10000
         received.append(out_signed)
 
     assert received == test_acts, f"act_out mismatch: expected {test_acts}, got {received}"

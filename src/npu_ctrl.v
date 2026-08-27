@@ -17,7 +17,11 @@
 
 `include "npu_defines.vh"
 
-module npu_ctrl (
+module npu_ctrl #(
+    parameter integer ACT_DEPTH   = `SPAD_KB * 64,
+    parameter integer WGT_DEPTH   = `SPAD_KB * 128,
+    parameter integer PARAM_DEPTH = `SPAD_KB * 16
+)(
     input  wire         clk,
     input  wire         rst_n,
 
@@ -165,12 +169,40 @@ module npu_ctrl (
     // Output words = out_size / 4
     wire [15:0] out_words = cfg_dma_out_size[17:2];
 
+    // Physical SRAM limits, in 32-bit words. DB_EN confines each activation
+    // transfer/output to one half of the activation SRAM.
+    wire [31:0] act_capacity_words = db_en ? {16'd0, cfg_act_bank_offset}
+                                                : ACT_DEPTH;
+    wire [31:0] initial_wgt_words = dw_stream ? {16'd0, dws_wgt_words}
+                                : ((cfg_dma_wgt_per_oc != 0)
+                                   ? cfg_dma_wgt_per_oc : wgt_words);
+    wire [31:0] initial_param_words = param_needs_reload ? 32'd64
+                                                         : {16'd0, param_words};
+    wire [31:0] output_tile_words = (({16'd0, cfg_tile_h}
+                                    * {16'd0, cfg_tile_w}
+                                    * {16'd0, cfg_out_c}
+                                    * (cfg_int16 ? 32'd2 : 32'd1)) + 3) >> 2;
+    wire [31:0] active_input_words = (cfg_tile_h != 0)
+                                   ? {16'd0, tile_in_words}
+                                   : (cfg_dma_in_size >> 2);
+    wire [31:0] active_output_words = (cfg_tile_h != 0)
+                                    ? output_tile_words
+                                    : (cfg_dma_out_size >> 2);
+    wire [31:0] output_sram_base = is_add_op ? 32'd0
+                                 : slice_stream ? `DW_STREAM_OUT_BASE
+                                 : {16'd0, cfg_out_base};
+
     // ─── Fusion control bits ───
     wire fuse_start = cfg_dma_ctrl[1];
     wire fuse_mid   = cfg_dma_ctrl[2];
     wire fuse_end   = cfg_dma_ctrl[3];
-    wire skip_act_load = fuse_mid | fuse_end;   // Input already in SRAM
-    wire skip_store    = fuse_start | fuse_mid;  // Output stays in SRAM
+    // SRAM reuse is only valid for a non-tiled full tensor. Tiled fused
+    // blocks (MODEL_D L9-L11) have different tile grids; skip_act_load
+    // also blocked tile_done PTS, so only the last tile was stored — and
+    // tile_x_seq never advanced, so it landed at DDR offset 0. Working
+    // buffers are prefilled with golden, which hid this as a small mismatch.
+    wire skip_act_load = (fuse_mid | fuse_end) & (cfg_tile_h == 16'd0);
+    wire skip_store    = (fuse_start | fuse_mid) & (cfg_tile_h == 16'd0);
 
     // ─── Op-type decode ───
     wire is_add_op    = (cfg_layer_mode[3:0] == 4'd4);
@@ -291,7 +323,7 @@ module npu_ctrl (
     // stays out of the DMA address path; CSRs are written long before START.
     reg [39:0] rsz_recip_h, rsz_recip_w;
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+        if (!rst_n || ctrl_soft_rst) begin
             rsz_recip_h <= 40'd0;
             rsz_recip_w <= 40'd0;
         end else begin
@@ -411,6 +443,25 @@ module npu_ctrl (
     wire [15:0] next_row_count = is_resize ?
         rsz_clamp_rows(tile_in_h_calc, cfg_in_h, rsz_next_ih_org) : tile_in_h_calc;
     wire [15:0] load_total_words = load_row_len[15:0] * load_row_count;
+
+    // Border tiles: 2D DMA lands in-bounds pixels at the packed-tile SRAM
+    // offset (leading pad_top rows / pad_left cols stay zero). Compute then
+    // uses the same elem_off as 1D packed loads. Do not DMA from before the
+    // image (that reads neighbouring SoC buffers and saturates INT16).
+    wire [31:0] pad_left_words = ({24'd0, cfg_pad_left} * {16'd0, cfg_in_c}
+                                  * (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
+    wire [15:0] cur_pad_top  = (use_2d_load && tile_y_seq == 16'd0) ? {8'd0, cfg_pad_top} : 16'd0;
+    wire [15:0] cur_pad_left = (use_2d_load && tile_x_seq == 16'd0) ? pad_left_words[15:0] : 16'd0;
+    wire [15:0] cur_2d_row_len = load_row_len[15:0] - cur_pad_left;
+    wire [15:0] cur_2d_row_cnt = load_row_count - cur_pad_top;
+    wire [15:0] cur_2d_sram_pad = cur_pad_top * load_row_len[15:0] + cur_pad_left;
+    wire [15:0] cur_2d_xfer = cur_2d_row_len * cur_2d_row_cnt;
+    wire [15:0] nxt_pad_top  = (use_2d_load && next_ty_2d == 16'd0) ? {8'd0, cfg_pad_top} : 16'd0;
+    wire [15:0] nxt_pad_left = (use_2d_load && next_tx_2d == 16'd0) ? pad_left_words[15:0] : 16'd0;
+    wire [15:0] nxt_2d_row_len = load_row_len[15:0] - nxt_pad_left;
+    wire [15:0] nxt_2d_row_cnt = next_row_count - nxt_pad_top;
+    wire [15:0] nxt_2d_sram_pad = nxt_pad_top * load_row_len[15:0] + nxt_pad_left;
+    wire [15:0] nxt_2d_xfer = nxt_2d_row_len * nxt_2d_row_cnt;
     // Words actually transferred. Non-Resize keeps the historical tile_in_words
     // (CSR-provided) untouched. Resize must instead stop at row_count*row_len,
     // or the DMA keeps walking rows past the clamp — npu_dma.v drops mode_2d
@@ -440,7 +491,7 @@ module npu_ctrl (
                                   * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
 
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+        if (!rst_n || ctrl_soft_rst) begin
             state            <= S_IDLE;
             hw_busy          <= 1'b0;
             hw_done          <= 1'b0;
@@ -520,15 +571,27 @@ module npu_ctrl (
                         end else if (slice_stream && (dws_act_words32 > `DW_STREAM_OUT_BASE)) begin
                             hw_error_code <= 4'd3;
                             state <= S_ERROR;
-                        // E4: non-tiled input >= 256KB truncates 16-bit
-                        //     in_words ([17:2]) — initial load would be short
-                        //     or skipped entirely (covers slice-stream too)
-                        end else if ((cfg_tile_h == 16'd0) && (cfg_dma_in_size[31:18] != 14'd0)
-                                     && (cfg_dma_in_size != 32'd0)) begin
+                        // E4: activation input transfer must fit its physical
+                        //     SRAM region (one bank under DB_EN).
+                        //     slice_stream only DMA-loads a 16-ch slice
+                        //     (dws_act_words32, already checked by E3). The
+                        //     full dma_in_size is what overflowed SRAM and is
+                        //     why the layer is streamed (A L61 DW, E L29 GAP).
+                        end else if (!slice_stream
+                                     && active_input_words > act_capacity_words) begin
                             hw_error_code <= 4'd4;
                             state <= S_ERROR;
-                        // E5: non-tiled output >= 256KB truncates out_words
-                        end else if ((cfg_tile_h == 16'd0) && (cfg_dma_out_size[31:18] != 14'd0)) begin
+                        // E5: output range must fit without address truncation.
+                        //     Stream output lives at DW_STREAM_OUT_BASE in the
+                        //     full act SRAM, not in a DB bank.
+                        end else if (!slice_stream
+                                     && (output_sram_base + active_output_words
+                                         > act_capacity_words)) begin
+                            hw_error_code <= 4'd5;
+                            state <= S_ERROR;
+                        end else if (slice_stream
+                                     && (output_sram_base + active_output_words
+                                         > ACT_DEPTH)) begin
                             hw_error_code <= 4'd5;
                             state <= S_ERROR;
                         // E6: Conv/FC k_depth exceeds 16-bit k_depth register
@@ -540,6 +603,14 @@ module npu_ctrl (
                         //     (would silently use the 1/256 fallback)
                         end else if (avg_gpool_bad_cnt) begin
                             hw_error_code <= 4'd7;
+                            state <= S_ERROR;
+                        // E8/E9: initial weight/parameter DMA ranges must fit
+                        //        their real SRAM depths.
+                        end else if (initial_wgt_words > WGT_DEPTH) begin
+                            hw_error_code <= 4'd8;
+                            state <= S_ERROR;
+                        end else if (initial_param_words > PARAM_DEPTH) begin
+                            hw_error_code <= 4'd9;
                             state <= S_ERROR;
                         end else begin
                             hw_busy  <= 1'b1;
@@ -600,7 +671,7 @@ module npu_ctrl (
                         dma_dir       <= 1'b0;
                         dma_sram_sel  <= 2'd1;  // activation
                         dma_ext_addr  <= cfg_dma_in_addr;  // tile(0,0) = base
-                        dma_sram_addr <= 16'd0;
+                        dma_sram_addr <= use_2d_load ? cur_2d_sram_pad : 16'd0;
                         if (slice_stream) begin
                             // Slice stream: 2D load of group 0's channel slice.
                             // Row = ARRAY_SIZE channels at one spatial position
@@ -614,16 +685,17 @@ module npu_ctrl (
                                      $time, dws_row_len, dws_row_count, dws_stride, cfg_dma_in_addr);
                             `endif
                         end else begin
-                        dma_xfer_len  <= load_xfer_words;
+                        dma_xfer_len  <= use_2d_load ? cur_2d_xfer : load_xfer_words;
                         // 2D load when in_stride != 0 (NHWC chain mode)
                         if (use_2d_load) begin
                             `ifndef SYNTHESIS
-                            $display("[2D_LOAD_INIT] t=%0t use_2d=%0d in_stride=%0d rlen=%0d rcnt=%0d stride=%0d addr=0x%08x",
-                                     $time, use_2d_load, cfg_dma_in_stride, load_row_len, load_row_count, load_in_stride, cfg_dma_in_addr);
+                            $display("[2D_LOAD_INIT] t=%0t use_2d=%0d in_stride=%0d rlen=%0d rcnt=%0d stride=%0d addr=0x%08x sram_pad=%0d",
+                                     $time, use_2d_load, cfg_dma_in_stride, cur_2d_row_len, cur_2d_row_cnt, load_in_stride, cfg_dma_in_addr, cur_2d_sram_pad);
                             `endif
-                            dma_row_len   <= load_row_len[15:0];
-                            dma_row_count <= load_row_count;
-                            dma_out_stride<= load_in_stride;
+                            dma_row_len    <= cur_2d_row_len;
+                            dma_row_count  <= cur_2d_row_cnt;
+                            dma_out_stride <= load_in_stride;
+                            dma_src_row_len<= load_row_len[15:0];
                         end else begin
                             dma_row_len   <= 16'd0;
                             dma_row_count <= 16'd0;
@@ -721,7 +793,20 @@ module npu_ctrl (
                         // Per-tile store path: store current tile output to DDR (NHWC) first,
                         // then prefetch next tile input.
                         // Non-per-tile path (last-tile-only store): prefetch directly.
-                        if (db_en && tile_done && !prefetch_active && !skip_act_load) begin
+                        if (db_en && tile_done && !prefetch_active && skip_act_load) begin
+                            // Fused mid/end with SRAM-resident input: do not
+                            // prefetch, but still advance tile_x_seq and keep
+                            // db_prefetch_done high. Otherwise compute sits in
+                            // S_TILE_WAIT_DB forever (Icarus MODEL_D L10 ran
+                            // 3 days at 100% CPU on tile(6,2) with no IRQ).
+                            if (tile_x_seq + 1 >= cfg_tile_num_w) begin
+                                tile_x_seq <= 16'd0;
+                                tile_y_seq <= tile_y_seq + 16'd1;
+                            end else begin
+                                tile_x_seq <= tile_x_seq + 16'd1;
+                            end
+                            db_prefetch_done <= 1'b1;
+                        end else if (db_en && tile_done && !prefetch_active && !skip_act_load) begin
                             if (per_tile_store_en) begin
                                 // Latch current tile's bank for store
                                 store_bank <= ping_pong_flag;
@@ -747,13 +832,14 @@ module npu_ctrl (
                                 dma_dir        <= 1'b0;  // load
                                 dma_sram_sel   <= 2'd1;  // activation
                                 dma_ext_addr   <= use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr;
-                                dma_sram_addr  <= next_sram_offset;
-                                dma_xfer_len   <= next_xfer_words;
+                                dma_sram_addr  <= next_sram_offset + (use_2d_load ? nxt_2d_sram_pad : 16'd0);
+                                dma_xfer_len   <= use_2d_load ? nxt_2d_xfer : next_xfer_words;
                                 // 2D load when in_stride != 0 (NHWC chain mode)
                                 if (use_2d_load) begin
-                                    dma_row_len   <= load_row_len[15:0];
-                                    dma_row_count <= next_row_count;
-                                    dma_out_stride<= load_in_stride;
+                                    dma_row_len    <= nxt_2d_row_len;
+                                    dma_row_count  <= nxt_2d_row_cnt;
+                                    dma_out_stride <= load_in_stride;
+                                    dma_src_row_len<= load_row_len[15:0];
                                 end else begin
                                     dma_row_len   <= 16'd0;
                                     dma_row_count <= 16'd0;
@@ -903,13 +989,14 @@ module npu_ctrl (
                                 dma_sram_sel   <= 2'd1;  // activation
                                 // 2D mode: use computed next tile address
                                 dma_ext_addr   <= use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr;
-                                dma_sram_addr  <= next_sram_offset;
-                                dma_xfer_len   <= next_xfer_words;
+                                dma_sram_addr  <= next_sram_offset + (use_2d_load ? nxt_2d_sram_pad : 16'd0);
+                                dma_xfer_len   <= use_2d_load ? nxt_2d_xfer : next_xfer_words;
                                 // 2D load when in_stride != 0 (NHWC chain mode)
                                 if (use_2d_load) begin
-                                    dma_row_len   <= load_row_len[15:0];
-                                    dma_row_count <= next_row_count;
-                                    dma_out_stride<= load_in_stride;
+                                    dma_row_len    <= nxt_2d_row_len;
+                                    dma_row_count  <= nxt_2d_row_cnt;
+                                    dma_out_stride <= load_in_stride;
+                                    dma_src_row_len<= load_row_len[15:0];
                                 end else begin
                                     dma_row_len   <= 16'd0;
                                     dma_row_count <= 16'd0;

@@ -61,6 +61,9 @@ module npu_top #(
 
     // --- CSR ↔ Controller ---
     wire        ctrl_start, ctrl_abort, ctrl_soft_rst, ctrl_auto_next;
+    // Cancel all in-flight datapath activity on SOFT_RST or ABORT. SRAM
+    // contents and programmed CSRs intentionally remain intact.
+    wire        engine_rst_n = rst_n & ~(ctrl_soft_rst | ctrl_abort);
     wire [7:0]  reg_layer_count;
     wire        hw_busy, hw_done, hw_error;
     wire [3:0]  hw_error_code;
@@ -231,7 +234,11 @@ module npu_top #(
     // Controller — Layer Sequencer FSM
     // ════════════════════════════════════════════════════════════════════
 
-    npu_ctrl u_ctrl (
+    npu_ctrl #(
+        .ACT_DEPTH   (ACT_DEPTH),
+        .WGT_DEPTH   (WGT_DEPTH),
+        .PARAM_DEPTH (PARAM_DEPTH)
+    ) u_ctrl (
         .clk            (clk),
         .rst_n          (rst_n),
         // CSR interface
@@ -273,7 +280,8 @@ module npu_top #(
         .cfg_dma_in_stride  (reg_dma_in_stride),
         .cfg_dma_out_stride (reg_dma_out_stride),
         .cfg_layer_mode     (reg_layer_mode),
-        .cfg_out_base       ({3'd0, reg_sram_base[ACT_ADDR_W+16-1:16]}),
+        .cfg_out_base       ({{(16-ACT_ADDR_W){1'b0}},
+                              reg_sram_base[ACT_ADDR_W+16-1:16]}),
         .cfg_dma_add_b_addr (reg_dma_add_b_addr),
         // Per-tile store (2D DMA for NHWC)
         .cfg_dma_store_mode    (reg_dma_store_mode),
@@ -287,7 +295,7 @@ module npu_top #(
         .cfg_stride_h          (reg_stride[7:0]),
         .cfg_stride_w          (reg_stride[15:8]),
         .cfg_kernel_h          (reg_kernel_size[7:0]),
-        .cfg_kernel_w          (reg_kernel_size[11:8]),
+        .cfg_kernel_w          (reg_kernel_size[15:8]),
         .cfg_pad_top           (reg_padding[7:0]),
         .cfg_pad_left          (reg_padding[15:8]),
         .cfg_pool_cfg          (reg_pool_cfg),
@@ -322,7 +330,7 @@ module npu_top #(
         .SRAM_ADDR_W (16)
     ) u_dma (
         .clk            (clk),
-        .rst_n          (rst_n),
+        .rst_n          (engine_rst_n),
         // Control
         .start          (dma_start),
         .abort          (ctrl_abort),
@@ -480,6 +488,8 @@ module npu_top #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             dma_bank_sel <= 2'd1;  // default: activation
+        else if (ctrl_soft_rst || ctrl_abort)
+            dma_bank_sel <= 2'd1;
         else if (dma_start)
             dma_bank_sel <= dma_sram_sel;  // latch at start, takes effect next cycle
     end
@@ -528,7 +538,7 @@ module npu_top #(
         .ACC_W  (`ACC_WIDTH)
     ) u_systolic (
         .clk            (clk),
-        .rst_n          (rst_n),
+        .rst_n          (engine_rst_n),
         .cmd            (sa_cmd),
         .cmd_valid      (sa_cmd_valid),
         .wgt_data_flat  (sa_wgt_data_flat),
@@ -561,7 +571,7 @@ module npu_top #(
         .MAX_KSZ (16)
     ) u_dw_conv (
         .clk        (clk),
-        .rst_n      (rst_n),
+        .rst_n      (engine_rst_n),
         .kernel_h   (reg_kernel_size[3:0]),
         .kernel_w   (reg_kernel_size[11:8]),
         .wgt_load   (dw_wgt_load),
@@ -596,7 +606,7 @@ module npu_top #(
         .ZP_W    (`PARAM_ZP_BITS)
     ) u_ppu (
         .clk        (clk),
-        .rst_n      (rst_n),
+        .rst_n      (engine_rst_n),
         .mode       (reg_post_ctrl[1:0]),
         .relu_en    (reg_post_ctrl[2]),
         .relu6_en   (reg_post_ctrl[3]),
@@ -643,7 +653,7 @@ module npu_top #(
         .ACC_W        (`ACC_WIDTH)
     ) u_compute (
         .clk            (clk),
-        .rst_n          (rst_n),
+        .rst_n          (engine_rst_n),
         .start          (compute_start),
         .done           (compute_done_w),
         // Layer config from CSR

@@ -18,7 +18,6 @@ MODE_COMPUTE  = 0b10
 MODE_DRAIN    = 0b11
 
 DATA_W = 16
-ACC_W  = 40
 
 def get_array_size(dut):
     """Get array size from RTL parameter."""
@@ -26,7 +25,7 @@ def get_array_size(dut):
 
 
 def int8_to_unsigned(val):
-    return val & 0xFF
+    return val & 0xFFFF
 
 
 def signed_acc(val, bits=40):
@@ -145,8 +144,9 @@ async def drain_column(dut, col):
 
     results = []
     acc_flat = int(dut.acc_out_flat.value)
+    acc_w = len(dut.acc_out_flat) // N
     for row in range(N):
-        results.append(signed_acc(unpack_flat(acc_flat, row, ACC_W)))
+        results.append(signed_acc(unpack_flat(acc_flat, row, acc_w), acc_w))
 
     await RisingEdge(dut.clk)  # Cycle 3: back to READY
     return results
