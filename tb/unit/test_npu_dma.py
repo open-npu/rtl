@@ -50,6 +50,9 @@ async def init_dut(dut):
     dut.burst_cfg.value = 0
     dut.cfg_in_stride.value = 0
     dut.cfg_out_stride.value = 0
+    dut.cfg_row_len.value = 0
+    dut.cfg_row_count.value = 0
+    dut.cfg_src_row_len.value = 0
     dut.wb_ack_i.value = 0
     dut.wb_dat_i.value = 0
     dut.sram_rdata.value = 0
@@ -403,7 +406,11 @@ async def test_address_increment(dut):
 # ─────────────────────────────────────────────────────────────────────────────
 @cocotb.test()
 async def test_load_stride(dut):
-    """DMA loads words with cfg_in_stride=8 (every other word in external mem)."""
+    """2D load: 4 rows × 1 word, row pitch 8 (every other word in external mem).
+
+    1D transfers are always contiguous (+4/word). CSR stride is only the
+    2D row pitch, latched from cfg_out_stride when row_len != 0.
+    """
     wb_mem = await init_dut(dut)
     N = 4
     base = 0xA000
@@ -427,7 +434,9 @@ async def test_load_stride(dut):
     dut.ext_addr.value = base
     dut.sram_addr.value = 0
     dut.xfer_len.value = N
-    dut.cfg_in_stride.value = 8  # stride=8 bytes
+    dut.cfg_row_len.value = 1
+    dut.cfg_row_count.value = N
+    dut.cfg_out_stride.value = 8  # 2D row pitch (bytes)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)
@@ -452,7 +461,11 @@ async def test_load_stride(dut):
 # ─────────────────────────────────────────────────────────────────────────────
 @cocotb.test()
 async def test_store_stride(dut):
-    """DMA stores words with cfg_out_stride=16 (every 16th byte in external mem)."""
+    """2D store: 3 rows × 1 word, row pitch 16 (every 16th byte in external mem).
+
+    1D transfers are always contiguous (+4/word). CSR stride is only the
+    2D row pitch, latched from cfg_out_stride when row_len != 0.
+    """
     wb_mem = await init_dut(dut)
     N = 3
     sram_data = 0xBEEF_0000
@@ -485,7 +498,9 @@ async def test_store_stride(dut):
     dut.ext_addr.value = 0xB000
     dut.sram_addr.value = 0
     dut.xfer_len.value = N
-    dut.cfg_out_stride.value = 16  # stride=16 bytes
+    dut.cfg_row_len.value = 1
+    dut.cfg_row_count.value = N
+    dut.cfg_out_stride.value = 16  # 2D row pitch (bytes)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)

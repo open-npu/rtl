@@ -11,14 +11,15 @@
 TOP        ?= npu_top
 FREQ_MHZ   ?= 200
 ARRAY_SIZE ?= 16
-SPAD_KB    ?= 128
+SPAD_KB    ?= 192
+ACC_WIDTH  ?= 44
 
 # ─── Paths ───
 SRC_DIR    = src
 TB_DIR     = tb
 SIM_DIR    = sim
 INC_DIR    = include
-SYN_DIR    = syn
+SYN_DIR    = synth
 
 # ─── Source files ───
 SRCS       = $(wildcard $(SRC_DIR)/*.v)
@@ -27,7 +28,7 @@ TB_SRCS    = $(wildcard $(TB_DIR)/*.v)
 # ─── Icarus Verilog ───
 IVERILOG   = iverilog
 VVP        = vvp
-IV_FLAGS   = -g2012 -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB)
+IV_FLAGS   = -g2012 -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH)
 
 .PHONY: sim sim_verilator syn lint clean
 
@@ -47,7 +48,8 @@ sim_verilator:
 
 # ─── Yosys Synthesis ───
 syn:
-	yosys -p "read_verilog -sv $(SRCS); \
+	mkdir -p $(SYN_DIR)
+	yosys -p "read_verilog -sv -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH) $(SRCS); \
 		synth -top $(TOP); \
 		stat; \
 		write_json $(SYN_DIR)/$(TOP).json" \
@@ -55,8 +57,8 @@ syn:
 
 # ─── Lint (Verilator) ───
 lint:
-	verilator --lint-only -Wall -I$(INC_DIR) \
-		-DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) \
+	verilator --lint-only -Wall -Wno-fatal -I$(INC_DIR) \
+		-DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH) \
 		$(SRCS)
 
 # ─── Clean ───

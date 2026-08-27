@@ -22,8 +22,11 @@ async def reset_dut(dut):
     await clock_reset(dut)
     dut.mode.value = MODE_CONV_REQ
     dut.relu_en.value = 0
+    dut.relu6_en.value = 0
     dut.bias_en.value = 1
     dut.zp_en.value = 1
+    dut.int16_mode.value = 0
+    dut.clamp_max.value = 127
     dut.acc_in.value = 0
     dut.in_valid.value = 0
     dut.bias.value = 0
@@ -55,8 +58,8 @@ async def push_and_wait(dut, acc, bias, M, S, zp, mode=MODE_CONV_REQ,
     dut.relu_en.value = int(relu_en)
     dut.bias_en.value = int(bias_en)
     dut.zp_en.value = int(zp_en)
-    dut.acc_in.value = to_signed(acc, 40)
-    dut.bias.value = to_signed(bias, 40)
+    dut.acc_in.value = to_signed(acc, len(dut.acc_in))
+    dut.bias.value = to_signed(bias, len(dut.bias))
     dut.mult_m.value = int(M) & 0x7FFF
     dut.shift_s.value = int(S) & 0x3F
     dut.zero_point.value = to_signed(zp, 16)
@@ -236,8 +239,8 @@ async def test_streaming_pipeline(dut):
         # Drive input
         if cycle < NUM_ELEMENTS:
             acc, bias, M, S, zp, _ = test_vectors[cycle]
-            dut.acc_in.value = to_signed(acc, 40)
-            dut.bias.value = to_signed(bias, 40)
+            dut.acc_in.value = to_signed(acc, len(dut.acc_in))
+            dut.bias.value = to_signed(bias, len(dut.bias))
             dut.mult_m.value = M & 0x7FFF
             dut.shift_s.value = S & 0x3F
             dut.zero_point.value = to_signed(zp, 16)
@@ -257,7 +260,7 @@ async def test_streaming_pipeline(dut):
                     # Debug: read internal pipeline state
                     s3_sh = from_signed(dut.s3_shifted.value, 17)
                     s3_m = int(dut.s3_mode.value)
-                    s2_pr = from_signed(dut.s2_product.value, 55)
+                    s2_pr = from_signed(dut.s2_product.value, len(dut.s2_product))
                     dut._log.warning(
                         f"cycle={cycle} result[{result_idx}]: got={val} expected={exp} "
                         f"s3_shifted={s3_sh} s3_mode={s3_m:02b} s2_product={s2_pr}")

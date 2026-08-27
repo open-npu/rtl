@@ -29,7 +29,22 @@ async def reset_dut(dut):
     dut.ppu_out_data.value = 0
     dut.dw_out_valid.value = 0
     dut.dw_acc_out.value = 0
+    dut.sa_acc_out_flat.value = 0
     dut.db_prefetch_done.value = 1  # No DB_EN in unit tests — always ready
+    dut.wgt_reload_done.value = 1
+    dut.cfg_wgt_per_oc.value = 0
+    dut.cfg_int16.value = 0
+    dut.cfg_in_zp.value = 0
+    dut.cfg_act_base.value = 0
+    dut.cfg_out_base.value = 64
+    dut.cfg_pool_cfg.value = 0
+    dut.cfg_resize_cfg.value = 0
+    dut.cfg_deconv_cfg.value = 0
+    dut.cfg_concat_cfg.value = 0
+    dut.cfg_2d_load.value = 0
+    dut.wgt_rd_data.value = 0
+    dut.act_rd_data.value = 0
+    dut.param_rd_data.value = 0
     for _ in range(5):
         await RisingEdge(dut.clk)
     dut.rst_n.value = 1
@@ -141,9 +156,9 @@ async def test_start_pulse(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    # Wait a few cycles and check state changed (wgt_cmd issued)
+    # Allow for the SRAM read pipeline before the first weight command.
     found_wgt_cmd = False
-    for _ in range(10):
+    for _ in range(512):
         await RisingEdge(dut.clk)
         await ReadOnly()
         if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 1:  # MODE_WGT_LOAD

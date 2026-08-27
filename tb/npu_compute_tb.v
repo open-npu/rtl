@@ -140,7 +140,11 @@ module npu_compute_tb #(
         .ACC_W        (ACC_W)
     ) u_compute (
         .clk(clk), .rst_n(rst_n),
-        .start(start), .done(done), .tile_done(tile_done), .db_prefetch_done(db_prefetch_done),
+        .start(start), .done(done), .tile_done(tile_done),
+        .oc_group_done(), .oc_group_out(),
+        .wgt_reload_done(1'b1), .cfg_wgt_per_oc(32'd0),
+        .db_prefetch_done(db_prefetch_done),
+        .tile_out_h_actual(), .tile_out_w_actual(),
         .cfg_op_type(cfg_op_type),
         .cfg_int16(cfg_int16),
         .cfg_in_c(cfg_in_c), .cfg_out_h(cfg_out_h), .cfg_out_w(cfg_out_w),
@@ -149,8 +153,11 @@ module npu_compute_tb #(
         .cfg_pad_top(cfg_pad_top), .cfg_pad_left(cfg_pad_left),
         .cfg_tile_h(cfg_tile_h), .cfg_tile_w(cfg_tile_w),
         .cfg_tile_num_h(cfg_tile_num_h), .cfg_tile_num_w(cfg_tile_num_w),
-        .cfg_in_w(cfg_in_w), .cfg_in_h(cfg_in_h),
+        .cfg_in_w(cfg_in_w), .cfg_in_h(cfg_in_h), .cfg_in_zp(16'sd0),
         .cfg_act_base(cfg_act_base), .cfg_out_base(cfg_out_base),
+        .cfg_pool_cfg(32'd0), .cfg_resize_cfg(32'd0),
+        .cfg_deconv_cfg(32'd0), .cfg_concat_cfg(32'd0),
+        .cfg_2d_load(1'b0),
         // SRAM
         .wgt_rd_en(wgt_rd_en), .wgt_rd_addr(wgt_rd_addr), .wgt_rd_data(wgt_rd_data),
         .act_rd_en(act_rd_en), .act_rd_addr(act_rd_addr), .act_rd_data(act_rd_data),

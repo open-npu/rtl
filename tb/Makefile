@@ -35,7 +35,7 @@ export PYTHONPATH := $(shell pwd):$(shell pwd)/golden:$(shell pwd)/unit:$(shell 
 ifneq ($(MODULE),)
   # Explicit MODULE override — use as-is
 else
-  _FOUND := $(shell find unit integration e2e robustness -name 'test_$(DUT).py' 2>/dev/null | head -1)
+  _FOUND := $(firstword $(wildcard unit/test_$(DUT).py integration/test_$(DUT).py e2e/test_$(DUT).py robustness/test_$(DUT).py))
   ifneq ($(_FOUND),)
     # Convert path like e2e/test_npu_dma_e2e.py → e2e.test_npu_dma_e2e
     MODULE = $(subst /,.,$(basename $(_FOUND)))
