@@ -3,4 +3,6 @@ tb/*.log
 tb/results.xml
 tb/sim_build/
 tb/golden/golden_dma_e2e/*_backup/
+tb/e2e/*_diag.py
 synth/stat_*.txt
+synth/*.log
