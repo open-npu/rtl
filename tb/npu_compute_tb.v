@@ -56,11 +56,12 @@ module npu_compute_tb #(
     // ─── SRAM Port B wires (compute engine side) ───
     wire                    wgt_rd_en;
     wire [WGT_ADDR_W-1:0]  wgt_rd_addr;
-    wire [31:0]             wgt_rd_data;
+    wire [`SRAM_B_WIDTH-1:0] wgt_rd_data;
 
     wire                    act_rd_en;
     wire [ACT_ADDR_W-1:0]  act_rd_addr;
-    wire [31:0]             act_rd_data;
+    wire                    act_rd_ofm;
+    wire [`SRAM_B_WIDTH-1:0] ifm_rd_data, ofm_rd_data, act_rd_data;
     wire                    act_wr_en;
     wire [ACT_ADDR_W-1:0]  act_wr_addr;
     wire [31:0]             act_wr_data;
@@ -76,9 +77,8 @@ module npu_compute_tb #(
     wire                                sa_wgt_valid;
     wire [DATA_W*ARRAY_SIZE-1:0]       sa_act_data_flat;
     wire                                sa_act_valid;
-    wire [$clog2(ARRAY_SIZE)-1:0]      sa_drain_col_sel;
-    wire [ACC_W*ARRAY_SIZE-1:0]        sa_acc_out_flat;
-    wire                                sa_acc_out_valid;
+    wire [ACC_W*ARRAY_SIZE-1:0]        sa_psum_out_flat;
+    wire                                sa_psum_out_valid;
     wire                                sa_busy, sa_ready;
 
     // ─── DW Conv wires ───
@@ -86,6 +86,9 @@ module npu_compute_tb #(
     wire signed [DATA_W-1:0]           dw_wgt_data, dw_in_data;
     wire signed [ACC_W-1:0]            dw_acc_out;
     wire                                dw_out_valid;
+    wire [ARRAY_SIZE-1:0]              dw_wgt_valid_w, dw_in_valid_w, dw_out_valid_w;
+    wire [DATA_W*ARRAY_SIZE-1:0]       dw_wgt_data_w, dw_in_data_w;
+    wire [ACC_W*ARRAY_SIZE-1:0]        dw_acc_w;
 
     // ─── PPU wires ───
     wire signed [ACC_W-1:0]            ppu_acc_in;
@@ -96,6 +99,12 @@ module npu_compute_tb #(
     wire signed [15:0]                 ppu_zero_point;
     wire signed [DATA_W-1:0]           ppu_out_data;
     wire                                ppu_out_valid;
+    wire [ACC_W*ARRAY_SIZE-1:0]        ppu_acc_w, ppu_bias_w;
+    wire [ARRAY_SIZE-1:0]              ppu_valid_w, ppu_vout_w;
+    wire [15*ARRAY_SIZE-1:0]           ppu_mult_w;
+    wire [6*ARRAY_SIZE-1:0]            ppu_shift_w;
+    wire [16*ARRAY_SIZE-1:0]           ppu_zp_w;
+    wire [DATA_W*ARRAY_SIZE-1:0]       ppu_out_w;
 
     // ═══════════════════════════════════════════════════════════════════
     // SRAMs (Port A unused here — would be DMA in full system)
@@ -103,7 +112,7 @@ module npu_compute_tb #(
     // For cocotb: use hierarchical access to write SRAM contents directly
     // ═══════════════════════════════════════════════════════════════════
 
-    npu_sram #(.DATA_W(32), .DEPTH(WGT_DEPTH)) u_sram_wgt (
+    npu_sram_wide #(.DEPTH(WGT_DEPTH)) u_sram_wgt (
         .clk(clk),
         .a_en(1'b0), .a_we(1'b0), .a_addr({WGT_ADDR_W{1'b0}}),
         .a_wdata(32'd0), .a_rdata(),
@@ -111,13 +120,28 @@ module npu_compute_tb #(
         .b_wdata(32'd0), .b_rdata(wgt_rd_data)
     );
 
-    npu_sram #(.DATA_W(32), .DEPTH(ACT_DEPTH)) u_sram_act (
+    // IFM: compute reads activations. Tests poke u_sram_act.mem[] for inputs.
+    npu_sram_wide #(.DEPTH(ACT_DEPTH)) u_sram_act (
         .clk(clk),
         .a_en(1'b0), .a_we(1'b0), .a_addr({ACT_ADDR_W{1'b0}}),
         .a_wdata(32'd0), .a_rdata(),
-        .b_en(act_rd_en | act_wr_en), .b_we(act_wr_en), .b_addr(act_wr_en ? act_wr_addr : act_rd_addr),
-        .b_wdata(act_wr_data), .b_rdata(act_rd_data)
+        .b_en(act_rd_en && !act_rd_ofm), .b_we(1'b0), .b_addr(act_rd_addr),
+        .b_wdata(32'd0), .b_rdata(ifm_rd_data)
     );
+
+    // OFM: compute writes results (+ RMW reads). Tests read u_sram_ofm.mem[].
+    npu_sram_wide #(.DEPTH(ACT_DEPTH)) u_sram_ofm (
+        .clk(clk),
+        .a_en(1'b0), .a_we(1'b0), .a_addr({ACT_ADDR_W{1'b0}}),
+        .a_wdata(32'd0), .a_rdata(),
+        .b_en((act_rd_en && act_rd_ofm) | act_wr_en),
+        .b_we(act_wr_en),
+        .b_addr(act_wr_en ? act_wr_addr : act_rd_addr),
+        .b_wdata(act_wr_data),
+        .b_rdata(ofm_rd_data)
+    );
+
+    assign act_rd_data = act_rd_ofm ? ofm_rd_data : ifm_rd_data;
 
     npu_sram #(.DATA_W(32), .DEPTH(PARAM_DEPTH)) u_sram_param (
         .clk(clk),
@@ -161,25 +185,32 @@ module npu_compute_tb #(
         // SRAM
         .wgt_rd_en(wgt_rd_en), .wgt_rd_addr(wgt_rd_addr), .wgt_rd_data(wgt_rd_data),
         .act_rd_en(act_rd_en), .act_rd_addr(act_rd_addr), .act_rd_data(act_rd_data),
+        .act_rd_ofm(act_rd_ofm),
         .act_wr_en(act_wr_en), .act_wr_addr(act_wr_addr), .act_wr_data(act_wr_data),
         .param_rd_en(param_rd_en), .param_rd_addr(param_rd_addr), .param_rd_data(param_rd_data),
         // Systolic
         .sa_cmd(sa_cmd), .sa_cmd_valid(sa_cmd_valid),
         .sa_wgt_data_flat(sa_wgt_data_flat), .sa_wgt_valid(sa_wgt_valid),
         .sa_act_data_flat(sa_act_data_flat), .sa_act_valid(sa_act_valid),
-        .sa_drain_col_sel(sa_drain_col_sel),
-        .sa_acc_out_flat(sa_acc_out_flat), .sa_acc_out_valid(sa_acc_out_valid),
+        .sa_psum_out_flat(sa_psum_out_flat), .sa_psum_out_valid(sa_psum_out_valid),
         .sa_busy(sa_busy), .sa_ready(sa_ready),
         // DW Conv
         .dw_wgt_load(dw_wgt_load), .dw_wgt_valid(dw_wgt_valid),
         .dw_wgt_data(dw_wgt_data), .dw_in_valid(dw_in_valid),
         .dw_in_data(dw_in_data), .dw_acc_clear(dw_acc_clear),
         .dw_acc_out(dw_acc_out), .dw_out_valid(dw_out_valid),
+        .dw_wgt_valid_w(dw_wgt_valid_w), .dw_wgt_data_w(dw_wgt_data_w),
+        .dw_in_valid_w(dw_in_valid_w), .dw_in_data_w(dw_in_data_w),
+        .dw_acc_w(dw_acc_w), .dw_out_valid_w(dw_out_valid_w),
         // PPU
         .ppu_acc_in(ppu_acc_in), .ppu_in_valid(ppu_in_valid),
         .ppu_bias(ppu_bias), .ppu_mult_m(ppu_mult_m),
         .ppu_shift_s(ppu_shift_s), .ppu_zero_point(ppu_zero_point),
-        .ppu_out_data(ppu_out_data), .ppu_out_valid(ppu_out_valid)
+        .ppu_out_data(ppu_out_data), .ppu_out_valid(ppu_out_valid),
+        .ppu_acc_w(ppu_acc_w), .ppu_valid_w(ppu_valid_w),
+        .ppu_bias_w(ppu_bias_w), .ppu_mult_w(ppu_mult_w),
+        .ppu_shift_w(ppu_shift_w), .ppu_zp_w(ppu_zp_w),
+        .ppu_out_w(ppu_out_w), .ppu_vout_w(ppu_vout_w)
     );
 
     // ═══════════════════════════════════════════════════════════════════
@@ -194,8 +225,7 @@ module npu_compute_tb #(
         .cmd(sa_cmd), .cmd_valid(sa_cmd_valid),
         .wgt_data_flat(sa_wgt_data_flat), .wgt_valid(sa_wgt_valid),
         .act_data_flat(sa_act_data_flat), .act_valid(sa_act_valid),
-        .drain_col_sel(sa_drain_col_sel),
-        .acc_out_flat(sa_acc_out_flat), .acc_out_valid(sa_acc_out_valid),
+        .psum_out_flat(sa_psum_out_flat), .psum_out_valid(sa_psum_out_valid),
         .busy(sa_busy), .ready(sa_ready)
     );
 
@@ -203,35 +233,48 @@ module npu_compute_tb #(
     // DW Conv Engine
     // ═══════════════════════════════════════════════════════════════════
 
-    npu_dw_conv #(
-        .DATA_W(DATA_W), .ACC_W(ACC_W), .MAX_KSZ(7)
-    ) u_dw_conv (
+    npu_dw_bank #(
+        .N(ARRAY_SIZE), .DATA_W(DATA_W), .ACC_W(ACC_W), .MAX_KSZ(16)
+    ) u_dw_bank (
         .clk(clk), .rst_n(rst_n),
         .kernel_h(cfg_kernel_h[3:0]), .kernel_w(cfg_kernel_w[3:0]),
-        .wgt_load(dw_wgt_load), .wgt_valid(dw_wgt_valid), .wgt_data(dw_wgt_data),
-        .in_valid(dw_in_valid), .in_data(dw_in_data), .acc_clear(dw_acc_clear),
-        .acc_out(dw_acc_out), .out_valid(dw_out_valid)
+        .wgt_load(dw_wgt_load),
+        .wgt_valid(dw_wgt_valid_w | {{(ARRAY_SIZE-1){1'b0}}, dw_wgt_valid}),
+        .wgt_data_flat(dw_wgt_data_w | {{(DATA_W*(ARRAY_SIZE-1)){1'b0}}, dw_wgt_data}),
+        .in_valid(dw_in_valid_w | {{(ARRAY_SIZE-1){1'b0}}, dw_in_valid}),
+        .in_data_flat(dw_in_data_w | {{(DATA_W*(ARRAY_SIZE-1)){1'b0}}, dw_in_data}),
+        .acc_clear(dw_acc_clear),
+        .acc_flat(dw_acc_w),
+        .out_valid(dw_out_valid_w)
     );
+    assign dw_acc_out   = dw_acc_w[ACC_W-1:0];
+    assign dw_out_valid = dw_out_valid_w[0];
 
     // ═══════════════════════════════════════════════════════════════════
     // PPU
     // ═══════════════════════════════════════════════════════════════════
 
-    npu_ppu #(
-        .ACC_W(ACC_W), .DATA_W(DATA_W),
+    npu_ppu_bank #(
+        .N(ARRAY_SIZE), .ACC_W(ACC_W), .DATA_W(DATA_W),
         .BIAS_W(`BIAS_WIDTH), .MULT_W(`PARAM_M_BITS),
         .SHIFT_W(`PARAM_S_BITS), .ZP_W(`PARAM_ZP_BITS)
-    ) u_ppu (
+    ) u_ppu_bank (
         .clk(clk), .rst_n(rst_n),
         .mode(ppu_mode),
         .relu_en(ppu_relu_en),
+        .relu6_en(1'b0),
         .bias_en(ppu_bias_en),
         .zp_en(ppu_zp_en),
         .int16_mode(cfg_int16),
-        .acc_in(ppu_acc_in), .in_valid(ppu_in_valid),
-        .bias(ppu_bias), .mult_m(ppu_mult_m),
-        .shift_s(ppu_shift_s), .zero_point(ppu_zero_point),
-        .out_data(ppu_out_data), .out_valid(ppu_out_valid)
+        .clamp_max(16'sd127),
+        .acc_wide(ppu_acc_w), .valid_wide(ppu_valid_w),
+        .bias_wide(ppu_bias_w), .mult_wide(ppu_mult_w),
+        .shift_wide(ppu_shift_w), .zp_wide(ppu_zp_w),
+        .acc_s(ppu_acc_in), .valid_s(ppu_in_valid),
+        .bias_s(ppu_bias), .mult_s(ppu_mult_m),
+        .shift_s(ppu_shift_s), .zp_s(ppu_zero_point),
+        .out_wide(ppu_out_w), .vout_wide(ppu_vout_w),
+        .out_s(ppu_out_data), .vout_s(ppu_out_valid)
     );
 
 endmodule

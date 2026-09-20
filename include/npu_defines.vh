@@ -8,7 +8,7 @@
 
 // ─── Array configuration ───
 `ifndef ARRAY_SIZE
-`define ARRAY_SIZE     16     // Systolic array dimension (N×N)
+`define ARRAY_SIZE     8      // Systolic array dimension (N×N); 16 via -DARRAY_SIZE=16
 `endif
 
 `ifndef SPAD_KB
@@ -20,7 +20,9 @@
 `define DW_CHANNELS    `ARRAY_SIZE
 
 // SRAM sizes (bytes) — for reference; actual depths derived in npu_top.v from SPAD_KB
-`define ACT_BANK_SIZE  (`SPAD_KB * 1024 / 4)   // Act SRAM = SPAD/4
+// Four blocks: IFM (read) + OFM (write) + Wgt + Param. IFM and OFM each use
+// the old Act depth so existing act_base/out_base addresses stay valid.
+`define ACT_BANK_SIZE  (`SPAD_KB * 1024 / 4)   // IFM or OFM = SPAD/4 each
 `define WEIGHT_BUF_SIZE (`SPAD_KB * 1024 / 2)  // Weight SRAM = SPAD/2
 `define PARAM_BUF_SIZE (`SPAD_KB * 1024 / 16)  // Param SRAM = SPAD/16
 
@@ -49,6 +51,10 @@
 `define WB_DATA_WIDTH  32     // Wishbone data bus width
 `define WB_ADDR_WIDTH  32     // Wishbone address bus width
 `define WB_SEL_WIDTH   4      // Wishbone byte select width
+`ifndef SRAM_B_WIDTH
+`define SRAM_B_WIDTH   256    // Compute-side act/wgt read width (8 × 32-bit words)
+`endif
+`define SRAM_B_WORDS   (`SRAM_B_WIDTH / 32)
 
 // ─── Register map base addresses ───
 `define CSR_BASE       12'h000  // Control & Status (Group 0)

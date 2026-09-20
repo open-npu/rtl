@@ -36,6 +36,7 @@ module ctrl_addr_tb;
         .dma_xfer_len(), .dma_busy(1'b0), .dma_done(1'b0),
         .compute_start(), .compute_done(1'b0), .oc_group_done(1'b0),
         .oc_group_idx(16'd0), .wgt_reload_done(), .dma_sram_sel(),
+        .act_role_swap(),
         .cfg_dma_in_addr(c_in_addr), .cfg_dma_out_addr(32'd0),
         .cfg_dma_wgt_addr(32'd0), .cfg_dma_param_addr(32'd0),
         .cfg_dma_in_size(32'd0), .cfg_dma_wgt_size(32'd0),

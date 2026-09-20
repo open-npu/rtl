@@ -1,10 +1,18 @@
 # Open-NPU RTL — cocotb Tests for npu_pe
 # SPDX-License-Identifier: Apache-2.0
+#
+# The PE is a link in a partial-sum chain, not a self-contained accumulator:
+#
+#     psum_out = psum_in + act_in * weight_reg
+#
+# Accumulation over the k dimension is done by chaining PEs down a column
+# inside npu_systolic, so there is no per-PE accumulator to drain and no
+# left-to-right activation passthrough (activations are broadcast within a row).
+
+import random
 
 import cocotb
-from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge, Timer
-import random
+from cocotb.triggers import ReadOnly, RisingEdge, Timer
 
 from utils.clock_reset import clock_reset
 from utils.csim_ref import pe_mac_reference
@@ -13,7 +21,8 @@ from utils.csim_ref import pe_mac_reference
 MODE_IDLE     = 0b00
 MODE_WGT_LOAD = 0b01
 MODE_COMPUTE  = 0b10
-MODE_DRAIN    = 0b11
+
+ACC_W = 44
 
 
 def int8_to_unsigned(val):
@@ -21,314 +30,174 @@ def int8_to_unsigned(val):
     return val & 0xFFFF
 
 
-def signed_acc(val, bits=40):
-    """Interpret unsigned value as signed with given bit width."""
+def to_unsigned_acc(val):
+    """Two's-complement encode a value onto the ACC_W-wide psum port."""
+    return val & ((1 << ACC_W) - 1)
+
+
+def signed_acc(val, bits=ACC_W):
+    """Interpret an unsigned port value as signed with the given width."""
     val = int(val) & ((1 << bits) - 1)
     if val >= (1 << (bits - 1)):
         val -= (1 << bits)
     return val
 
 
-@cocotb.test()
-async def test_weight_load(dut):
-    """Test: Load a weight value into the PE weight register."""
-    await clock_reset(dut)
-
-    # Load weight = 42
+async def load_weight(dut, weight):
     dut.mode.value = MODE_WGT_LOAD
     dut.valid_in.value = 1
-    dut.weight_in.value = int8_to_unsigned(42)
+    dut.weight_in.value = int8_to_unsigned(weight)
     dut.act_in.value = 0
+    dut.psum_in.value = 0
     await RisingEdge(dut.clk)
-
-    # Back to idle
     dut.mode.value = MODE_IDLE
     dut.valid_in.value = 0
     await RisingEdge(dut.clk)
 
-    # Verify: compute with act=1 should give acc=42
+
+async def mac(dut, act, psum_in=0):
+    """One COMPUTE cycle; returns the registered psum_out."""
     dut.mode.value = MODE_COMPUTE
     dut.valid_in.value = 1
-    dut.act_in.value = int8_to_unsigned(1)
+    dut.act_in.value = int8_to_unsigned(act)
+    dut.psum_in.value = to_unsigned_acc(psum_in)
     await RisingEdge(dut.clk)
-
     dut.mode.value = MODE_IDLE
     dut.valid_in.value = 0
     await RisingEdge(dut.clk)
+    return signed_acc(dut.psum_out.value)
 
-    # Drain
-    dut.mode.value = MODE_DRAIN
-    dut.valid_in.value = 1
-    await RisingEdge(dut.clk)
 
-    dut.valid_in.value = 0
-    dut.mode.value = MODE_IDLE
-    await RisingEdge(dut.clk)
-
-    acc_val = signed_acc(dut.acc_out.value)
-    assert acc_val == 42, f"Expected acc=42, got {acc_val}"
-    dut._log.info(f"PASS: weight_load — acc={acc_val}")
+@cocotb.test()
+async def test_weight_load(dut):
+    """A loaded weight is used by the next COMPUTE."""
+    await clock_reset(dut)
+    await load_weight(dut, 42)
+    got = await mac(dut, act=1, psum_in=0)
+    assert got == 42, f"Expected 42, got {got}"
 
 
 @cocotb.test()
 async def test_single_mac(dut):
-    """Test: Single MAC operation (act * weight)."""
+    """psum_out = act * weight when psum_in is zero."""
     await clock_reset(dut)
-
-    weight = -3
-    act = 7
-
-    # Load weight
-    dut.mode.value = MODE_WGT_LOAD
-    dut.valid_in.value = 1
-    dut.weight_in.value = int8_to_unsigned(weight)
-    dut.act_in.value = 0
-    await RisingEdge(dut.clk)
-
-    # Compute
-    dut.mode.value = MODE_COMPUTE
-    dut.act_in.value = int8_to_unsigned(act)
-    await RisingEdge(dut.clk)
-
-    # Drain
-    dut.mode.value = MODE_DRAIN
-    await RisingEdge(dut.clk)
-
-    dut.valid_in.value = 0
-    dut.mode.value = MODE_IDLE
-    await RisingEdge(dut.clk)
-
-    acc_val = signed_acc(dut.acc_out.value)
-    expected = act * weight  # 7 * (-3) = -21
-    assert acc_val == expected, f"Expected {expected}, got {acc_val}"
-    dut._log.info(f"PASS: single_mac — {act}*{weight}={acc_val}")
+    await load_weight(dut, -3)
+    got = await mac(dut, act=7, psum_in=0)
+    assert got == -21, f"Expected -21, got {got}"
 
 
 @cocotb.test()
-async def test_multi_mac_accumulate(dut):
-    """Test: Multiple MACs accumulate correctly (dot product)."""
+async def test_psum_passthrough_add(dut):
+    """psum_in is added to the product, not ignored."""
     await clock_reset(dut)
-
-    weight = 5
-    activations = [1, 2, 3, 4, 5, 6, 7, 8]
-    expected = pe_mac_reference(activations, weight)
-
-    # Load weight
-    dut.mode.value = MODE_WGT_LOAD
-    dut.valid_in.value = 1
-    dut.weight_in.value = int8_to_unsigned(weight)
-    dut.act_in.value = 0
-    await RisingEdge(dut.clk)
-
-    # Stream activations
-    dut.mode.value = MODE_COMPUTE
-    for act in activations:
-        dut.act_in.value = int8_to_unsigned(act)
-        await RisingEdge(dut.clk)
-
-    # Drain
-    dut.mode.value = MODE_DRAIN
-    await RisingEdge(dut.clk)
-
-    dut.valid_in.value = 0
-    dut.mode.value = MODE_IDLE
-    await RisingEdge(dut.clk)
-
-    acc_val = signed_acc(dut.acc_out.value)
-    assert acc_val == expected, f"Expected {expected}, got {acc_val}"
-    dut._log.info(f"PASS: multi_mac — dot([1..8], 5) = {acc_val}")
+    await load_weight(dut, 5)
+    got = await mac(dut, act=3, psum_in=1000)
+    assert got == 1015, f"Expected 1000 + 3*5 = 1015, got {got}"
 
 
 @cocotb.test()
 async def test_negative_values(dut):
-    """Test: MAC with negative activations and weights."""
+    """Sign handling across the INT8 extremes and a negative psum_in."""
     await clock_reset(dut)
+    await load_weight(dut, -128)
 
-    weight = -128  # min int8
-    activations = [-1, -2, 127, -128]
-    expected = pe_mac_reference(activations, weight)
-
-    # Load weight
-    dut.mode.value = MODE_WGT_LOAD
-    dut.valid_in.value = 1
-    dut.weight_in.value = int8_to_unsigned(weight)
-    dut.act_in.value = 0
-    await RisingEdge(dut.clk)
-
-    # Compute
-    dut.mode.value = MODE_COMPUTE
-    for act in activations:
-        dut.act_in.value = int8_to_unsigned(act)
-        await RisingEdge(dut.clk)
-
-    # Drain
-    dut.mode.value = MODE_DRAIN
-    await RisingEdge(dut.clk)
-
-    dut.valid_in.value = 0
-    dut.mode.value = MODE_IDLE
-    await RisingEdge(dut.clk)
-
-    acc_val = signed_acc(dut.acc_out.value)
-    assert acc_val == expected, f"Expected {expected}, got {acc_val}"
-    dut._log.info(f"PASS: negative_values — acc={acc_val}")
+    for act, psum_in in [(-1, 0), (127, -5000), (-128, 1 << 20)]:
+        expect = psum_in + act * (-128)
+        got = await mac(dut, act=act, psum_in=psum_in)
+        assert got == expect, \
+            f"act={act} psum_in={psum_in}: expected {expect}, got {got}"
 
 
 @cocotb.test()
-async def test_act_passthrough(dut):
-    """Test: Activation passes through to act_out during COMPUTE."""
+async def test_no_accumulation_across_cycles(dut):
+    """The PE holds no running sum: each COMPUTE depends only on psum_in.
+
+    This is what distinguishes the chained PE from the previous
+    output-stationary one, which accumulated internally and needed a drain.
+    """
     await clock_reset(dut)
+    await load_weight(dut, 10)
 
-    weight = 1
-    test_acts = [10, -20, 127, -128, 0]
-
-    # Load weight
-    dut.mode.value = MODE_WGT_LOAD
-    dut.valid_in.value = 1
-    dut.weight_in.value = int8_to_unsigned(weight)
-    dut.act_in.value = 0
-    await RisingEdge(dut.clk)
-
-    # Compute — check act_out follows act_in (1 cycle delayed)
-    dut.mode.value = MODE_COMPUTE
-    received = []
-    for act in test_acts:
-        dut.act_in.value = int8_to_unsigned(act)
-        await RisingEdge(dut.clk)
-        # Read act_out from previous cycle
-        if dut.act_valid_out.value:
-            out_raw = int(dut.act_out.value)
-            out_signed = out_raw if out_raw < 0x8000 else out_raw - 0x10000
-            received.append(out_signed)
-
-    # One more cycle to capture last value
-    dut.mode.value = MODE_IDLE
-    dut.valid_in.value = 0
-    await RisingEdge(dut.clk)
-    if dut.act_valid_out.value:
-        out_raw = int(dut.act_out.value)
-        out_signed = out_raw if out_raw < 0x8000 else out_raw - 0x10000
-        received.append(out_signed)
-
-    assert received == test_acts, f"act_out mismatch: expected {test_acts}, got {received}"
-    dut._log.info(f"PASS: act_passthrough — {received}")
+    first = await mac(dut, act=5, psum_in=0)
+    second = await mac(dut, act=5, psum_in=0)
+    assert first == 50, f"Expected 50, got {first}"
+    assert second == 50, \
+        f"PE accumulated across cycles: expected 50, got {second}"
 
 
 @cocotb.test()
-async def test_drain_clears_acc(dut):
-    """Test: Drain resets accumulator to zero."""
+async def test_idle_holds_psum(dut):
+    """IDLE must not disturb the registered psum_out."""
     await clock_reset(dut)
+    await load_weight(dut, 7)
+    held = await mac(dut, act=6, psum_in=0)
+    assert held == 42
 
-    weight = 10
-
-    # Load weight
-    dut.mode.value = MODE_WGT_LOAD
-    dut.valid_in.value = 1
-    dut.weight_in.value = int8_to_unsigned(weight)
-    dut.act_in.value = 0
-    await RisingEdge(dut.clk)
-
-    # Compute a few MACs
-    dut.mode.value = MODE_COMPUTE
-    for act in [5, 5, 5]:
-        dut.act_in.value = int8_to_unsigned(act)
+    dut.mode.value = MODE_IDLE
+    dut.valid_in.value = 0
+    dut.act_in.value = int8_to_unsigned(100)
+    dut.psum_in.value = to_unsigned_acc(999999)
+    for _ in range(5):
         await RisingEdge(dut.clk)
-
-    # Drain
-    dut.mode.value = MODE_DRAIN
-    await RisingEdge(dut.clk)
-    dut.mode.value = MODE_IDLE
-    dut.valid_in.value = 0
-    await RisingEdge(dut.clk)
-
-    first_drain = signed_acc(dut.acc_out.value)
-    assert first_drain == 150, f"First drain: expected 150, got {first_drain}"
-
-    # Now compute again — accumulator should start from 0
-    dut.mode.value = MODE_COMPUTE
-    dut.valid_in.value = 1
-    dut.act_in.value = int8_to_unsigned(1)
-    await RisingEdge(dut.clk)
-
-    # Drain again
-    dut.mode.value = MODE_DRAIN
-    await RisingEdge(dut.clk)
-    dut.mode.value = MODE_IDLE
-    dut.valid_in.value = 0
-    await RisingEdge(dut.clk)
-
-    second_drain = signed_acc(dut.acc_out.value)
-    assert second_drain == 10, f"Second drain: expected 10, got {second_drain}"
-    dut._log.info(f"PASS: drain_clears — first={first_drain}, second={second_drain}")
+    assert signed_acc(dut.psum_out.value) == 42, \
+        f"psum_out changed while idle: {signed_acc(dut.psum_out.value)}"
 
 
 @cocotb.test()
-async def test_random_dot_product(dut):
-    """Test: Random dot product — compare RTL vs Python golden."""
+async def test_psum_valid(dut):
+    """psum_valid_out tracks COMPUTE with valid_in, one cycle delayed."""
+    await clock_reset(dut)
+    await load_weight(dut, 3)
+
+    dut.mode.value = MODE_COMPUTE
+    dut.valid_in.value = 1
+    dut.act_in.value = int8_to_unsigned(4)
+    dut.psum_in.value = 0
+    await RisingEdge(dut.clk)
+    # Sample after the nonblocking updates have settled, not at the edge.
+    await ReadOnly()
+    assert dut.psum_valid_out.value == 1, "psum_valid_out not asserted"
+
+    await Timer(1, unit="step")
+    dut.valid_in.value = 0
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+    assert dut.psum_valid_out.value == 0, \
+        "psum_valid_out stuck high after valid_in dropped"
+
+
+@cocotb.test()
+async def test_chain_dot_product(dut):
+    """Feeding psum_out back as psum_in reproduces a full dot product.
+
+    This mimics what a column of chained PEs does spatially: PE r consumes the
+    partial sum from PE r-1. Doing it in time on a single PE lets us check the
+    arithmetic against the same reference the array uses.
+    """
     await clock_reset(dut)
 
     random.seed(42)
     weight = random.randint(-128, 127)
-    length = 64  # Simulate C_in=64
-    activations = [random.randint(-128, 127) for _ in range(length)]
+    activations = [random.randint(-128, 127) for _ in range(64)]
     expected = pe_mac_reference(activations, weight)
 
-    # Load weight
-    dut.mode.value = MODE_WGT_LOAD
-    dut.valid_in.value = 1
-    dut.weight_in.value = int8_to_unsigned(weight)
-    dut.act_in.value = 0
-    await RisingEdge(dut.clk)
+    await load_weight(dut, weight)
 
-    # Stream activations
-    dut.mode.value = MODE_COMPUTE
+    psum = 0
     for act in activations:
-        dut.act_in.value = int8_to_unsigned(act)
-        await RisingEdge(dut.clk)
+        psum = await mac(dut, act=act, psum_in=psum)
 
-    # Drain
-    dut.mode.value = MODE_DRAIN
-    await RisingEdge(dut.clk)
-    dut.valid_in.value = 0
-    dut.mode.value = MODE_IDLE
-    await RisingEdge(dut.clk)
-
-    acc_val = signed_acc(dut.acc_out.value)
-    assert acc_val == expected, f"Random dot product: expected {expected}, got {acc_val}"
-    dut._log.info(f"PASS: random_dot_product — weight={weight}, len={length}, acc={acc_val}")
+    assert psum == expected, f"Expected {expected}, got {psum}"
 
 
 @cocotb.test()
-async def test_large_accumulation(dut):
-    """Test: Large accumulation to verify no overflow in 40-bit acc."""
+async def test_wide_psum(dut):
+    """A psum_in near the ACC_W limit survives the add without truncation."""
     await clock_reset(dut)
+    await load_weight(dut, 127)
 
-    # Worst case: 512 multiplications of 127*127 = 8,258,048
-    # Fits easily in 40 bits (max ~549B)
-    weight = 127
-    activations = [127] * 512
-    expected = pe_mac_reference(activations, weight)
-
-    # Load weight
-    dut.mode.value = MODE_WGT_LOAD
-    dut.valid_in.value = 1
-    dut.weight_in.value = int8_to_unsigned(weight)
-    dut.act_in.value = 0
-    await RisingEdge(dut.clk)
-
-    # Stream 512 activations
-    dut.mode.value = MODE_COMPUTE
-    for act in activations:
-        dut.act_in.value = int8_to_unsigned(act)
-        await RisingEdge(dut.clk)
-
-    # Drain
-    dut.mode.value = MODE_DRAIN
-    await RisingEdge(dut.clk)
-    dut.valid_in.value = 0
-    dut.mode.value = MODE_IDLE
-    await RisingEdge(dut.clk)
-
-    acc_val = signed_acc(dut.acc_out.value)
-    assert acc_val == expected, f"Large acc: expected {expected}, got {acc_val}"
-    dut._log.info(f"PASS: large_accumulation — 512×(127×127)={acc_val}")
+    # Leave headroom for one 127*127 product below the 44-bit signed max.
+    big = (1 << (ACC_W - 1)) - 1 - (127 * 127)
+    got = await mac(dut, act=127, psum_in=big)
+    assert got == big + 127 * 127, \
+        f"Expected {big + 127*127}, got {got}"

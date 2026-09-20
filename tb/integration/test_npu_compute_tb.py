@@ -56,21 +56,25 @@ def set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1,
 
 def write_sram_word(dut, bank, addr, data):
     """Write a 32-bit word to an SRAM bank's memory array directly.
-    bank: 'wgt', 'act', 'param'
+    bank: 'wgt', 'act' (IFM), 'ofm', 'param'
     """
     if bank == 'wgt':
         dut.u_sram_wgt.mem[addr].value = data
     elif bank == 'act':
         dut.u_sram_act.mem[addr].value = data
+    elif bank == 'ofm':
+        dut.u_sram_ofm.mem[addr].value = data
     elif bank == 'param':
         dut.u_sram_param.mem[addr].value = data
 
 
 def read_sram_word(dut, bank, addr):
-    """Read a 32-bit word from SRAM memory array."""
+    """Read a 32-bit word from SRAM. 'act' reads OFM (compute writeback)."""
     if bank == 'wgt':
         return int(dut.u_sram_wgt.mem[addr].value)
-    elif bank == 'act':
+    elif bank == 'act' or bank == 'ofm':
+        return int(dut.u_sram_ofm.mem[addr].value)
+    elif bank == 'ifm':
         return int(dut.u_sram_act.mem[addr].value)
     elif bank == 'param':
         return int(dut.u_sram_param.mem[addr].value)
@@ -163,19 +167,24 @@ async def test_weight_load_4x4(dut):
 
 
 @cocotb.test()
-async def test_act_stream_4x4(dut):
-    """Verify activation streaming produces k_depth act_valid pulses."""
+async def test_act_vector_single_pulse(dut):
+    """One (pixel, pass) presents the whole k-vector in a single act_valid cycle.
+
+    The array reduces down its psum chain, so the feed is one ROWS-wide vector
+    per cycle rather than one scalar per cycle. For a single-pixel 1x1 conv with
+    k_depth=4 that means exactly one pulse, carrying the 4 k-slots in lanes 0..3
+    and zeros above.
+    """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
     ARRAY_SIZE = get_array_size(dut)
     k_depth = 4  # 1*1*4
+    acts = (10, 20, 30, 40)
 
-    # Load weights (any values)
     for i in range(ARRAY_SIZE):
         write_sram_word(dut, 'wgt', i, pack_i8x4(1, 1, 1, 1))
-    # Load activations: 4 bytes = 1 word
-    write_sram_word(dut, 'act', 0, pack_i8x4(10, 20, 30, 40))
+    write_sram_word(dut, 'act', 0, pack_i8x4(*acts))
 
     set_cfg(dut, in_c=4, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
@@ -183,8 +192,8 @@ async def test_act_stream_4x4(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    # Wait for act phase and count act_valid
     act_valid_count = 0
+    vectors = []
     in_compute = False
     for _ in range(500):
         await RisingEdge(dut.clk)
@@ -195,28 +204,39 @@ async def test_act_stream_4x4(dut):
             in_compute = True
         if in_compute and int(dut.u_compute.sa_act_valid.value) == 1:
             act_valid_count += 1
-        # Stop at DRAIN
-        if in_compute and cmd_v == 1 and cmd == 3:
+            flat = int(dut.sa_act_data_flat.value)
+            vectors.append([
+                (flat >> (16 * lane)) & 0xFFFF for lane in range(ARRAY_SIZE)
+            ])
+        if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert act_valid_count == k_depth, \
-        f"Expected {k_depth} act_valid pulses, got {act_valid_count}"
+    assert act_valid_count == 1, \
+        f"Expected 1 act_valid pulse for one pixel, got {act_valid_count}"
+    vec = vectors[0]
+    assert vec[:k_depth] == list(acts), \
+        f"Expected k-slots {list(acts)} in lanes 0..{k_depth-1}, got {vec[:k_depth]}"
+    assert all(v == 0 for v in vec[k_depth:]), \
+        f"Lanes beyond k_depth must be zero, got {vec[k_depth:]}"
 
 
 @cocotb.test()
-async def test_drain_sequence(dut):
-    """Verify drain issues ARRAY_SIZE DRAIN commands."""
+async def test_psum_vector_per_pixel(dut):
+    """The array emits one full result vector per (pixel, pass), not per column.
+
+    Replaces the old per-column drain sequence: there is no MODE_DRAIN and no
+    drain_col_sel any more. A single-pixel single-pass conv must therefore
+    produce exactly one psum_out_valid cycle.
+    """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
     ARRAY_SIZE = get_array_size(dut)
 
-    # Load weights and activations
     for i in range(ARRAY_SIZE):
         write_sram_word(dut, 'wgt', i, pack_i8x4(1, 0, 0, 0))
     write_sram_word(dut, 'act', 0, pack_i8x4(1, 0, 0, 0))
-    # Load params (zero params — passthrough mode)
     for ch in range(ARRAY_SIZE):
         base = ch * 4
         write_sram_word(dut, 'param', base + 0, 0x00010000)  # M=1, S=0
@@ -224,7 +244,6 @@ async def test_drain_sequence(dut):
         write_sram_word(dut, 'param', base + 2, 0x00000000)  # bias_mid
         write_sram_word(dut, 'param', base + 3, 0x00000000)  # bias_hi
 
-    # Use passthrough mode to avoid PPU complexity
     dut.ppu_mode.value = 3  # PASSTHROUGH
     dut.ppu_bias_en.value = 0
     dut.ppu_zp_en.value = 0
@@ -235,25 +254,28 @@ async def test_drain_sequence(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    # Count drain commands
-    drain_count = 0
-    drain_cols = set()
-    for _ in range(20000):
+    psum_valid_count = 0
+    feed_cycle = None
+    result_cycle = None
+    for cyc in range(20000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        cmd_v = int(dut.u_compute.sa_cmd_valid.value)
-        cmd = int(dut.u_compute.sa_cmd.value)
-        if cmd_v == 1 and cmd == 3:  # MODE_DRAIN
-            drain_count += 1
-            drain_cols.add(int(dut.u_compute.sa_drain_col_sel.value))
+        if int(dut.u_compute.sa_act_valid.value) == 1 and feed_cycle is None:
+            feed_cycle = cyc
+        if int(dut.sa_psum_out_valid.value) == 1:
+            psum_valid_count += 1
+            if result_cycle is None:
+                result_cycle = cyc
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert drain_count == ARRAY_SIZE, \
-        f"Expected {ARRAY_SIZE} drain commands, got {drain_count}"
-    assert drain_cols == set(range(ARRAY_SIZE)), \
-        f"Expected drain cols {{0..{ARRAY_SIZE-1}}}, got {drain_cols}"
+    assert psum_valid_count == 1, \
+        f"Expected 1 psum result vector for one pixel, got {psum_valid_count}"
+    # The result leaves the bottom of the chain ROWS cycles after the feed.
+    latency = result_cycle - feed_cycle
+    assert latency == ARRAY_SIZE, \
+        f"Expected psum latency of {ARRAY_SIZE} cycles, got {latency}"
 
 
 @cocotb.test()
@@ -887,19 +909,17 @@ async def test_dw_conv_3x3_with_padding(dut):
 
 @cocotb.test()
 async def test_conv1x1_kdepth_32(dut):
-    """Conv 1x1 with k_depth=32 (2 passes). 1 pixel, verify dot product.
+    """Conv 1x1 with k_depth=2*ARRAY_SIZE (2 passes). 1 pixel, verify dot product.
 
-    ARRAY_SIZE=16, in_c=32, kh=1, kw=1 → k_depth=32, k_pass_max=1.
-    All weights=1, activations=[1..32].
-    Expected dot product = sum(1..32) = 528.
-    The PPU saturates this to signed INT8 maximum 127.
+    in_c = 2*ARRAY_SIZE, kh=1, kw=1 → two k_passes.
+    All weights=1, activations=[1..in_c].
+    Expected dot product = sum(1..in_c); PPU saturates INT8 to 127.
     """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
     ARRAY_SIZE = get_array_size(dut)
-    in_c = 32  # 2x ARRAY_SIZE
-    assert ARRAY_SIZE == 16, f"Test assumes ARRAY_SIZE=16, got {ARRAY_SIZE}"
+    in_c = ARRAY_SIZE * 2
 
     # Weights: all ones. Layout: col c at words [c*32/4 .. c*32/4 + 7]
     # Each column has 32 weights (k_depth=32), packed 4 per word = 8 words/col

@@ -5,7 +5,7 @@
 //   - CSR (Wishbone slave for CPU configuration)
 //   - Controller (layer sequencer FSM)
 //   - DMA (Wishbone master for external memory)
-//   - SRAMs: activation, weight, parameter (dual-port)
+//   - SRAMs: IFM, OFM, weight, parameter (dual-port)
 //   - Systolic Array (weight-stationary N×N)
 //   - DW Convolution Engine
 //   - PPU (post-processing unit)
@@ -23,7 +23,8 @@ module npu_top #(
     parameter ARRAY_SIZE = `ARRAY_SIZE,
     parameter SPAD_KB    = `SPAD_KB,
     // SRAM depths (words) — derived from SPAD_KB
-    // Allocation: Act=SPAD/4, Wgt=SPAD/2, Param=SPAD/16 (SPAD/16 unused for future)
+    // Allocation: IFM=SPAD/4, OFM=SPAD/4, Wgt=SPAD/2, Param=SPAD/16
+    // IFM and OFM each keep the old Act depth so act_base/out_base match.
     parameter ACT_DEPTH   = SPAD_KB * 64,     // SPAD_KB * 1024 / 4 bytes / 4 B/word
     parameter WGT_DEPTH   = SPAD_KB * 128,    // SPAD_KB * 1024 / 2 bytes / 4 B/word
     parameter PARAM_DEPTH = SPAD_KB * 16      // SPAD_KB * 1024 / 16 bytes / 4 B/word
@@ -120,6 +121,7 @@ module npu_top #(
     wire        oc_group_done, wgt_reload_done;
     wire [15:0] oc_group_idx;
     wire [1:0]  dma_sram_sel;
+    wire        act_role_swap;
 
     // --- DMA ↔ SRAM MUX ---
     wire        dma_sram_en, dma_sram_we;
@@ -265,6 +267,7 @@ module npu_top #(
         .oc_group_idx   (oc_group_idx),
         .wgt_reload_done(wgt_reload_done),
         .dma_sram_sel   (dma_sram_sel),
+        .act_role_swap  (act_role_swap),
         // Layer configuration from CSR
         .cfg_dma_in_addr    (reg_dma_in_addr),
         .cfg_dma_out_addr   (reg_dma_out_addr),
@@ -374,18 +377,26 @@ module npu_top #(
     localparam WGT_ADDR_W   = $clog2(WGT_DEPTH);
     localparam PARAM_ADDR_W = $clog2(PARAM_DEPTH);
 
-    // --- Activation SRAM ---
-    // Port A: DMA access (load input / store output)
-    // Port B: Compute engine read + write (output writeback)
+    // --- IFM / OFM SRAMs (phys0 = u_sram_act, phys1 = u_sram_ofm) ---
+    // Port A: 32-bit DMA (load → IFM, store → OFM; concat preload → OFM)
+    // Port B: IFM 256-bit read; OFM 256-bit RMW read + 32-bit write
+    // act_role_swap swaps the two physical banks so a fused next layer
+    // reads the previous OFM without a memcpy.
     wire                    act_a_en, act_a_we;
     wire [ACT_ADDR_W-1:0]  act_a_addr;
     wire [31:0]             act_a_wdata, act_a_rdata;
+    wire                    ofm_a_en, ofm_a_we;
+    wire [ACT_ADDR_W-1:0]  ofm_a_addr;
+    wire [31:0]             ofm_a_wdata, ofm_a_rdata;
     wire                    act_b_en;
     wire [ACT_ADDR_W-1:0]  act_b_addr;
-    wire [31:0]             act_b_rdata;
+    wire [`SRAM_B_WIDTH-1:0] act_b_rdata;
+    wire                    ofm_b_en;
+    wire [ACT_ADDR_W-1:0]  ofm_b_addr;
+    wire [`SRAM_B_WIDTH-1:0] ofm_b_rdata;
+    wire                    act_phys0_b_we, ofm_phys1_b_we;
 
-    npu_sram #(
-        .DATA_W (32),
+    npu_sram_wide #(
         .DEPTH  (ACT_DEPTH)
     ) u_sram_act (
         .clk    (clk),
@@ -395,24 +406,39 @@ module npu_top #(
         .a_wdata(act_a_wdata),
         .a_rdata(act_a_rdata),
         .b_en   (act_b_en),
-        .b_we   (act_b_wr_en),
+        .b_we   (act_phys0_b_we),
         .b_addr (act_b_addr),
         .b_wdata(act_b_wr_data),
         .b_rdata(act_b_rdata)
     );
 
+    npu_sram_wide #(
+        .DEPTH  (ACT_DEPTH)
+    ) u_sram_ofm (
+        .clk    (clk),
+        .a_en   (ofm_a_en),
+        .a_we   (ofm_a_we),
+        .a_addr (ofm_a_addr),
+        .a_wdata(ofm_a_wdata),
+        .a_rdata(ofm_a_rdata),
+        .b_en   (ofm_b_en),
+        .b_we   (ofm_phys1_b_we),
+        .b_addr (ofm_b_addr),
+        .b_wdata(act_b_wr_data),
+        .b_rdata(ofm_b_rdata)
+    );
+
     // --- Weight SRAM ---
-    // Port A: DMA access (load weights)
-    // Port B: Compute engine read
+    // Port A: 32-bit DMA access (load weights)
+    // Port B: 256-bit compute read
     wire                    wgt_a_en, wgt_a_we;
     wire [WGT_ADDR_W-1:0]  wgt_a_addr;
     wire [31:0]             wgt_a_wdata, wgt_a_rdata;
     wire                    wgt_b_en;
     wire [WGT_ADDR_W-1:0]  wgt_b_addr;
-    wire [31:0]             wgt_b_rdata;
+    wire [`SRAM_B_WIDTH-1:0] wgt_b_rdata;
 
-    npu_sram #(
-        .DATA_W (32),
+    npu_sram_wide #(
         .DEPTH  (WGT_DEPTH)
     ) u_sram_wgt (
         .clk    (clk),
@@ -461,9 +487,9 @@ module npu_top #(
     //
     // The controller drives DMA with a direction and phase.
     // During weight load: DMA writes to weight SRAM
-    // During act load: DMA writes to activation SRAM
+    // During act load: DMA writes to IFM
     // During param load: DMA writes to parameter SRAM
-    // During output store: DMA reads from activation SRAM
+    // During output store: DMA reads from OFM
     //
     // We use the controller's FSM state (exposed via dma_dir and the
     // address range) to select which SRAM the DMA connects to.
@@ -494,11 +520,19 @@ module npu_top #(
             dma_bank_sel <= dma_sram_sel;  // latch at start, takes effect next cycle
     end
 
-    // Route DMA SRAM signals to correct bank
-    assign act_a_en    = dma_sram_en && (dma_bank_sel == 2'd1);
+    // Logical IFM/OFM Port A (DMA). act_role_swap maps them onto phys0/phys1.
+    wire ifm_dma_en = dma_sram_en && (dma_bank_sel == 2'd1);
+    wire ofm_dma_en = dma_sram_en && (dma_bank_sel == 2'd3);
+
+    assign act_a_en    = act_role_swap ? ofm_dma_en : ifm_dma_en;
     assign act_a_we    = dma_sram_we;
     assign act_a_addr  = dma_sram_addr_o[ACT_ADDR_W-1:0];
     assign act_a_wdata = dma_sram_wdata;
+
+    assign ofm_a_en    = act_role_swap ? ifm_dma_en : ofm_dma_en;
+    assign ofm_a_we    = dma_sram_we;
+    assign ofm_a_addr  = dma_sram_addr_o[ACT_ADDR_W-1:0];
+    assign ofm_a_wdata = dma_sram_wdata;
 
     assign wgt_a_en    = dma_sram_en && (dma_bank_sel == 2'd0);
     assign wgt_a_we    = dma_sram_we;
@@ -510,10 +544,11 @@ module npu_top #(
     assign param_a_addr  = dma_sram_addr_o[PARAM_ADDR_W-1:0];
     assign param_a_wdata = dma_sram_wdata;
 
-    // DMA read data mux (for store direction)
+    // DMA read data mux (store reads OFM = sel 3)
+    wire [31:0] ofm_dma_rdata = act_role_swap ? act_a_rdata : ofm_a_rdata;
     assign dma_sram_rdata = (dma_bank_sel == 2'd0) ? wgt_a_rdata :
                             (dma_bank_sel == 2'd2) ? param_a_rdata :
-                                                     act_a_rdata;
+                                                     ofm_dma_rdata;
 
     // ════════════════════════════════════════════════════════════════════
     // Systolic Array
@@ -526,9 +561,8 @@ module npu_top #(
     wire                          sa_wgt_valid;
     wire [`DATA_WIDTH*ARRAY_SIZE-1:0] sa_act_data_flat;
     wire                          sa_act_valid;
-    wire [$clog2(ARRAY_SIZE)-1:0] sa_drain_col_sel;
-    wire [`ACC_WIDTH*ARRAY_SIZE-1:0]  sa_acc_out_flat;
-    wire                          sa_acc_out_valid;
+    wire [`ACC_WIDTH*ARRAY_SIZE-1:0]  sa_psum_out_flat;
+    wire                          sa_psum_out_valid;
     wire                          sa_busy, sa_ready;
 
     npu_systolic #(
@@ -545,9 +579,8 @@ module npu_top #(
         .wgt_valid      (sa_wgt_valid),
         .act_data_flat  (sa_act_data_flat),
         .act_valid      (sa_act_valid),
-        .drain_col_sel  (sa_drain_col_sel),
-        .acc_out_flat   (sa_acc_out_flat),
-        .acc_out_valid  (sa_acc_out_valid),
+        .psum_out_flat  (sa_psum_out_flat),
+        .psum_out_valid (sa_psum_out_valid),
         .busy           (sa_busy),
         .ready          (sa_ready)
     );
@@ -565,24 +598,31 @@ module npu_top #(
     wire signed [`DATA_WIDTH-1:0] dw_in_data;
     wire                          dw_acc_clear;
 
-    npu_dw_conv #(
+    wire [ARRAY_SIZE-1:0]          dw_wgt_valid_w, dw_in_valid_w, dw_out_valid_w;
+    wire [`DATA_WIDTH*ARRAY_SIZE-1:0] dw_wgt_data_w, dw_in_data_w;
+    wire [`ACC_WIDTH*ARRAY_SIZE-1:0]  dw_acc_w;
+
+    npu_dw_bank #(
+        .N       (ARRAY_SIZE),
         .DATA_W  (`DATA_WIDTH),
         .ACC_W   (`ACC_WIDTH),
         .MAX_KSZ (16)
-    ) u_dw_conv (
-        .clk        (clk),
-        .rst_n      (engine_rst_n),
-        .kernel_h   (reg_kernel_size[3:0]),
-        .kernel_w   (reg_kernel_size[11:8]),
-        .wgt_load   (dw_wgt_load),
-        .wgt_valid  (dw_wgt_valid),
-        .wgt_data   (dw_wgt_data),
-        .in_valid   (dw_in_valid),
-        .in_data    (dw_in_data),
-        .acc_clear  (dw_acc_clear),
-        .acc_out    (dw_acc_out),
-        .out_valid  (dw_out_valid)
+    ) u_dw_bank (
+        .clk          (clk),
+        .rst_n        (engine_rst_n),
+        .kernel_h     (reg_kernel_size[3:0]),
+        .kernel_w     (reg_kernel_size[11:8]),
+        .wgt_load     (dw_wgt_load),
+        .wgt_valid    (dw_wgt_valid_w | {{(ARRAY_SIZE-1){1'b0}}, dw_wgt_valid}),
+        .wgt_data_flat(dw_wgt_data_w | {{(`DATA_WIDTH*(ARRAY_SIZE-1)){1'b0}}, dw_wgt_data}),
+        .in_valid     (dw_in_valid_w | {{(ARRAY_SIZE-1){1'b0}}, dw_in_valid}),
+        .in_data_flat (dw_in_data_w | {{(`DATA_WIDTH*(ARRAY_SIZE-1)){1'b0}}, dw_in_data}),
+        .acc_clear    (dw_acc_clear),
+        .acc_flat     (dw_acc_w),
+        .out_valid    (dw_out_valid_w)
     );
+    assign dw_acc_out   = dw_acc_w[`ACC_WIDTH-1:0];
+    assign dw_out_valid = dw_out_valid_w[0];
 
     // ════════════════════════════════════════════════════════════════════
     // PPU — Post-Processing Unit (single lane)
@@ -597,14 +637,22 @@ module npu_top #(
     wire [`PARAM_S_BITS-1:0]      ppu_shift_s;
     wire signed [`PARAM_ZP_BITS-1:0] ppu_zero_point;
 
-    npu_ppu #(
+    wire [`ACC_WIDTH*ARRAY_SIZE-1:0]  ppu_acc_w, ppu_bias_w;
+    wire [ARRAY_SIZE-1:0]              ppu_valid_w, ppu_vout_w;
+    wire [15*ARRAY_SIZE-1:0]           ppu_mult_w;
+    wire [6*ARRAY_SIZE-1:0]            ppu_shift_w;
+    wire [16*ARRAY_SIZE-1:0]           ppu_zp_w;
+    wire [`DATA_WIDTH*ARRAY_SIZE-1:0] ppu_out_w;
+
+    npu_ppu_bank #(
+        .N       (ARRAY_SIZE),
         .ACC_W   (`ACC_WIDTH),
         .DATA_W  (`DATA_WIDTH),
         .BIAS_W  (`BIAS_WIDTH),
         .MULT_W  (`PARAM_M_BITS),
         .SHIFT_W (`PARAM_S_BITS),
         .ZP_W    (`PARAM_ZP_BITS)
-    ) u_ppu (
+    ) u_ppu_bank (
         .clk        (clk),
         .rst_n      (engine_rst_n),
         .mode       (reg_post_ctrl[1:0]),
@@ -614,14 +662,22 @@ module npu_top #(
         .zp_en      (reg_post_ctrl[5]),
         .int16_mode (reg_post_ctrl[7]),
         .clamp_max  (reg_post_clamp[`PARAM_ZP_BITS-1:0]),
-        .acc_in     (ppu_acc_in),
-        .in_valid   (ppu_in_valid),
-        .bias       (ppu_bias),
-        .mult_m     (ppu_mult_m),
+        .acc_wide   (ppu_acc_w),
+        .valid_wide (ppu_valid_w),
+        .bias_wide  (ppu_bias_w),
+        .mult_wide  (ppu_mult_w),
+        .shift_wide (ppu_shift_w),
+        .zp_wide    (ppu_zp_w),
+        .acc_s      (ppu_acc_in),
+        .valid_s    (ppu_in_valid),
+        .bias_s     (ppu_bias),
+        .mult_s     (ppu_mult_m),
         .shift_s    (ppu_shift_s),
-        .zero_point (ppu_zero_point),
-        .out_data   (ppu_out_data),
-        .out_valid  (ppu_out_valid)
+        .zp_s       (ppu_zero_point),
+        .out_wide   (ppu_out_w),
+        .vout_wide  (ppu_vout_w),
+        .out_s      (ppu_out_data),
+        .vout_s     (ppu_out_valid)
     );
 
     // ════════════════════════════════════════════════════════════════════
@@ -634,6 +690,8 @@ module npu_top #(
     wire [31:0] act_b_wr_data;
     wire        act_b_rd_en;
     wire [ACT_ADDR_W-1:0] act_b_rd_addr;
+    wire        act_rd_ofm;
+    wire [`SRAM_B_WIDTH-1:0] act_rd_mux;
 
     // Compute engine handles full pipeline (compute + PPU + writeback) internally
     assign compute_done = compute_done_w;
@@ -690,7 +748,8 @@ module npu_top #(
         // Activation SRAM Port B
         .act_rd_en      (act_b_rd_en),
         .act_rd_addr    (act_b_rd_addr),
-        .act_rd_data    (act_b_rdata),
+        .act_rd_data    (act_rd_mux),
+        .act_rd_ofm     (act_rd_ofm),
         .act_wr_en      (act_b_wr_en),
         .act_wr_addr    (act_b_wr_addr),
         .act_wr_data    (act_b_wr_data),
@@ -705,9 +764,8 @@ module npu_top #(
         .sa_wgt_valid   (sa_wgt_valid),
         .sa_act_data_flat(sa_act_data_flat),
         .sa_act_valid   (sa_act_valid),
-        .sa_drain_col_sel(sa_drain_col_sel),
-        .sa_acc_out_flat (sa_acc_out_flat),
-        .sa_acc_out_valid(sa_acc_out_valid),
+        .sa_psum_out_flat (sa_psum_out_flat),
+        .sa_psum_out_valid(sa_psum_out_valid),
         .sa_busy        (sa_busy),
         .sa_ready       (sa_ready),
         // DW Conv
@@ -719,6 +777,12 @@ module npu_top #(
         .dw_acc_clear   (dw_acc_clear),
         .dw_acc_out     (dw_acc_out),
         .dw_out_valid   (dw_out_valid),
+        .dw_wgt_valid_w (dw_wgt_valid_w),
+        .dw_wgt_data_w  (dw_wgt_data_w),
+        .dw_in_valid_w  (dw_in_valid_w),
+        .dw_in_data_w   (dw_in_data_w),
+        .dw_acc_w       (dw_acc_w),
+        .dw_out_valid_w (dw_out_valid_w),
         // PPU
         .ppu_acc_in     (ppu_acc_in),
         .ppu_in_valid   (ppu_in_valid),
@@ -728,6 +792,14 @@ module npu_top #(
         .ppu_zero_point (ppu_zero_point),
         .ppu_out_data   (ppu_out_data),
         .ppu_out_valid  (ppu_out_valid),
+        .ppu_acc_w      (ppu_acc_w),
+        .ppu_valid_w    (ppu_valid_w),
+        .ppu_bias_w     (ppu_bias_w),
+        .ppu_mult_w     (ppu_mult_w),
+        .ppu_shift_w    (ppu_shift_w),
+        .ppu_zp_w       (ppu_zp_w),
+        .ppu_out_w      (ppu_out_w),
+        .ppu_vout_w     (ppu_vout_w),
         // DB_EN
         .tile_done          (tile_done),
         .oc_group_done      (oc_group_done),
@@ -739,10 +811,23 @@ module npu_top #(
         .tile_out_w_actual  (tile_out_w_actual)
     );
 
-    // ─── SRAM Port B connections (compute engine) ───
-    // Activation SRAM Port B: needs both read and write for compute
-    assign act_b_en   = act_b_rd_en | act_b_wr_en;
-    assign act_b_addr = act_b_wr_en ? act_b_wr_addr : act_b_rd_addr;
+    // ─── SRAM Port B: IFM read ∥ OFM write (and OFM RMW read) ───
+    // Logical IFM = phys0 when !swap, phys1 when swap.
+    wire ifm_b_en = act_b_rd_en && !act_rd_ofm;
+    wire ofm_b_en_log = (act_b_rd_en && act_rd_ofm) || act_b_wr_en;
+    wire [ACT_ADDR_W-1:0] ofm_b_addr_log = act_b_wr_en ? act_b_wr_addr : act_b_rd_addr;
+
+    assign act_b_en        = act_role_swap ? ofm_b_en_log : ifm_b_en;
+    assign act_phys0_b_we  = act_role_swap ? act_b_wr_en : 1'b0;
+    assign act_b_addr      = act_role_swap ? ofm_b_addr_log : act_b_rd_addr;
+
+    assign ofm_b_en        = act_role_swap ? ifm_b_en : ofm_b_en_log;
+    assign ofm_phys1_b_we  = act_role_swap ? 1'b0 : act_b_wr_en;
+    assign ofm_b_addr      = act_role_swap ? act_b_rd_addr : ofm_b_addr_log;
+
+    wire [`SRAM_B_WIDTH-1:0] ifm_b_rdata = act_role_swap ? ofm_b_rdata : act_b_rdata;
+    wire [`SRAM_B_WIDTH-1:0] ofm_b_rdata_log = act_role_swap ? act_b_rdata : ofm_b_rdata;
+    assign act_rd_mux = act_rd_ofm ? ofm_b_rdata_log : ifm_b_rdata;
 
 `ifdef VCD_TRACE
 // Minimal VCD: 6 scalar signals only

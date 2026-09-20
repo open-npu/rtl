@@ -52,7 +52,8 @@ module npu_ctrl #(
     output reg          wgt_reload_done, // Weight reload for next oc_group complete
 
     // ─── DMA Bank Select (explicit, replaces address compare in npu_top) ───
-    output reg  [1:0]   dma_sram_sel,    // 0=weight, 1=activation, 2=param
+    output reg  [1:0]   dma_sram_sel,    // 0=weight, 1=IFM, 2=param, 3=OFM
+    output reg          act_role_swap,   // 1 = IFM/OFM physical banks swapped (fused reuse)
 
     // ─── Layer Configuration (from CSR register file) ───
     input  wire [31:0]  cfg_dma_in_addr,
@@ -196,11 +197,11 @@ module npu_ctrl #(
     wire fuse_start = cfg_dma_ctrl[1];
     wire fuse_mid   = cfg_dma_ctrl[2];
     wire fuse_end   = cfg_dma_ctrl[3];
-    // SRAM reuse is only valid for a non-tiled full tensor. Tiled fused
-    // blocks (MODEL_D L9-L11) have different tile grids; skip_act_load
-    // also blocked tile_done PTS, so only the last tile was stored — and
-    // tile_x_seq never advanced, so it landed at DDR offset 0. Working
-    // buffers are prefilled with golden, which hid this as a small mismatch.
+    // SRAM reuse is only valid for a non-tiled full tensor. The converter
+    // now stamps one large tile grid on each IR, but compute still finishes
+    // all START tiles before MID runs — skip_act_load on a tiled block
+    // would leave only the last tile in SRAM. Keep the tile_h==0 gate until
+    // tile-major (one IR tile through START/MID/END before the next).
     wire skip_act_load = (fuse_mid | fuse_end) & (cfg_tile_h == 16'd0);
     wire skip_store    = (fuse_start | fuse_mid) & (cfg_tile_h == 16'd0);
 
@@ -322,8 +323,14 @@ module npu_ctrl #(
     // Reciprocals mirror npu_compute.v:2590-2591. Registered so the divider
     // stays out of the DMA address path; CSRs are written long before START.
     reg [39:0] rsz_recip_h, rsz_recip_w;
+    // ctrl_soft_rst is a CSR bit, not an async reset source, so it must be
+    // tested in the clocked branch. Folding it into the `!rst_n` branch makes
+    // the block unsynthesizable (Yosys: "Multiple edge sensitive events").
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n || ctrl_soft_rst) begin
+        if (!rst_n) begin
+            rsz_recip_h <= 40'd0;
+            rsz_recip_w <= 40'd0;
+        end else if (ctrl_soft_rst) begin
             rsz_recip_h <= 40'd0;
             rsz_recip_w <= 40'd0;
         end else begin
@@ -490,50 +497,49 @@ module npu_ctrl #(
                                    + {16'd0, tile_x_seq} * {16'd0, cfg_tile_w})
                                   * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
 
+    // Shared by the async (!rst_n) and synchronous (ctrl_soft_rst) branches so
+    // the two cannot drift apart.
+    `define NPU_CTRL_RESET_STATE \
+        state               <= S_IDLE; \
+        hw_busy             <= 1'b0; \
+        hw_done             <= 1'b0; \
+        hw_error            <= 1'b0; \
+        hw_error_code       <= 4'd0; \
+        hw_curr_layer       <= 8'd0; \
+        aborted             <= 1'b0; \
+        dma_start           <= 1'b0; \
+        dma_dir             <= 1'b0; \
+        dma_ext_addr        <= 32'd0; \
+        dma_sram_addr       <= 16'd0; \
+        dma_xfer_len        <= 16'd0; \
+        compute_start       <= 1'b0; \
+        wgt_reload_done     <= 1'b0; \
+        dma_sram_sel        <= 2'd1; \
+        act_role_swap       <= 1'b0; \
+        ping_pong_flag      <= 1'b0; \
+        prefetch_active     <= 1'b0; \
+        prefetch_pending    <= 1'b0; \
+        db_prefetch_done    <= 1'b1; \
+        next_tile_ddr_addr  <= 32'd0; \
+        cur_tile_ddr_offset <= 32'd0; \
+        add_b_reload        <= 1'b0; \
+        next_sram_offset    <= cfg_act_bank_offset; \
+        tile_y_seq          <= 16'd0; \
+        tile_x_seq          <= 16'd0; \
+        last_tile_store     <= 1'b0; \
+        dma_row_len         <= 16'd0; \
+        dma_row_count       <= 16'd0; \
+        dma_src_row_len     <= 16'd0; \
+        dma_out_stride      <= 32'd0;
+
+    // ctrl_soft_rst is a CSR bit, not an async reset source, so it must be
+    // tested in the clocked branch. Folding it into the `!rst_n` branch makes
+    // the block unsynthesizable (Yosys: "Multiple edge sensitive events").
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n || ctrl_soft_rst) begin
-            state            <= S_IDLE;
-            hw_busy          <= 1'b0;
-            hw_done          <= 1'b0;
-            hw_error         <= 1'b0;
-            hw_error_code    <= 4'd0;
-            hw_curr_layer    <= 8'd0;
-            aborted          <= 1'b0;
-            dma_start        <= 1'b0;
-            dma_dir          <= 1'b0;
-            dma_ext_addr     <= 32'd0;
-            dma_sram_addr    <= 16'd0;
-            dma_xfer_len     <= 16'd0;
-            compute_start    <= 1'b0;
-            wgt_reload_done  <= 1'b0;
-            dma_sram_sel     <= 2'd1;  // default: activation
-            ping_pong_flag   <= 1'b0;
-            prefetch_active  <= 1'b0;
-            prefetch_pending <= 1'b0;
-            db_prefetch_done <= 1'b1;
-            next_tile_ddr_addr <= 32'd0;
-            cur_tile_ddr_offset <= 32'd0;
-            add_b_reload <= 1'b0;
-            next_sram_offset <= cfg_act_bank_offset;  // Start prefetch to bank 1 (bank 0 has tile 0)
-            tile_y_seq <= 16'd0;
-            tile_x_seq <= 16'd0;
-            last_tile_store <= 1'b0;
-            dma_row_len <= 16'd0;
-            dma_row_count <= 16'd0;
-            dma_src_row_len <= 16'd0;
-            dma_out_stride <= 32'd0;
-            state            <= S_IDLE;
-            hw_busy          <= 1'b0;
-            hw_done          <= 1'b0;
-            hw_error         <= 1'b0;
-            hw_error_code    <= 4'd0;
-            aborted          <= 1'b0;
-            dma_start        <= 1'b0;
-            compute_start    <= 1'b0;
-            ping_pong_flag   <= 1'b0;
-            prefetch_active  <= 1'b0;
-            prefetch_pending <= 1'b0;
-            db_prefetch_done <= 1'b1;
+        if (!rst_n) begin
+            `NPU_CTRL_RESET_STATE
+        end else if (ctrl_soft_rst) begin
+            `NPU_CTRL_RESET_STATE
         end else begin
             // Default: clear single-cycle pulses
             hw_done       <= 1'b0;
@@ -661,15 +667,20 @@ module npu_ctrl #(
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else if (skip_act_load || in_words == 0) begin
-                        // Fused mid/end: input already in SRAM, skip load
+                        // Fused mid/end: previous OFM becomes this layer's IFM.
+                        // Swap before Add-B / concat preload so those DMAs hit
+                        // the post-swap banks.
+                        if (skip_act_load)
+                            act_role_swap <= ~act_role_swap;
                         if (is_add_op || is_concat_op)
                             state <= S_LOAD_ADD_B;
                         else
                             state <= S_LOAD_PARAM;
                     end else begin
+                        act_role_swap <= 1'b0;  // fresh IFM load
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;
-                        dma_sram_sel  <= 2'd1;  // activation
+                        dma_sram_sel  <= 2'd1;  // IFM
                         dma_ext_addr  <= cfg_dma_in_addr;  // tile(0,0) = base
                         dma_sram_addr <= use_2d_load ? cur_2d_sram_pad : 16'd0;
                         if (slice_stream) begin
@@ -931,7 +942,7 @@ module npu_ctrl #(
                         // 2D DMA store: current tile output → DDR at NHWC offset
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b1;  // store
-                        dma_sram_sel  <= 2'd1;  // activation
+                        dma_sram_sel  <= 2'd3;  // OFM
                         dma_ext_addr  <= cfg_dma_out_addr + r_tile_ddr_offset;
                         // Source SRAM: output region in current bank.
                         // Add (op 4) computes in-place in the input region;
@@ -1205,7 +1216,7 @@ module npu_ctrl #(
                     end else if (out_words != 0) begin
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b1;  // store
-                        dma_sram_sel  <= 2'd1;  // activation
+                        dma_sram_sel  <= 2'd3;  // OFM
                         dma_ext_addr  <= cfg_dma_out_addr;
                         // Conv2D/Concat: store from cfg_out_base; Add: store from
                         // cfg_act_base (in-place). Key on op_type, not add_b_addr:
@@ -1248,7 +1259,8 @@ module npu_ctrl #(
                     end else if (cfg_dma_add_b_addr != 0 && tile_in_words != 0) begin
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;  // load
-                        dma_sram_sel  <= 2'd1;  // activation
+                        // Add B is an IFM input; concat preload is a partial OFM.
+                        dma_sram_sel  <= is_concat_op ? 2'd3 : 2'd1;
                         dma_ext_addr  <= cfg_dma_add_b_addr
                                          + (is_concat_op ? tile_ddr_offset : cur_tile_ddr_offset);
                         dma_sram_addr <= cfg_out_base + (db_en && ping_pong_flag ? cfg_act_bank_offset : 16'd0);
@@ -1317,4 +1329,5 @@ module npu_ctrl #(
         end
     end
 
+`undef NPU_CTRL_RESET_STATE
 endmodule

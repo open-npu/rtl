@@ -18,7 +18,7 @@ SIM        ?= icarus
 TOPLEVEL_LANG ?= verilog
 
 # ─── Hardware parameters (override to test different configs) ───
-ARRAY_SIZE ?= 16
+ARRAY_SIZE ?= 8
 SPAD_KB    ?= 192
 ACC_WIDTH  ?= 44     # 40: model_b (C_in≤64); 44: ResNet18 (C_in≤256, k_depth≤2304); 48: future-proof
 
@@ -50,8 +50,11 @@ ifeq ($(DUT),npu_top)
 VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v \
                   $(RTL_DIR)/npu_systolic.v \
                   $(RTL_DIR)/npu_ppu.v \
+                  $(RTL_DIR)/npu_ppu_bank.v \
+                  $(RTL_DIR)/npu_dw_bank.v \
                   $(RTL_DIR)/npu_csr.v \
                   $(RTL_DIR)/npu_sram.v \
+                  $(RTL_DIR)/npu_sram_wide.v \
                   $(RTL_DIR)/npu_dma.v \
                   $(RTL_DIR)/npu_dw_conv.v \
                   $(RTL_DIR)/npu_ctrl.v \
@@ -61,7 +64,10 @@ else ifeq ($(DUT),npu_compute_tb)
 VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v \
                   $(RTL_DIR)/npu_systolic.v \
                   $(RTL_DIR)/npu_ppu.v \
+                  $(RTL_DIR)/npu_ppu_bank.v \
+                  $(RTL_DIR)/npu_dw_bank.v \
                   $(RTL_DIR)/npu_sram.v \
+                  $(RTL_DIR)/npu_sram_wide.v \
                   $(RTL_DIR)/npu_dw_conv.v \
                   $(RTL_DIR)/npu_compute.v \
                   $(shell pwd)/npu_compute_tb.v
@@ -69,7 +75,10 @@ else ifeq ($(DUT),npu_compute)
 VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v \
                   $(RTL_DIR)/npu_systolic.v \
                   $(RTL_DIR)/npu_ppu.v \
+                  $(RTL_DIR)/npu_ppu_bank.v \
+                  $(RTL_DIR)/npu_dw_bank.v \
                   $(RTL_DIR)/npu_sram.v \
+                  $(RTL_DIR)/npu_sram_wide.v \
                   $(RTL_DIR)/npu_dw_conv.v \
                   $(RTL_DIR)/npu_compute.v
 else ifeq ($(DUT),npu_systolic)
