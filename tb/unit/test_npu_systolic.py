@@ -1,352 +1,194 @@
-# Open-NPU RTL — cocotb Tests for npu_systolic
-# SPDX-License-Identifier: Apache-2.0
-#
-# ARRAY_SIZE is read dynamically from the RTL parameter.
+"""Unit tests for the psum-chained weight-stationary systolic array.
+
+PE[r][c] holds W[r][c]. One ROWS-wide activation vector is presented per cycle;
+the array emits, ROWS cycles later, the COLS dot products
+
+    out[c] = sum_r act[r] * W[r][c]
+
+one vector per cycle.
+"""
+
+import random
 
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge
-import random
 
-from utils.clock_reset import clock_reset
-from utils.csim_ref import pe_mac_reference
-
-# Mode encoding
-MODE_IDLE     = 0b00
-MODE_WGT_LOAD = 0b01
-MODE_COMPUTE  = 0b10
-MODE_DRAIN    = 0b11
-
+ROWS = 16
+COLS = 16
 DATA_W = 16
+ACC_W = 44
 
-def get_array_size(dut):
-    """Get array size from RTL parameter."""
-    return int(dut.ROWS.value)
-
-
-def int8_to_unsigned(val):
-    return val & 0xFFFF
+MODE_IDLE = 0
+MODE_WGT_LOAD = 1
+MODE_COMPUTE = 2
 
 
-def signed_acc(val, bits=40):
-    val = int(val) & ((1 << bits) - 1)
-    if val >= (1 << (bits - 1)):
-        val -= (1 << bits)
-    return val
+def pack(values, width):
+    v = 0
+    for i, x in enumerate(values):
+        v |= (int(x) & ((1 << width) - 1)) << (width * i)
+    return v
 
 
-def pack_flat(values, elem_w):
-    """Pack a list of element values into a single flat integer."""
-    flat = 0
-    for i, v in enumerate(values):
-        flat |= (int(v) & ((1 << elem_w) - 1)) << (elem_w * i)
-    return flat
+def unpack_signed(flat, width, count):
+    out = []
+    mask = (1 << width) - 1
+    for i in range(count):
+        raw = (int(flat) >> (width * i)) & mask
+        if raw >> (width - 1):
+            raw -= 1 << width
+        out.append(raw)
+    return out
 
 
-def unpack_flat(flat_val, idx, elem_w):
-    """Extract element idx from a flat packed integer."""
-    return (int(flat_val) >> (elem_w * idx)) & ((1 << elem_w) - 1)
-
-
-async def reset_dut(dut):
-    """Initialize and reset the DUT."""
-    N = get_array_size(dut)
-    await clock_reset(dut)
+async def reset(dut):
+    dut.rst_n.value = 0
     dut.cmd.value = MODE_IDLE
     dut.cmd_valid.value = 0
     dut.wgt_valid.value = 0
     dut.act_valid.value = 0
-    dut.drain_col_sel.value = 0
     dut.wgt_data_flat.value = 0
     dut.act_data_flat.value = 0
+    for _ in range(5):
+        await RisingEdge(dut.clk)
+    dut.rst_n.value = 1
     await RisingEdge(dut.clk)
 
 
-async def load_weights(dut, weight_matrix):
-    """Load weight matrix into the systolic array.
-
-    weight_matrix[col][row] = weight for PE[row][col].
-    Loading is column-by-column: each cycle loads one column.
-    """
-    N = get_array_size(dut)
-
-    # Issue WGT_LOAD command
+async def load_weights(dut, W):
+    """W[r][c]. Column c is presented on cycle c over the row-broadcast bus."""
     dut.cmd.value = MODE_WGT_LOAD
     dut.cmd_valid.value = 1
     await RisingEdge(dut.clk)
     dut.cmd_valid.value = 0
-    await RisingEdge(dut.clk)  # Wait for FSM to enter WGT_LOAD
-
-    # Load one column per cycle
-    for col in range(N):
-        wgt_vals = [int8_to_unsigned(weight_matrix[col][row]) for row in range(N)]
-        dut.wgt_data_flat.value = pack_flat(wgt_vals, DATA_W)
+    for c in range(COLS):
+        dut.wgt_data_flat.value = pack([W[r][c] for r in range(ROWS)], DATA_W)
         dut.wgt_valid.value = 1
         await RisingEdge(dut.clk)
-
     dut.wgt_valid.value = 0
-    # Wait for wgt_load_done flag + FSM transition to READY
-    await RisingEdge(dut.clk)
-    await RisingEdge(dut.clk)
+    # wgt_load_done is registered, then the FSM moves to S_READY.
+    for _ in range(3):
+        await RisingEdge(dut.clk)
 
 
-async def start_compute(dut):
-    """Transition FSM to COMPUTE state."""
+async def stream(dut, vectors):
+    """Feed one activation vector per cycle; collect emitted result vectors."""
     dut.cmd.value = MODE_COMPUTE
     dut.cmd_valid.value = 1
     await RisingEdge(dut.clk)
     dut.cmd_valid.value = 0
-    await RisingEdge(dut.clk)  # Wait for FSM transition
-
-
-async def stream_activations(dut, act_matrix):
-    """Stream activations through the array.
-
-    act_matrix[k][row] = activation for row `row` at timestep k.
-    After K values, wait COLS-1 cycles for pipeline completion.
-    """
-    N = get_array_size(dut)
-    K = len(act_matrix)
-
-    # Stream K activation vectors
-    for k in range(K):
-        act_vals = [int8_to_unsigned(act_matrix[k][row]) for row in range(N)]
-        dut.act_data_flat.value = pack_flat(act_vals, DATA_W)
-        dut.act_valid.value = 1
-        await RisingEdge(dut.clk)
-
-    dut.act_valid.value = 0
-
-    # Wait for systolic pipeline to complete (COLS - 1 extra cycles)
-    for _ in range(N - 1):
-        await RisingEdge(dut.clk)
-
-
-async def drain_column(dut, col):
-    """Drain one column and return ROWS accumulator values.
-
-    Timing:
-      Cycle 0: Issue DRAIN cmd (FSM transitions from COMPUTE/READY to S_DRAIN)
-      Cycle 1: S_DRAIN — PE processes drain (output not yet valid)
-      Cycle 2: S_DRAIN_OUT — acc_out_valid=1, read results here
-      Cycle 3: S_READY — done
-    """
-    N = get_array_size(dut)
-
-    dut.drain_col_sel.value = col
-    dut.cmd.value = MODE_DRAIN
-    dut.cmd_valid.value = 1
-    await RisingEdge(dut.clk)  # Cycle 0: cmd accepted
-    dut.cmd_valid.value = 0
-
-    await RisingEdge(dut.clk)  # Cycle 1: S_DRAIN (PE draining)
-    await RisingEdge(dut.clk)  # Cycle 2: S_DRAIN_OUT (valid=1)
 
     results = []
-    acc_flat = int(dut.acc_out_flat.value)
-    acc_w = len(dut.acc_out_flat) // N
-    for row in range(N):
-        results.append(signed_acc(unpack_flat(acc_flat, row, acc_w), acc_w))
-
-    await RisingEdge(dut.clk)  # Cycle 3: back to READY
+    # ROWS cycles of pipeline fill plus a couple of cycles of margin.
+    for i in range(len(vectors) + ROWS + 4):
+        if i < len(vectors):
+            dut.act_data_flat.value = pack(vectors[i], DATA_W)
+            dut.act_valid.value = 1
+        else:
+            dut.act_valid.value = 0
+        await RisingEdge(dut.clk)
+        if dut.psum_out_valid.value == 1:
+            results.append(unpack_signed(dut.psum_out_flat.value, ACC_W, COLS))
     return results
 
 
-async def drain_all_columns(dut):
-    """Drain all columns, return results[row][col]."""
-    N = get_array_size(dut)
-    results = [[0] * N for _ in range(N)]
-    for col in range(N):
-        col_results = await drain_column(dut, col)
-        for row in range(N):
-            results[row][col] = col_results[row]
-    return results
+def reference(W, act):
+    return [sum(act[r] * W[r][c] for r in range(ROWS)) for c in range(COLS)]
 
 
 @cocotb.test()
-async def test_weight_load_basic(dut):
-    """Test: Load weights and verify via single-activation compute."""
-    await reset_dut(dut)
-    N = get_array_size(dut)
+async def test_single_vector(dut):
+    """One activation vector produces one correct result vector."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
 
-    # weights[col][row] = col + 1 (same for all rows in a column)
-    weights = [[col + 1] * N for col in range(N)]
-    await load_weights(dut, weights)
+    W = [[(r + 1) if c == r else 0 for c in range(COLS)] for r in range(ROWS)]
+    act = [r + 1 for r in range(ROWS)]
 
-    assert dut.ready.value == 1, "Array should be ready after weight load"
+    await load_weights(dut, W)
+    got = await stream(dut, [act])
 
-    # Compute with act = 1 for all rows, K=1
-    await start_compute(dut)
-    act_matrix = [[1] * N]
-    await stream_activations(dut, act_matrix)
-
-    # Drain all columns
-    results = await drain_all_columns(dut)
-
-    # PE[r][c].acc = act * weight[c][r] = 1 * (c+1) = c+1
-    for row in range(N):
-        for col in range(N):
-            expected = col + 1
-            assert results[row][col] == expected, \
-                f"PE[{row}][{col}]: expected {expected}, got {results[row][col]}"
-
-    dut._log.info("PASS: weight_load_basic")
+    assert len(got) == 1, f"expected 1 result vector, got {len(got)}"
+    assert got[0] == reference(W, act), f"{got[0]} != {reference(W, act)}"
 
 
 @cocotb.test()
-async def test_single_mac_per_pe(dut):
-    """Test: Each PE computes one act*weight product with unique values."""
-    await reset_dut(dut)
-    N = get_array_size(dut)
+async def test_pipelined_stream(dut):
+    """Back-to-back vectors come out one per cycle, in order."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
 
-    # Unique weight per PE: weight[col][row] — keep values within int8 range
-    # Use modular values to avoid overflow for large N
-    weights = [[((row + 1) * (col + 1)) % 120 + 1 for row in range(N)] for col in range(N)]
-    await load_weights(dut, weights)
+    random.seed(1)
+    W = [[random.randint(-128, 127) for _ in range(COLS)] for _ in range(ROWS)]
+    vectors = [[random.randint(-128, 127) for _ in range(ROWS)]
+               for _ in range(8)]
 
-    # Single activation: act[row] = (row % 8) + 1 (bounded to avoid overflow)
-    acts = [(row % 8) + 1 for row in range(N)]
-    await start_compute(dut)
-    act_matrix = [acts]  # K=1
-    await stream_activations(dut, act_matrix)
+    await load_weights(dut, W)
+    got = await stream(dut, vectors)
 
-    results = await drain_all_columns(dut)
-
-    for row in range(N):
-        for col in range(N):
-            w = weights[col][row]
-            a = acts[row]
-            # int8 interpretation of weight
-            w_s = w if w < 128 else w - 256
-            a_s = a if a < 128 else a - 256
-            expected = a_s * w_s
-            assert results[row][col] == expected, \
-                f"PE[{row}][{col}]: expected {expected}, got {results[row][col]}"
-
-    dut._log.info("PASS: single_mac_per_pe")
+    assert len(got) == len(vectors), \
+        f"expected {len(vectors)} result vectors, got {len(got)}"
+    for i, (g, v) in enumerate(zip(got, vectors)):
+        assert g == reference(W, v), f"vector {i}: {g} != {reference(W, v)}"
 
 
 @cocotb.test()
-async def test_dot_product_k8(dut):
-    """Test: K=8 dot product, verify accumulation over multiple cycles."""
-    await reset_dut(dut)
-    N = get_array_size(dut)
+async def test_zero_padded_rows(dut):
+    """Rows beyond the ragged last k_pass are zeroed via their weights."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
 
-    # All PEs have weight = 3
-    weights = [[3] * N for _ in range(N)]
-    await load_weights(dut, weights)
+    random.seed(2)
+    k_valid = 5
+    W = [[random.randint(-128, 127) if r < k_valid else 0
+          for _ in range(COLS)] for r in range(ROWS)]
+    act = [random.randint(-128, 127) for _ in range(ROWS)]
 
-    # K=8: act[k][row] = k + 1 for all rows
-    K = 8
-    await start_compute(dut)
-    act_matrix = [[k + 1] * N for k in range(K)]
-    await stream_activations(dut, act_matrix)
+    await load_weights(dut, W)
+    got = await stream(dut, [act])
 
-    results = await drain_all_columns(dut)
-
-    # Each PE: sum_{k=0}^{7}((k+1) * 3) = 3 * 36 = 108
-    expected = 3 * sum(range(1, K + 1))
-    for row in range(N):
-        for col in range(N):
-            assert results[row][col] == expected, \
-                f"PE[{row}][{col}]: expected {expected}, got {results[row][col]}"
-
-    dut._log.info(f"PASS: dot_product_k8 — all PEs = {expected}")
+    expect = [sum(act[r] * W[r][c] for r in range(k_valid))
+              for c in range(COLS)]
+    assert got[0] == expect, f"{got[0]} != {expect}"
 
 
 @cocotb.test()
-async def test_full_matmul(dut):
-    """Test: Full random data, compare RTL vs golden."""
-    await reset_dut(dut)
-    N = get_array_size(dut)
+async def test_weight_reload_between_passes(dut):
+    """A second weight load must not disturb results already in flight."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
 
-    random.seed(123)
-    K = 6
+    random.seed(3)
+    W1 = [[random.randint(-50, 50) for _ in range(COLS)] for _ in range(ROWS)]
+    W2 = [[random.randint(-50, 50) for _ in range(COLS)] for _ in range(ROWS)]
+    act = [random.randint(-50, 50) for _ in range(ROWS)]
 
-    # Random weights[col][row]
-    weights = [[random.randint(-128, 127) for _ in range(N)] for _ in range(N)]
-    # Random activations[k][row]
-    act_matrix = [[random.randint(-128, 127) for _ in range(N)] for _ in range(K)]
+    await load_weights(dut, W1)
+    got1 = await stream(dut, [act])
+    assert got1[0] == reference(W1, act)
 
-    await load_weights(dut, weights)
-    await start_compute(dut)
-    await stream_activations(dut, act_matrix)
-
-    results = await drain_all_columns(dut)
-
-    # Golden: PE[r][c].acc = sum_k(act[k][r] * weight[c][r])
-    for row in range(N):
-        for col in range(N):
-            expected = sum(act_matrix[k][row] * weights[col][row] for k in range(K))
-            mask = (1 << 40) - 1
-            exp_masked = expected & mask
-            if exp_masked >= (1 << 39):
-                exp_masked -= (1 << 40)
-            assert results[row][col] == exp_masked, \
-                f"PE[{row}][{col}]: expected {exp_masked}, got {results[row][col]}"
-
-    dut._log.info(f"PASS: full_matmul — all {N}x{N} results match golden")
+    await load_weights(dut, W2)
+    got2 = await stream(dut, [act])
+    assert got2[0] == reference(W2, act)
 
 
 @cocotb.test()
-async def test_drain_clears_and_reload(dut):
-    """Test: After drain, accumulators clear. Reload and compute again."""
-    await reset_dut(dut)
-    N = get_array_size(dut)
+async def test_negative_and_wide(dut):
+    """Full INT16 operands exercise sign handling and accumulator width."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
 
-    # First pass: weight=2, act=5, K=1
-    weights = [[2] * N for _ in range(N)]
-    await load_weights(dut, weights)
-    await start_compute(dut)
-    await stream_activations(dut, [[5] * N])
+    W = [[-32768 if (r + c) % 2 else 32767 for c in range(COLS)]
+         for r in range(ROWS)]
+    act = [-32768 if r % 2 else 32767 for r in range(ROWS)]
 
-    results1 = await drain_all_columns(dut)
-    for r in range(N):
-        for c in range(N):
-            assert results1[r][c] == 10, f"Pass 1 PE[{r}][{c}]: expected 10, got {results1[r][c]}"
+    await load_weights(dut, W)
+    got = await stream(dut, [act])
 
-    # Second pass: reload weight=7, act=3, K=1
-    weights2 = [[7] * N for _ in range(N)]
-    await load_weights(dut, weights2)
-    await start_compute(dut)
-    await stream_activations(dut, [[3] * N])
-
-    results2 = await drain_all_columns(dut)
-    for r in range(N):
-        for c in range(N):
-            # Should be 7*3=21, NOT 10+21=31 (acc was cleared by drain)
-            assert results2[r][c] == 21, f"Pass 2 PE[{r}][{c}]: expected 21, got {results2[r][c]}"
-
-    dut._log.info("PASS: drain_clears_and_reload")
-
-
-@cocotb.test()
-async def test_systolic_delay(dut):
-    """Test: All columns eventually see all activations (systolic propagation)."""
-    await reset_dut(dut)
-    N = get_array_size(dut)
-
-    # All weights = 1
-    weights = [[1] * N for _ in range(N)]
-    await load_weights(dut, weights)
-
-    # Feed K=N unique activations, wait for full pipeline drain (K + N - 1)
-    K = N
-    await start_compute(dut)
-    act_matrix = [[k + 1] * N for k in range(K)]
-    # stream_activations waits N-1 extra cycles for pipeline completion
-    await stream_activations(dut, act_matrix)
-
-    results = await drain_all_columns(dut)
-
-    # With weight=1: PE[r][c].acc = sum of all K activations that arrived at col c.
-    # Due to systolic propagation, all columns receive ALL K activations (just delayed).
-    # So all PEs should have sum(1..K).
-    expected = sum(range(1, K + 1))
-
-    for r in range(N):
-        for c in range(N):
-            assert results[r][c] == expected, \
-                f"PE[{r}][{c}]: expected {expected}, got {results[r][c]}"
-
-    dut._log.info(f"PASS: systolic_delay — all PEs = {expected}")
+    expect = reference(W, act)
+    # Results must fit the 44-bit accumulator for this comparison to be valid.
+    for v in expect:
+        assert -(1 << (ACC_W - 1)) <= v < (1 << (ACC_W - 1)), \
+            f"test vector overflows ACC_W: {v}"
+    assert got[0] == expect, f"{got[0]} != {expect}"

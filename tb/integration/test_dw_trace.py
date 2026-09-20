@@ -149,7 +149,7 @@ async def test_dw_trace(dut):
     
     for _ in range(5):
         await RisingEdge(dut.clk)
-    raw = dut.u_sram_act.mem[0].value
+    raw = dut.u_sram_ofm.mem[0].value
     dut._log.info(f"mem[0] = {raw}")
     # Expected: weight=3, input=7, acc=21, PPU passthrough → output byte = 21
     out_byte = int(raw) & 0xFF

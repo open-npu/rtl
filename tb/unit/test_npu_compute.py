@@ -24,12 +24,19 @@ async def reset_dut(dut):
     # Drive feedback inputs that would normally come from systolic/PPU
     dut.sa_ready.value = 1
     dut.sa_busy.value = 0
-    dut.sa_acc_out_valid.value = 0
+    dut.sa_psum_out_valid.value = 0
     dut.ppu_out_valid.value = 0
     dut.ppu_out_data.value = 0
     dut.dw_out_valid.value = 0
     dut.dw_acc_out.value = 0
-    dut.sa_acc_out_flat.value = 0
+    dut.sa_psum_out_flat.value = 0
+    try:
+        dut.ppu_vout_w.value = 0
+        dut.ppu_out_w.value = 0
+        dut.dw_out_valid_w.value = 0
+        dut.dw_acc_w.value = 0
+    except Exception:
+        pass
     dut.db_prefetch_done.value = 1  # No DB_EN in unit tests — always ready
     dut.wgt_reload_done.value = 1
     dut.cfg_wgt_per_oc.value = 0
@@ -52,44 +59,50 @@ async def reset_dut(dut):
 
 
 async def systolic_ppu_stub(dut):
-    """Stub coroutine that mimics systolic drain + PPU pipeline responses.
+    """Stub coroutine that mimics the systolic psum chain + PPU pipeline.
 
-    Monitors sa_cmd_valid/sa_cmd and responds:
-    - On MODE_DRAIN (3): after 2 cycles, pulse sa_acc_out_valid with zero accumulators
-    - On ppu_in_valid: after 4-cycle pipeline delay, pulse ppu_out_valid with ppu_out_data=0
+    The array no longer has a drain phase. It consumes one ROWS-wide activation
+    vector per sa_act_valid cycle and emits the reduced result vector ROWS
+    cycles later, so this stub responds to sa_act_valid rather than to a
+    MODE_DRAIN command:
+    - On sa_act_valid: after ARRAY_SIZE cycles, pulse sa_psum_out_valid with
+      zero partial sums.
+    - On ppu_in_valid: after 4-cycle pipeline delay, pulse ppu_out_valid with
+      ppu_out_data=0.
     """
     ARRAY_SIZE = get_array_size(dut)
-    ppu_pipeline = []  # Queue of (cycle_due, data) for PPU outputs
+    ppu_pipeline = []  # Queue of cycle_due for PPU outputs
+    psum_due = []      # one due-cycle per in-flight activation vector
 
     cycle = 0
     while True:
         await RisingEdge(dut.clk)
         cycle += 1
 
-        # Check for drain command
         try:
-            cmd_valid = int(dut.sa_cmd_valid.value)
-            cmd = int(dut.sa_cmd.value)
+            act_valid = int(dut.sa_act_valid.value)
         except Exception:
-            cmd_valid = 0
-            cmd = 0
+            act_valid = 0
 
-        if cmd_valid == 1 and cmd == 3:  # MODE_DRAIN
-            # Wait 2 cycles then pulse acc_out_valid (simulating drain timing)
-            await RisingEdge(dut.clk)
-            await RisingEdge(dut.clk)
-            dut.sa_acc_out_valid.value = 1
-            dut.sa_acc_out_flat.value = 0
-            await RisingEdge(dut.clk)
-            dut.sa_acc_out_valid.value = 0
-            cycle += 3
-            continue
+        if act_valid == 1:
+            psum_due.append(cycle + ARRAY_SIZE)
 
-        # Check for PPU input
+        if psum_due and psum_due[0] <= cycle:
+            psum_due.pop(0)
+            dut.sa_psum_out_valid.value = 1
+            dut.sa_psum_out_flat.value = 0
+        else:
+            dut.sa_psum_out_valid.value = 0
+
+        # Check for PPU input (scalar or any wide lane)
         try:
             ppu_in = int(dut.ppu_in_valid.value)
         except Exception:
             ppu_in = 0
+        try:
+            ppu_in = ppu_in or int(dut.ppu_valid_w.value)
+        except Exception:
+            pass
 
         if ppu_in == 1:
             ppu_pipeline.append(cycle + 4)  # 4-cycle PPU pipeline
@@ -99,8 +112,17 @@ async def systolic_ppu_stub(dut):
             ppu_pipeline.pop(0)
             dut.ppu_out_valid.value = 1
             dut.ppu_out_data.value = 0
+            try:
+                dut.ppu_vout_w.value = 1
+                dut.ppu_out_w.value = 0
+            except Exception:
+                pass
         else:
             dut.ppu_out_valid.value = 0
+            try:
+                dut.ppu_vout_w.value = 0
+            except Exception:
+                pass
 
 
 def set_cfg_conv2d(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1,
@@ -202,8 +224,17 @@ async def test_weight_load_timing(dut):
 
 
 @cocotb.test()
-async def test_act_stream_timing(dut):
-    """Verify activation streaming produces k_depth act_valid pulses."""
+async def test_act_vector_timing(dut):
+    """The k-slots for one pixel are presented as one vector, not k_depth scalars.
+
+    The old feed drove a single lane per cycle (one-hot), so a k_depth-deep
+    pixel cost k_depth act_valid pulses and left the other lanes multiplying by
+    zero. The vector feed asserts sa_act_valid once.
+
+    This DUT is bare npu_compute with no SRAM attached, so the lane *contents*
+    are meaningless here; integration.test_npu_compute_tb's
+    test_act_vector_single_pulse checks those against real activation data.
+    """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
@@ -212,12 +243,10 @@ async def test_act_stream_timing(dut):
     k_depth = in_c  # 1*1*in_c
     set_cfg_conv2d(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
-    # Pulse start
     dut.start.value = 1
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    # Wait for activation streaming phase (after weight load)
     act_valid_count = 0
     in_act_phase = False
     for _ in range(500):
@@ -227,18 +256,20 @@ async def test_act_stream_timing(dut):
             in_act_phase = True
         if in_act_phase and int(dut.sa_act_valid.value) == 1:
             act_valid_count += 1
-        # Stop when drain starts
-        if in_act_phase and int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 3:
-            break
         await Timer(1, unit="step")
 
-    assert act_valid_count == k_depth, \
-        f"Expected {k_depth} act_valid pulses, got {act_valid_count}"
+    assert act_valid_count == 1, \
+        f"Expected 1 activation vector for k_depth={k_depth}, got {act_valid_count}"
 
 
 @cocotb.test()
-async def test_drain_sequence(dut):
-    """Verify drain issues ARRAY_SIZE DRAIN commands (one per column)."""
+async def test_no_drain_commands(dut):
+    """The compute FSM must never issue MODE_DRAIN.
+
+    Reduction moved inside the array (psum chain), so the per-column drain
+    sequence is gone. A single-pixel 1x1 conv should present exactly one
+    activation vector and consume exactly one result vector.
+    """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
     cocotb.start_soon(systolic_ppu_stub(dut))
@@ -246,28 +277,27 @@ async def test_drain_sequence(dut):
     ARRAY_SIZE = get_array_size(dut)
     set_cfg_conv2d(dut, in_c=ARRAY_SIZE, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
-    # Pulse start
     dut.start.value = 1
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    # Count drain commands
     drain_count = 0
-    drain_cols_seen = set()
+    act_vector_count = 0
     for _ in range(10000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 3:  # MODE_DRAIN
+        if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 3:
             drain_count += 1
-            drain_cols_seen.add(int(dut.sa_drain_col_sel.value))
+        if int(dut.sa_act_valid.value) == 1:
+            act_vector_count += 1
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert drain_count == ARRAY_SIZE, \
-        f"Expected {ARRAY_SIZE} drain commands, got {drain_count}"
-    assert drain_cols_seen == set(range(ARRAY_SIZE)), \
-        f"Expected drain cols {{0..{ARRAY_SIZE-1}}}, got {drain_cols_seen}"
+    assert drain_count == 0, \
+        f"Compute issued {drain_count} MODE_DRAIN commands; the array has no drain phase"
+    assert act_vector_count == 1, \
+        f"Expected 1 activation vector for one pixel, got {act_vector_count}"
 
 
 @cocotb.test()

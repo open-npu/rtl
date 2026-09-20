@@ -1,25 +1,38 @@
-// Open-NPU RTL — Systolic Array (N×N)
+// Open-NPU RTL — Systolic Array (ROWS x COLS)
 // SPDX-License-Identifier: Apache-2.0
 //
-// Weight-stationary systolic array.
+// Weight-stationary array with in-array partial-sum reduction.
+//
+// Mapping (unchanged from the previous revision):
+//   row r    -> one k-slot of the flattened kernel*in_c dimension
+//   column c -> one output channel of the current oc_group
+//   PE[r][c] -> W[k=r][oc=c]
+//
+// Dataflow (this is what changed):
+//   - Activations are BROADCAST across a row. There is no left-to-right chain,
+//     because nothing travels sideways: the reduction is vertical.
+//   - Partial sums flow DOWN a column. PE[r][c] computes
+//         psum_out = psum_in + act[r] * W[r][c]
+//     with row 0 seeded at zero, so the bottom row of column c emits the
+//     complete dot product over all ROWS k-slots.
+//   - One full result vector (COLS dot products) leaves the array per cycle,
+//     pipelined, instead of the previous drain-one-column-per-3-cycles plus an
+//     external adder tree.
+//
+// Skew: for the descending partial sum to meet the right activation, act[k=r]
+// must enter row r exactly r cycles after act[k=0] entered row 0. The caller
+// presents an unskewed ROWS-wide vector; the triangular buffer below applies
+// the delay.
+//
+// Bit-exactness: the chain accumulates in row order,
+//     ((((0 + a0*w0) + a1*w1) + ...) + a15*w15)
+// which is the same left-to-right order, at the same ACC_W width, as the
+// external adder tree it replaces. Results are bit-identical.
 //
 // Phases:
-//   1. WGT_LOAD: Load weights column-by-column (COLS cycles, wgt_valid=1 each)
-//   2. COMPUTE:  Stream activations into col 0 (K cycles with act_valid=1).
-//                Systolic propagation adds 1-cycle delay per column.
-//                Wait K + COLS - 1 total cycles for all PEs to finish.
-//   3. DRAIN:    Assert drain for 1 cycle. PE outputs are registered,
-//                so acc_out_valid pulses 1 cycle after drain is triggered.
-//                All COLS columns drain simultaneously.
-//
-// Output: acc_out[row] is from column selected by `drain_col_sel` input.
-// The controller iterates drain_col_sel = 0..COLS-1 to read all columns,
-// issuing DRAIN once per column. (Each drain clears that column's accumulators.)
-//
-// Simplified first version:
-//   - No double weight buffer
-//   - No partial sum
-//   - Single drain column per DRAIN phase (re-enter DRAIN for next column)
+//   1. WGT_LOAD: one column per cycle (broadcast bus + column select), COLS cycles.
+//   2. COMPUTE:  stream one ROWS-wide activation vector per cycle. Results
+//                appear on psum_out_flat ROWS cycles later, one per cycle.
 
 `include "npu_defines.vh"
 
@@ -40,32 +53,27 @@ module npu_systolic #(
     input  wire [DATA_W*ROWS-1:0]       wgt_data_flat,
     input  wire                         wgt_valid,
 
-    // ─── Activation Input ───
+    // ─── Activation Input (unskewed; one vector per cycle) ───
     input  wire [DATA_W*ROWS-1:0]       act_data_flat,
     input  wire                         act_valid,
 
-    // ─── Drain Control ───
-    input  wire [$clog2(COLS)-1:0]      drain_col_sel,  // Which column to drain
-
-    // ─── Accumulator Output ───
-    output wire [ACC_W*ROWS-1:0]        acc_out_flat,
-    output reg                          acc_out_valid,
+    // ─── Result Output (one vector per cycle, COLS dot products) ───
+    output wire [ACC_W*COLS-1:0]        psum_out_flat,
+    output wire                         psum_out_valid,
 
     // ─── Status ───
     output wire                         busy,
     output wire                         ready
 );
 
-    // ─── Unpack flattened ports to internal arrays ───
+    // ─── Unpack flattened ports ───
     wire signed [DATA_W-1:0] wgt_data [0:ROWS-1];
     wire signed [DATA_W-1:0] act_data [0:ROWS-1];
-    wire signed [ACC_W-1:0]  acc_out  [0:ROWS-1];
     genvar gi;
     generate
         for (gi = 0; gi < ROWS; gi = gi + 1) begin : unpack_ports
             assign wgt_data[gi] = wgt_data_flat[DATA_W*gi +: DATA_W];
             assign act_data[gi] = act_data_flat[DATA_W*gi +: DATA_W];
-            assign acc_out_flat[ACC_W*gi +: ACC_W] = acc_out[gi];
         end
     endgenerate
 
@@ -73,31 +81,17 @@ module npu_systolic #(
     localparam MODE_IDLE     = 2'b00;
     localparam MODE_WGT_LOAD = 2'b01;
     localparam MODE_COMPUTE  = 2'b10;
-    localparam MODE_DRAIN    = 2'b11;
 
     // ─── FSM States ───
     localparam S_IDLE     = 3'd0;
     localparam S_WGT_LOAD = 3'd1;
     localparam S_READY    = 3'd2;
     localparam S_COMPUTE  = 3'd3;
-    localparam S_DRAIN    = 3'd4;
-    localparam S_DRAIN_OUT= 3'd5;  // 1-cycle output phase
 
     reg [2:0] state, state_next;
     reg [$clog2(COLS)-1:0] wgt_col_cnt;
     reg wgt_load_done;
 
-    // ─── PE interconnect ───
-    wire [1:0]               pe_mode   [0:ROWS-1][0:COLS-1];
-    wire                     pe_valid  [0:ROWS-1][0:COLS-1];
-    wire signed [DATA_W-1:0] pe_act_in  [0:ROWS-1][0:COLS-1];
-    wire signed [DATA_W-1:0] pe_act_out [0:ROWS-1][0:COLS-1];
-    wire                     pe_act_valid_out [0:ROWS-1][0:COLS-1];
-    wire signed [DATA_W-1:0] pe_wgt_in [0:ROWS-1][0:COLS-1];
-    wire signed [ACC_W-1:0]  pe_acc_out [0:ROWS-1][0:COLS-1];
-    wire                     pe_acc_valid [0:ROWS-1][0:COLS-1];
-
-    // Maximum counter value (COLS-1)
     localparam [$clog2(COLS)-1:0] COL_MAX = COLS - 1;
 
     // ─── wgt_load_done: fires 1 cycle after last column loaded ───
@@ -131,24 +125,14 @@ module npu_systolic #(
             S_READY: begin
                 if (cmd_valid && cmd == MODE_COMPUTE)
                     state_next = S_COMPUTE;
-                else if (cmd_valid && cmd == MODE_DRAIN)
-                    state_next = S_DRAIN;
                 else if (cmd_valid && cmd == MODE_WGT_LOAD)
                     state_next = S_WGT_LOAD;
             end
             S_COMPUTE: begin
-                if (cmd_valid && cmd == MODE_DRAIN)
-                    state_next = S_DRAIN;
-                else if (cmd_valid && cmd == MODE_IDLE)
+                if (cmd_valid && cmd == MODE_IDLE)
                     state_next = S_READY;
-            end
-            S_DRAIN: begin
-                // PE processes drain in this cycle; output available next cycle
-                state_next = S_DRAIN_OUT;
-            end
-            S_DRAIN_OUT: begin
-                // Output is valid this cycle; return to READY for next drain/compute
-                state_next = S_READY;
+                else if (cmd_valid && cmd == MODE_WGT_LOAD)
+                    state_next = S_WGT_LOAD;
             end
             default: state_next = S_IDLE;
         endcase
@@ -164,55 +148,93 @@ module npu_systolic #(
             wgt_col_cnt <= 0;
     end
 
-    // ─── acc_out_valid: high during S_DRAIN_OUT ───
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            acc_out_valid <= 1'b0;
-        else
-            acc_out_valid <= (state == S_DRAIN);
-    end
-
     // ─── Status ───
-    assign busy  = (state == S_WGT_LOAD) || (state == S_DRAIN) || (state == S_DRAIN_OUT);
-    assign ready = (state == S_READY);
+    assign busy  = (state == S_WGT_LOAD);
+    // The array accepts a new activation vector every cycle once it is
+    // computing, so S_COMPUTE is "ready" too — otherwise the caller would have
+    // to bounce through S_READY between pixels and lose the pipelining.
+    assign ready = (state == S_READY) || (state == S_COMPUTE);
 
-    // ─── PE Grid ───
+    // ═══════════════════════════════════════════════════════════════════
+    // Input skew buffer
+    //
+    // Row r needs its activation r cycles after row 0. skew_data[r] is
+    // act_data[r] delayed by r registers; row 0 passes straight through.
+    // Total cost is ROWS*(ROWS-1)/2 registers of DATA_W bits.
+    // ═══════════════════════════════════════════════════════════════════
+    wire signed [DATA_W-1:0] skew_data  [0:ROWS-1];
+    wire                     skew_valid [0:ROWS-1];
+
+    genvar sr, sd;
+    generate
+        for (sr = 0; sr < ROWS; sr = sr + 1) begin : gen_skew_row
+            if (sr == 0) begin : skew_passthrough
+                assign skew_data[sr]  = act_data[sr];
+                assign skew_valid[sr] = act_valid;
+            end else begin : skew_delay
+                reg signed [DATA_W-1:0] d [0:sr-1];
+                reg                     v [0:sr-1];
+                integer si;
+                always @(posedge clk or negedge rst_n) begin
+                    if (!rst_n) begin
+                        for (si = 0; si < sr; si = si + 1) begin
+                            d[si] <= {DATA_W{1'b0}};
+                            v[si] <= 1'b0;
+                        end
+                    end else begin
+                        d[0] <= act_data[sr];
+                        v[0] <= act_valid;
+                        for (si = 1; si < sr; si = si + 1) begin
+                            d[si] <= d[si-1];
+                            v[si] <= v[si-1];
+                        end
+                    end
+                end
+                assign skew_data[sr]  = d[sr-1];
+                assign skew_valid[sr] = v[sr-1];
+            end
+        end
+    endgenerate
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PE Grid
+    // ═══════════════════════════════════════════════════════════════════
+    wire [1:0]               pe_mode    [0:ROWS-1][0:COLS-1];
+    wire                     pe_valid   [0:ROWS-1][0:COLS-1];
+    wire signed [DATA_W-1:0] pe_act_in  [0:ROWS-1][0:COLS-1];
+    wire signed [DATA_W-1:0] pe_wgt_in  [0:ROWS-1][0:COLS-1];
+    wire signed [ACC_W-1:0]  pe_psum_in [0:ROWS-1][0:COLS-1];
+    wire signed [ACC_W-1:0]  pe_psum_out[0:ROWS-1][0:COLS-1];
+    wire                     pe_psum_val[0:ROWS-1][0:COLS-1];
+
     genvar r, c;
     generate
         for (r = 0; r < ROWS; r = r + 1) begin : gen_row
             for (c = 0; c < COLS; c = c + 1) begin : gen_col
 
-                // Activation chain
-                if (c == 0) begin : act_col0
-                    assign pe_act_in[r][c] = act_data[r];
-                end else begin : act_chain
-                    assign pe_act_in[r][c] = pe_act_out[r][c-1];
-                end
+                // Activation: broadcast across the row (skewed per row).
+                assign pe_act_in[r][c] = skew_data[r];
 
-                // Weight input
+                // Weight: broadcast bus, one column enabled per load cycle.
                 assign pe_wgt_in[r][c] = wgt_data[r];
 
-                // PE mode
+                // Partial sum: seeded at zero on the top row, chained downward.
+                if (r == 0) begin : psum_top
+                    assign pe_psum_in[r][c] = {ACC_W{1'b0}};
+                end else begin : psum_chain
+                    assign pe_psum_in[r][c] = pe_psum_out[r-1][c];
+                end
+
                 assign pe_mode[r][c] =
                     (state == S_WGT_LOAD) ? MODE_WGT_LOAD :
                     (state == S_COMPUTE)  ? MODE_COMPUTE  :
-                    (state == S_DRAIN && drain_col_sel == c[$clog2(COLS)-1:0]) ? MODE_DRAIN :
                     MODE_IDLE;
 
-                // PE valid_in
-                if (c == 0) begin : valid_col0
-                    assign pe_valid[r][c] =
-                        (state == S_WGT_LOAD && wgt_valid && wgt_col_cnt == 0) ? 1'b1 :
-                        (state == S_COMPUTE)  ? act_valid :
-                        (state == S_DRAIN && drain_col_sel == 0) ? 1'b1 :
-                        1'b0;
-                end else begin : valid_colN
-                    assign pe_valid[r][c] =
-                        (state == S_WGT_LOAD && wgt_valid && wgt_col_cnt == c[$clog2(COLS)-1:0]) ? 1'b1 :
-                        (state == S_COMPUTE)  ? pe_act_valid_out[r][c-1] :
-                        (state == S_DRAIN && drain_col_sel == c[$clog2(COLS)-1:0]) ? 1'b1 :
-                        1'b0;
-                end
+                assign pe_valid[r][c] =
+                    (state == S_WGT_LOAD) ? (wgt_valid &&
+                        wgt_col_cnt == c[$clog2(COLS)-1:0]) :
+                    (state == S_COMPUTE)  ? skew_valid[r] :
+                    1'b0;
 
                 npu_pe u_pe (
                     .clk            (clk),
@@ -220,45 +242,23 @@ module npu_systolic #(
                     .mode           (pe_mode[r][c]),
                     .valid_in       (pe_valid[r][c]),
                     .act_in         (pe_act_in[r][c]),
-                    .act_out        (pe_act_out[r][c]),
-                    .act_valid_out  (pe_act_valid_out[r][c]),
                     .weight_in      (pe_wgt_in[r][c]),
-                    .acc_out        (pe_acc_out[r][c]),
-                    .acc_valid      (pe_acc_valid[r][c])
+                    .psum_in        (pe_psum_in[r][c]),
+                    .psum_out       (pe_psum_out[r][c]),
+                    .psum_valid_out (pe_psum_val[r][c])
                 );
 
             end
         end
     endgenerate
 
-    // ─── Output MUX: select drain column ───
+    // ─── Output: bottom row carries the completed dot products ───
     generate
-        for (r = 0; r < ROWS; r = r + 1) begin : gen_drain_mux
-            reg signed [ACC_W-1:0] acc_mux;
-            always @(*) begin
-                (* full_case *)
-                case (drain_col_sel)
-                    4'd0:  acc_mux = pe_acc_out[r][0];
-                    4'd1:  acc_mux = pe_acc_out[r][1];
-                    4'd2:  acc_mux = pe_acc_out[r][2];
-                    4'd3:  acc_mux = pe_acc_out[r][3];
-                    4'd4:  acc_mux = pe_acc_out[r][4];
-                    4'd5:  acc_mux = pe_acc_out[r][5];
-                    4'd6:  acc_mux = pe_acc_out[r][6];
-                    4'd7:  acc_mux = pe_acc_out[r][7];
-                    4'd8:  acc_mux = pe_acc_out[r][8];
-                    4'd9:  acc_mux = pe_acc_out[r][9];
-                    4'd10: acc_mux = pe_acc_out[r][10];
-                    4'd11: acc_mux = pe_acc_out[r][11];
-                    4'd12: acc_mux = pe_acc_out[r][12];
-                    4'd13: acc_mux = pe_acc_out[r][13];
-                    4'd14: acc_mux = pe_acc_out[r][14];
-                    4'd15: acc_mux = pe_acc_out[r][15];
-                    default: acc_mux = {ACC_W{1'b0}};
-                endcase
-            end
-            assign acc_out[r] = acc_mux;
+        for (c = 0; c < COLS; c = c + 1) begin : gen_out
+            assign psum_out_flat[ACC_W*c +: ACC_W] = pe_psum_out[ROWS-1][c];
         end
     endgenerate
+
+    assign psum_out_valid = pe_psum_val[ROWS-1][0];
 
 endmodule
