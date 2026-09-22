@@ -3,10 +3,11 @@
 //
 // Same DEPTH as npu_sram: number of 32-bit words. Capacity is unchanged.
 //   Port A: 32-bit R/W  — DMA / Wishbone
-//   Port B: 32-bit write (compute writeback) + 256-bit read of 8 consecutive
-//           words starting at b_addr. Word 0 of the beat is mem[b_addr], so
-//           existing 32-bit consumers (DW / pool / add / resize / RMW) still
-//           see the addressed word in b_rdata[31:0].
+//   Port B: 32-bit write (DW / pool / add / resize / RMW) or, when b_wmask
+//           is nonzero, up to 8 consecutive words in one cycle (conv PPU).
+//           256-bit read of 8 consecutive words starting at b_addr. Word 0
+//           of the beat is mem[b_addr], so 32-bit consumers still see the
+//           addressed word in b_rdata[31:0].
 //
 // Storage stays a linear 32-bit array so cocotb can keep poking `.mem[addr]`.
 // Eight parallel reads typically infer replicated BRAM in a generic FPGA
@@ -31,17 +32,20 @@ module npu_sram_wide #(
     input  wire [31:0]          a_wdata,
     output reg  [31:0]          a_rdata,
 
-    // ─── Port B (32-bit write, BEAT_W-bit read) ───
+    // ─── Port B (32-bit or masked 8-word write, BEAT_W-bit read) ───
     input  wire                 b_en,
     input  wire                 b_we,
     input  wire [ADDR_W-1:0]   b_addr,
     input  wire [31:0]          b_wdata,
+    input  wire [7:0]           b_wmask,
+    input  wire [BEAT_W-1:0]    b_wdata_wide,
     output reg  [BEAT_W-1:0]   b_rdata
 );
 
     reg [31:0] mem [0:DEPTH-1];
 
     integer ii;
+    integer wb;
     initial begin
         for (ii = 0; ii < DEPTH; ii = ii + 1)
             mem[ii] = 32'd0;
@@ -59,7 +63,11 @@ module npu_sram_wide #(
     // treat the whole array as a single variable being read and written
     // in one block (Icarus then X's every location).
     always @(posedge clk) begin
-        if (b_en && b_we)
+        if (b_en && (b_wmask != 8'd0)) begin
+            for (wb = 0; wb < 8; wb = wb + 1)
+                if (b_wmask[wb])
+                    mem[b_addr + wb] <= b_wdata_wide[32*wb +: 32];
+        end else if (b_en && b_we)
             mem[b_addr] <= b_wdata;
     end
 

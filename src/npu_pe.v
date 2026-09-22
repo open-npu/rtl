@@ -39,6 +39,11 @@ module npu_pe (
 
     // Weight (from the column-select broadcast bus)
     input  wire signed [`DATA_WIDTH-1:0] weight_in,
+    // Next-pass weight: filled while COMPUTE still uses weight_reg.
+    // swap_wgt commits it after the in-flight psum chain has consumed
+    // the old weight (same cycle is safe: the MAC reads weight_reg first).
+    input  wire                      load_nxt,
+    input  wire                      swap_wgt,
 
     // Partial sum (flows top-to-bottom)
     input  wire signed [`ACC_WIDTH-1:0]  psum_in,
@@ -51,10 +56,12 @@ module npu_pe (
     localparam MODE_COMPUTE  = 2'b10;
 
     reg signed [`DATA_WIDTH-1:0] weight_reg;
+    reg signed [`DATA_WIDTH-1:0] weight_nxt;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             weight_reg     <= {`DATA_WIDTH{1'b0}};
+            weight_nxt     <= {`DATA_WIDTH{1'b0}};
             psum_out       <= {`ACC_WIDTH{1'b0}};
             psum_valid_out <= 1'b0;
         end else begin
@@ -71,9 +78,15 @@ module npu_pe (
                         psum_out       <= psum_in + (act_in * weight_reg);
                         psum_valid_out <= 1'b1;
                     end
+                    if (load_nxt)
+                        weight_nxt <= weight_in;
+                    if (swap_wgt)
+                        weight_reg <= weight_nxt;
                 end
 
                 default: begin // MODE_IDLE
+                    if (swap_wgt)
+                        weight_reg <= weight_nxt;
                 end
             endcase
         end
