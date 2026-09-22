@@ -409,6 +409,8 @@ module npu_top #(
         .b_we   (act_phys0_b_we),
         .b_addr (act_b_addr),
         .b_wdata(act_b_wr_data),
+        .b_wmask(act_phys0_b_we ? act_b_wr_mask : 8'd0),
+        .b_wdata_wide(act_b_wr_wide),
         .b_rdata(act_b_rdata)
     );
 
@@ -425,6 +427,8 @@ module npu_top #(
         .b_we   (ofm_phys1_b_we),
         .b_addr (ofm_b_addr),
         .b_wdata(act_b_wr_data),
+        .b_wmask(ofm_phys1_b_we ? act_b_wr_mask : 8'd0),
+        .b_wdata_wide(act_b_wr_wide),
         .b_rdata(ofm_b_rdata)
     );
 
@@ -451,6 +455,8 @@ module npu_top #(
         .b_we   (1'b0),
         .b_addr (wgt_b_addr),
         .b_wdata(32'd0),
+        .b_wmask(8'd0),
+        .b_wdata_wide({`SRAM_B_WIDTH{1'b0}}),
         .b_rdata(wgt_b_rdata)
     );
 
@@ -559,6 +565,7 @@ module npu_top #(
     wire                          sa_cmd_valid;
     wire [`DATA_WIDTH*ARRAY_SIZE-1:0] sa_wgt_data_flat;
     wire                          sa_wgt_valid;
+    wire                          sa_swap_wgt;
     wire [`DATA_WIDTH*ARRAY_SIZE-1:0] sa_act_data_flat;
     wire                          sa_act_valid;
     wire [`ACC_WIDTH*ARRAY_SIZE-1:0]  sa_psum_out_flat;
@@ -577,6 +584,7 @@ module npu_top #(
         .cmd_valid      (sa_cmd_valid),
         .wgt_data_flat  (sa_wgt_data_flat),
         .wgt_valid      (sa_wgt_valid),
+        .swap_wgt       (sa_swap_wgt),
         .act_data_flat  (sa_act_data_flat),
         .act_valid      (sa_act_valid),
         .psum_out_flat  (sa_psum_out_flat),
@@ -688,6 +696,8 @@ module npu_top #(
     wire        act_b_wr_en;
     wire [ACT_ADDR_W-1:0] act_b_wr_addr;
     wire [31:0] act_b_wr_data;
+    wire [7:0]  act_b_wr_mask;
+    wire [`SRAM_B_WIDTH-1:0] act_b_wr_wide;
     wire        act_b_rd_en;
     wire [ACT_ADDR_W-1:0] act_b_rd_addr;
     wire        act_rd_ofm;
@@ -753,6 +763,8 @@ module npu_top #(
         .act_wr_en      (act_b_wr_en),
         .act_wr_addr    (act_b_wr_addr),
         .act_wr_data    (act_b_wr_data),
+        .act_wr_mask    (act_b_wr_mask),
+        .act_wr_wide    (act_b_wr_wide),
         // Param SRAM Port B
         .param_rd_en    (param_b_en),
         .param_rd_addr  (param_b_addr),
@@ -762,6 +774,7 @@ module npu_top #(
         .sa_cmd_valid   (sa_cmd_valid),
         .sa_wgt_data_flat(sa_wgt_data_flat),
         .sa_wgt_valid   (sa_wgt_valid),
+        .sa_swap_wgt    (sa_swap_wgt),
         .sa_act_data_flat(sa_act_data_flat),
         .sa_act_valid   (sa_act_valid),
         .sa_psum_out_flat (sa_psum_out_flat),

@@ -65,6 +65,8 @@ module npu_compute_tb #(
     wire                    act_wr_en;
     wire [ACT_ADDR_W-1:0]  act_wr_addr;
     wire [31:0]             act_wr_data;
+    wire [7:0]              act_wr_mask;
+    wire [`SRAM_B_WIDTH-1:0] act_wr_wide;
 
     wire                    param_rd_en;
     wire [PARAM_ADDR_W-1:0] param_rd_addr;
@@ -75,6 +77,7 @@ module npu_compute_tb #(
     wire                                sa_cmd_valid;
     wire [DATA_W*ARRAY_SIZE-1:0]       sa_wgt_data_flat;
     wire                                sa_wgt_valid;
+    wire                                sa_swap_wgt;
     wire [DATA_W*ARRAY_SIZE-1:0]       sa_act_data_flat;
     wire                                sa_act_valid;
     wire [ACC_W*ARRAY_SIZE-1:0]        sa_psum_out_flat;
@@ -117,7 +120,10 @@ module npu_compute_tb #(
         .a_en(1'b0), .a_we(1'b0), .a_addr({WGT_ADDR_W{1'b0}}),
         .a_wdata(32'd0), .a_rdata(),
         .b_en(wgt_rd_en), .b_we(1'b0), .b_addr(wgt_rd_addr),
-        .b_wdata(32'd0), .b_rdata(wgt_rd_data)
+        .b_wdata(32'd0),
+        .b_wmask(8'd0),
+        .b_wdata_wide({`SRAM_B_WIDTH{1'b0}}),
+        .b_rdata(wgt_rd_data)
     );
 
     // IFM: compute reads activations. Tests poke u_sram_act.mem[] for inputs.
@@ -126,7 +132,10 @@ module npu_compute_tb #(
         .a_en(1'b0), .a_we(1'b0), .a_addr({ACT_ADDR_W{1'b0}}),
         .a_wdata(32'd0), .a_rdata(),
         .b_en(act_rd_en && !act_rd_ofm), .b_we(1'b0), .b_addr(act_rd_addr),
-        .b_wdata(32'd0), .b_rdata(ifm_rd_data)
+        .b_wdata(32'd0),
+        .b_wmask(8'd0),
+        .b_wdata_wide({`SRAM_B_WIDTH{1'b0}}),
+        .b_rdata(ifm_rd_data)
     );
 
     // OFM: compute writes results (+ RMW reads). Tests read u_sram_ofm.mem[].
@@ -138,6 +147,8 @@ module npu_compute_tb #(
         .b_we(act_wr_en),
         .b_addr(act_wr_en ? act_wr_addr : act_rd_addr),
         .b_wdata(act_wr_data),
+        .b_wmask(act_wr_mask),
+        .b_wdata_wide(act_wr_wide),
         .b_rdata(ofm_rd_data)
     );
 
@@ -187,10 +198,12 @@ module npu_compute_tb #(
         .act_rd_en(act_rd_en), .act_rd_addr(act_rd_addr), .act_rd_data(act_rd_data),
         .act_rd_ofm(act_rd_ofm),
         .act_wr_en(act_wr_en), .act_wr_addr(act_wr_addr), .act_wr_data(act_wr_data),
+        .act_wr_mask(act_wr_mask), .act_wr_wide(act_wr_wide),
         .param_rd_en(param_rd_en), .param_rd_addr(param_rd_addr), .param_rd_data(param_rd_data),
         // Systolic
         .sa_cmd(sa_cmd), .sa_cmd_valid(sa_cmd_valid),
         .sa_wgt_data_flat(sa_wgt_data_flat), .sa_wgt_valid(sa_wgt_valid),
+        .sa_swap_wgt(sa_swap_wgt),
         .sa_act_data_flat(sa_act_data_flat), .sa_act_valid(sa_act_valid),
         .sa_psum_out_flat(sa_psum_out_flat), .sa_psum_out_valid(sa_psum_out_valid),
         .sa_busy(sa_busy), .sa_ready(sa_ready),
@@ -224,6 +237,7 @@ module npu_compute_tb #(
         .clk(clk), .rst_n(rst_n),
         .cmd(sa_cmd), .cmd_valid(sa_cmd_valid),
         .wgt_data_flat(sa_wgt_data_flat), .wgt_valid(sa_wgt_valid),
+        .swap_wgt(sa_swap_wgt),
         .act_data_flat(sa_act_data_flat), .act_valid(sa_act_valid),
         .psum_out_flat(sa_psum_out_flat), .psum_out_valid(sa_psum_out_valid),
         .busy(sa_busy), .ready(sa_ready)

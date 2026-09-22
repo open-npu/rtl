@@ -80,7 +80,9 @@ module npu_compute #(
     output reg  [WGT_ADDR_W-1:0]       wgt_rd_addr,
     input  wire [`SRAM_B_WIDTH-1:0]     wgt_rd_data,
 
-    // ─── Activation SRAM Port B (256-bit IFM read + 32-bit OFM write) ───
+    // ─── Activation SRAM Port B (256-bit IFM read + OFM write) ───
+    // act_wr_mask == 0: one 32-bit word in act_wr_data (DW / pool / add / resize).
+    // act_wr_mask != 0: those words of act_wr_wide, starting at act_wr_addr.
     output reg                          act_rd_en,
     output reg  [ACT_ADDR_W-1:0]       act_rd_addr,
     input  wire [`SRAM_B_WIDTH-1:0]     act_rd_data,
@@ -88,6 +90,8 @@ module npu_compute #(
     output reg                          act_wr_en,
     output reg  [ACT_ADDR_W-1:0]       act_wr_addr,
     output reg  [31:0]                  act_wr_data,
+    output reg  [7:0]                   act_wr_mask,
+    output reg  [`SRAM_B_WIDTH-1:0]     act_wr_wide,
 
     // ─── Parameter SRAM Port B (read-only) ───
     output reg                          param_rd_en,
@@ -99,6 +103,7 @@ module npu_compute #(
     output reg                          sa_cmd_valid,
     output wire [DATA_W*ARRAY_SIZE-1:0] sa_wgt_data_flat,
     output reg                          sa_wgt_valid,
+    output reg                          sa_swap_wgt,
     output wire [DATA_W*ARRAY_SIZE-1:0] sa_act_data_flat,
     output reg                          sa_act_valid,
     input  wire [ACC_W*ARRAY_SIZE-1:0]  sa_psum_out_flat,
@@ -337,7 +342,7 @@ module npu_compute #(
     localparam IF_DEPTH = ARRAY_SIZE;
     localparam IF_CNT_W = $clog2(ARRAY_SIZE + 1);
     localparam [IF_CNT_W-1:0] IF_DEPTH_CNT = ARRAY_SIZE;
-    reg [4:0]    if_px [0:IF_DEPTH-1];
+    reg [5:0]    if_px [0:IF_DEPTH-1];
     reg [15:0]   if_kp [0:IF_DEPTH-1];
     reg [COL_W-1:0] if_wr, if_rd;
     reg [IF_CNT_W-1:0] if_count;
@@ -347,8 +352,8 @@ module npu_compute #(
 
     // ─── A: param cache + streamed PPU/WB (per oc_group params are
     // pixel-invariant — load once per group, then feed PPU back-to-back)
-    reg [31:0]   param_cache [0:63];   // 16 ch × 4 words
-    reg [6:0]    cache_issue, cache_cap;
+    reg [31:0]   param_cache [0:255];  // 64 ch × 4 words
+    reg [8:0]    cache_issue, cache_cap;
     reg          feed_left;            // PPU stream feed side active
     reg [1:0]    ppu_st;               // 0=feed 1=wait 2=wb
     reg signed [DATA_W-1:0] ppu_lat [0:15];
@@ -358,7 +363,7 @@ module npu_compute #(
     reg          act_armed;            // 1 after first ACT_CMD of this k_pass
     reg          ppu_ovl;              // PPU/WB running overlapped with next-block WGT
     reg          ppu_bg;               // PPU stream runs while state is WGT/ACT
-    reg [4:0]    ppu_blk_save;         // blk_px_cnt latched at PPU start (PIXEL_NEXT overwrites)
+    reg [5:0]    ppu_blk_save;         // blk_px_cnt latched at PPU start (PIXEL_NEXT overwrites)
     reg [15:0]   ppu_oc_save;          // oc_group latched at PPU start (OC may advance)
     reg [$clog2(ARRAY_SIZE)-1:0] ppu_col_last;
     reg          ppu_ahead;            // q0 (ppu_lat) holds a completed pixel
@@ -375,7 +380,7 @@ module npu_compute #(
     reg [15:0]   wgt_held_pass;
     reg [15:0]   k_first;              // first k_pass of this spatial block
     reg [15:0]   k_fin_cnt;            // completed k_passes in this block
-    reg [4:0]    wb_px;                // WB-side pixel within block
+    reg [5:0]    wb_px;                // WB-side pixel within block
     reg [3:0]    wb_ch;                // WB-side channel
     reg [15:0]   spw_oh, spw_ow;       // WB-side pixel coords
     reg [$clog2(ARRAY_SIZE)-1:0] col_last;  // last valid drain column for current oc_group
@@ -434,23 +439,31 @@ module npu_compute #(
     reg [ACT_ADDR_W-1:0] pixel_act_base;     // Per-pixel activation base address
     reg signed [ACC_W-1:0] dot_buf [0:ARRAY_SIZE-1]; // Reduced dot products per column
 
-    // ─── 1b pixel-block weight reuse ───
-    // Partial sums for a 16-pixel block × 16 columns. Weights are loaded once
-    // per (oc_group, k_pass) and reused across the block's pixels instead of
-    // being re-streamed per pixel (baseline: ~92% of conv cycles were weight
-    // re-streaming). Accumulation order per output element is unchanged
-    // (pass-sequential, wraparound add) → bit-exact with the old schedule.
-    // Two banks: PPU feeds bank rd while the next spatial block accumulates
-    // into bank wr. Index is {bank, px_in_blk[3:0], col[3:0]}.
-    reg signed [ACC_W-1:0] px_acc_buf [0:511];
+    // ─── Pixel-block weight reuse ───
+    // One k_pass of weights is reused across BLK_PX_MAX pixels. Two banks:
+    // PPU reads bank rd while the next block accumulates into bank wr.
+    // 32 (not 16) so a pass is long enough to park the next pass's weights
+    // in the PE shadow before the psum drain ends.
+    localparam BLK_PX_MAX = 32;
+    localparam ACC_N = 2 * BLK_PX_MAX * ARRAY_SIZE;
+    reg signed [ACC_W-1:0] px_acc_buf [0:ACC_N-1];
+    function integer acc_at;
+        input              bank;
+        input [5:0]        px;
+        input integer      col;
+        begin
+            acc_at = ((bank ? BLK_PX_MAX : 0) + px) * ARRAY_SIZE + col;
+        end
+    endfunction
     reg          acc_wr_bank;
     reg          acc_rd_bank;
     reg [15:0] blk_oh_start, blk_ow_start;       // sp of first pixel in block
     reg [15:0] px_remaining;                     // pixels left in this oc_group/tile
-    reg [4:0]  px_in_blk;                        // pixel index within block (0..15)
-    reg [4:0]  blk_px_cnt;                       // pixels in current block (1..16)
-    reg [4:0]  ppu_px;                           // PPU-loop pixel index within block
-
+    reg [5:0]  px_in_blk;                        // pixel index within block
+    reg [5:0]  blk_px_cnt;                       // pixels in current block (1..BLK_PX_MAX)
+    reg [5:0]  ppu_px;                           // PPU-loop pixel index within block
+    reg [4:0]  wgt_nxt_col;                      // column of wgt_sh copied into PE shadow
+    reg        wgt_nxt_done;
     // ─── Multi-pass (k_depth > ARRAY_SIZE) ───
     reg [15:0] k_pass;           // Current pass index (0-based)
     reg [15:0] k_pass_max;       // Total passes - 1
@@ -511,8 +524,8 @@ module npu_compute #(
     wire        grp8_mode = (cfg_wgt_per_oc != 32'd0)
                          && ((kd_bytes << 2) > (`SPAD_KB * 128));  // 16ch words = kd_bytes*16/4
     wire [4:0]  grp_oc    = grp8_mode ? 5'd8 : 5'd16;
-    wire [4:0]  param_nch = {1'b0, col_last} + 5'd1;
-    wire [6:0]  param_tgt = {param_nch, 2'b00}; // nch * 4 words
+    wire [6:0]  param_nch = {3'b0, col_last} + 7'd1;
+    wire [8:0]  param_tgt = {param_nch, 2'b00}; // nch * 4 words
     wire        param_feed_busy = ppu_bg && (ppu_px < ppu_blk_save);
     wire        param_ready = !param_pend
                             && (cache_issue >= param_tgt)
@@ -743,6 +756,7 @@ module npu_compute #(
             sa_cmd       <= MODE_IDLE;
             sa_cmd_valid <= 1'b0;
             sa_wgt_valid <= 1'b0;
+            sa_swap_wgt  <= 1'b0;
             sa_act_valid <= 1'b0;
             wgt_rd_en   <= 1'b0;
             wgt_rd_addr <= 0;
@@ -756,6 +770,8 @@ module npu_compute #(
             act_wr_en   <= 1'b0;
             act_wr_addr <= 0;
             act_wr_data <= 32'd0;
+            act_wr_mask <= 8'd0;
+            act_wr_wide <= {`SRAM_B_WIDTH{1'b0}};
             param_rd_en <= 1'b0;
             param_rd_addr <= 0;
             ppu_acc_in   <= 0;
@@ -819,6 +835,8 @@ module npu_compute #(
             wgt_sh_pass <= 16'd0;
             wgt_pf_col <= 0;
             wgt_pf_ph <= 0;
+            wgt_nxt_col <= 0;
+            wgt_nxt_done <= 1'b0;
             wgt_from_sh <= 1'b0;
             wgt_held <= 1'b0;
             wgt_held_pass <= 16'd0;
@@ -868,11 +886,13 @@ module npu_compute #(
             tile_done_r  <= 1'b0;
             sa_cmd_valid <= 1'b0;
             sa_wgt_valid <= 1'b0;
+            sa_swap_wgt  <= 1'b0;
             sa_act_valid <= 1'b0;
             wgt_rd_en   <= 1'b0;
             act_rd_en   <= 1'b0;
             act_rd_ofm  <= 1'b0;
             act_wr_en   <= 1'b0;
+            act_wr_mask <= 8'd0;
             param_rd_en <= 1'b0;
             ppu_in_valid <= 1'b0;
             ppu_valid_w  <= {ARRAY_SIZE{1'b0}};
@@ -888,11 +908,11 @@ module npu_compute #(
             if (if_collect) begin
                 for (i = 0; i < ARRAY_SIZE; i = i + 1) begin
                     if (if_kp[if_rd] == k_first)
-                        px_acc_buf[{acc_wr_bank, if_px[if_rd][3:0], i[3:0]}]
+                        px_acc_buf[acc_at(acc_wr_bank, if_px[if_rd], i)]
                             <= sa_psum_out[i];
                     else
-                        px_acc_buf[{acc_wr_bank, if_px[if_rd][3:0], i[3:0]}]
-                            <= px_acc_buf[{acc_wr_bank, if_px[if_rd][3:0], i[3:0]}]
+                        px_acc_buf[acc_at(acc_wr_bank, if_px[if_rd], i)]
+                            <= px_acc_buf[acc_at(acc_wr_bank, if_px[if_rd], i)]
                                + sa_psum_out[i];
                 end
                 if_rd <= if_rd + 1'b1;
@@ -915,91 +935,81 @@ module npu_compute #(
                 begin : ppu_stream_blk
                     reg [31:0] elem_off;
                     reg [4:0]  nch;
-                    reg        last_wb;
-                    reg        vout;
+                    reg [3:0]  nwords;
                     reg [4:0]  inflight;
                     nch = {1'b0, ppu_col_last} + 5'd1;
-                    last_wb = ppu_ahead && ((cfg_int16 && (ppu_wb_idx + 5'd2 >= nch))
-                                         || (!cfg_int16 && (ppu_wb_idx + 5'd4 >= nch)));
-                    vout = ppu_vout_w[0] || ppu_out_valid;
+                    // One beat holds the whole OC group: 4 INT8 or 2 INT16 per word.
+                    nwords = cfg_int16 ? ((nch + 5'd1) >> 1) : ((nch + 5'd3) >> 2);
                     inflight = ppu_px - wb_px;
 
-                    if (vout) begin
-                        if (!ppu_ahead || last_wb) begin
-                            for (i = 0; i < ARRAY_SIZE; i = i + 1)
-                                ppu_lat[i] <= ppu_out_w[DATA_W*i +: DATA_W];
-                            if (!ppu_vout_w[0])
-                                ppu_lat[0] <= ppu_out_data;
-                        end else begin
-                            for (i = 0; i < ARRAY_SIZE; i = i + 1)
-                                ppu_lat2[i] <= ppu_out_w[DATA_W*i +: DATA_W];
-                            if (!ppu_vout_w[0])
-                                ppu_lat2[0] <= ppu_out_data;
-                            ppu_pend <= 1'b1;
-                        end
-                    end
-
-                    if (ppu_ahead) begin
+                    // PPU latency is 4 and throughput is 1/cycle. Write the
+                    // group the cycle it comes out, and keep 4 pixels in flight
+                    // so the pipe stays full.
+                    if (ppu_vout_w[0] || ppu_out_valid) begin
                         elem_off = (spw_oh * out_tile_w + spw_ow) * cfg_out_c
-                                 + ppu_oc_save * {11'd0, grp_oc}
-                                 + {11'd0, ppu_wb_idx};
+                                 + ppu_oc_save * {11'd0, grp_oc};
                         act_wr_en <= 1'b1;
                         if (cfg_int16) begin
                             act_wr_addr <= out_base + elem_off[17:1];
-                            act_wr_data <= {ppu_lat[ppu_wb_idx[3:0] + 4'd1],
-                                            ppu_lat[ppu_wb_idx[3:0]]};
-                            ppu_wb_idx <= ppu_wb_idx + 5'd2;
+                            for (i = 0; i < 8; i = i + 1) begin
+                                act_wr_mask[i] <= (i < nwords);
+                                act_wr_wide[32*i +: 16] <=
+                                    ((2*i) < ARRAY_SIZE)
+                                    ? ppu_out_w[DATA_W*(2*i) +: DATA_W] : 16'd0;
+                                act_wr_wide[32*i+16 +: 16] <=
+                                    ((2*i+1) < ARRAY_SIZE)
+                                    ? ppu_out_w[DATA_W*(2*i+1) +: DATA_W] : 16'd0;
+                            end
                         end else begin
                             act_wr_addr <= out_base + elem_off[17:2];
-                            act_wr_data <= {ppu_lat[ppu_wb_idx[3:0] + 4'd3][7:0],
-                                            ppu_lat[ppu_wb_idx[3:0] + 4'd2][7:0],
-                                            ppu_lat[ppu_wb_idx[3:0] + 4'd1][7:0],
-                                            ppu_lat[ppu_wb_idx[3:0]][7:0]};
-                            ppu_wb_idx <= ppu_wb_idx + 5'd4;
-                        end
-                        if (last_wb) begin
-                            if (wb_px + 1 >= ppu_blk_save) begin
-                                if (!ppu_bg) begin
-                                    sp_oh <= spw_oh;
-                                    sp_ow <= spw_ow;
-                                    state <= S_PIXEL_NEXT;
-                                end
-                                ppu_ovl    <= 1'b0;
-                                ppu_bg     <= 1'b0;
-                                ppu_ahead  <= 1'b0;
-                                ppu_pend   <= 1'b0;
-                            end else begin
-                                wb_px <= wb_px + 1;
-                                if (spw_ow + 1 >= out_tile_w) begin
-                                    spw_ow <= 0;
-                                    spw_oh <= spw_oh + 1;
-                                end else begin
-                                    spw_ow <= spw_ow + 1;
-                                end
-                                if (ppu_pend) begin
-                                    for (i = 0; i < ARRAY_SIZE; i = i + 1)
-                                        ppu_lat[i] <= ppu_lat2[i];
-                                    ppu_pend <= 1'b0;
-                                    ppu_wb_idx <= 0;
-                                    ppu_ahead <= 1'b1;
-                                end else if (vout) begin
-                                    ppu_wb_idx <= 0;
-                                    ppu_ahead <= 1'b1;
-                                end else begin
-                                    ppu_ahead <= 1'b0;
-                                end
+                            for (i = 0; i < 8; i = i + 1) begin
+                                act_wr_mask[i] <= (i < nwords);
+                                act_wr_wide[32*i +: 8] <=
+                                    ((4*i) < ARRAY_SIZE)
+                                    ? ppu_out_w[DATA_W*(4*i) +: 8] : 8'd0;
+                                act_wr_wide[32*i+8 +: 8] <=
+                                    ((4*i+1) < ARRAY_SIZE)
+                                    ? ppu_out_w[DATA_W*(4*i+1) +: 8] : 8'd0;
+                                act_wr_wide[32*i+16 +: 8] <=
+                                    ((4*i+2) < ARRAY_SIZE)
+                                    ? ppu_out_w[DATA_W*(4*i+2) +: 8] : 8'd0;
+                                act_wr_wide[32*i+24 +: 8] <=
+                                    ((4*i+3) < ARRAY_SIZE)
+                                    ? ppu_out_w[DATA_W*(4*i+3) +: 8] : 8'd0;
                             end
                         end
-                    end else if (vout) begin
-                        ppu_ahead <= 1'b1;
-                        ppu_wb_idx <= 0;
+                        if (!ppu_vout_w[0]) begin
+                            if (cfg_int16)
+                                act_wr_wide[15:0] <= ppu_out_data;
+                            else
+                                act_wr_wide[7:0] <= ppu_out_data[7:0];
+                        end
+                        if (wb_px + 1 >= ppu_blk_save) begin
+                            if (!ppu_bg) begin
+                                sp_oh <= spw_oh;
+                                sp_ow <= spw_ow;
+                                state <= S_PIXEL_NEXT;
+                            end
+                            ppu_ovl    <= 1'b0;
+                            ppu_bg     <= 1'b0;
+                            ppu_ahead  <= 1'b0;
+                            ppu_pend   <= 1'b0;
+                        end else begin
+                            wb_px <= wb_px + 1;
+                            if (spw_ow + 1 >= out_tile_w) begin
+                                spw_ow <= 0;
+                                spw_oh <= spw_oh + 1;
+                            end else begin
+                                spw_ow <= spw_ow + 1;
+                            end
+                        end
                     end
 
-                    if ((ppu_px < ppu_blk_save) && (inflight < 5'd2)) begin
+                    if ((ppu_px < ppu_blk_save) && (inflight < 5'd5)) begin
                         for (i = 0; i < ARRAY_SIZE; i = i + 1) begin
                             if (i[3:0] <= ppu_col_last) begin
                                 ppu_acc_w[ACC_W*i +: ACC_W]
-                                    <= px_acc_buf[{acc_rd_bank, ppu_px[3:0], i[3:0]}];
+                                    <= px_acc_buf[acc_at(acc_rd_bank, ppu_px, i)];
                                 ppu_mult_w[15*i +: 15]
                                     <= param_cache[{i[3:0], 2'b00}][14:0];
                                 ppu_shift_w[6*i +: 6]
@@ -1014,7 +1024,7 @@ module npu_compute #(
                             end
                         end
                         ppu_in_valid <= 1'b1;
-                        ppu_acc_in   <= px_acc_buf[{acc_rd_bank, ppu_px[3:0], 4'd0}];
+                        ppu_acc_in   <= px_acc_buf[acc_at(acc_rd_bank, ppu_px, 0)];
                         ppu_px <= ppu_px + 1;
                     end
                 end
@@ -1034,7 +1044,7 @@ module npu_compute #(
                     cache_issue   <= cache_issue + 1;
                 end
                 if (cache_issue >= 2 && cache_cap < param_tgt) begin
-                    param_cache[cache_cap[5:0]] <= param_rd_data;
+                    param_cache[cache_cap[7:0]] <= param_rd_data;
                     cache_cap <= cache_cap + 1;
                 end
             end
@@ -1264,7 +1274,7 @@ module npu_compute #(
                     reg [31:0] tpx;
                     tpx = {16'd0, out_tile_h} * {16'd0, out_tile_w};
                     px_remaining <= tpx[15:0];
-                    blk_px_cnt   <= (tpx >= 32'd16) ? 5'd16 : tpx[4:0];
+                    blk_px_cnt   <= (tpx >= BLK_PX_MAX) ? BLK_PX_MAX[5:0] : tpx[5:0];
                 end
 
                 // Reset writeback packing state for this OC group
@@ -1299,7 +1309,8 @@ module npu_compute #(
             S_PPU_STREAM: begin
             end
 
-            // ══════════════════════════════════════════════════════════════
+            // 1D OC-parallel conv. Preload this group's weights once, then for
+            // each pixel gather K and accumulate one tap per cycle.
             // WEIGHT LOAD: load ARRAY_SIZE columns, one per wgt_valid pulse
             // ══════════════════════════════════════════════════════════════
             S_WGT_CMD: begin
@@ -1328,6 +1339,8 @@ module npu_compute #(
                 end
                 wgt_pf_col <= 0;
                 wgt_pf_ph  <= 2'd0;
+                wgt_nxt_col <= 0;
+                wgt_nxt_done <= 1'b0;
                 if (wgt_sh_ok && wgt_sh_pass == k_pass) begin
                     wgt_from_sh <= 1'b1;
                     wgt_sh_ok   <= 1'b0;
@@ -2018,7 +2031,20 @@ module npu_compute #(
                             act_armed <= 1'b0;
                             sp_oh <= blk_oh_start;
                             sp_ow <= blk_ow_start;
-                            if (wgt_held && (nxt == wgt_held_pass)) begin
+                            if (wgt_nxt_done && (wgt_sh_pass == nxt)) begin
+                                // Shadow weights already sit in the PEs.
+                                // Swap after the old chain has drained.
+                                sa_swap_wgt  <= 1'b1;
+                                wgt_held     <= 1'b1;
+                                wgt_held_pass <= nxt;
+                                wgt_sh_ok    <= 1'b0;
+                                wgt_nxt_done <= 1'b0;
+                                wgt_nxt_col  <= 0;
+                                k_pass_remain <= (nxt == k_pass_max)
+                                    ? (k_depth - nxt * ARRAY_SIZE_16)
+                                    : ARRAY_SIZE_16;
+                                state <= S_SPATIAL_SETUP;
+                            end else if (wgt_held && (nxt == wgt_held_pass)) begin
                                 k_pass_remain <= (nxt == k_pass_max)
                                     ? (k_depth - nxt * ARRAY_SIZE_16)
                                     : ARRAY_SIZE_16;
@@ -2068,12 +2094,12 @@ module npu_compute #(
             // PPU FEED: send ONE dot product (dot_buf[drain_col]) to PPU
             // ══════════════════════════════════════════════════════════════
             S_PPU_FEED: begin
-                ppu_acc_in   <= px_acc_buf[{acc_rd_bank, ppu_px[3:0], drain_col[3:0]}];
+                ppu_acc_in   <= px_acc_buf[acc_at(acc_rd_bank, ppu_px, drain_col)];
                 ppu_in_valid <= 1'b1;
 `ifndef SYNTHESIS
                 if (cfg_2d_load && drain_col == 0 && tile_x == 0 && tile_y == 0 && sp_oh == 0 && sp_ow == 0)
                     $display("[L2PPU] drain=%0d acc=%0d bias=%0d M=%0d S=%0d zp=%0d",
-                            drain_col, px_acc_buf[{acc_rd_bank, ppu_px[3:0], drain_col[3:0]}],
+                            drain_col, px_acc_buf[acc_at(acc_rd_bank, ppu_px, drain_col)],
                             $signed({param_buf[3][15:0], param_buf[2], param_buf[1][31:16]}),
                             param_buf[0][14:0], param_buf[0][21:16],
                             $signed(param_buf[1][15:0]));
@@ -2379,6 +2405,8 @@ module npu_compute #(
                 px_in_blk <= 0;
                 k_fin_cnt <= 16'd0;
                 act_armed <= 1'b0;
+                wgt_nxt_done <= 1'b0;
+                wgt_nxt_col <= 0;
                 if (!ppu_bg)
                     ppu_px <= 0;
                 begin : blk_adv_blk
@@ -2389,7 +2417,7 @@ module npu_compute #(
                         state <= S_OC_NEXT;
                     end else begin
                         px_remaining <= rem_next;
-                        blk_px_cnt   <= (rem_next >= 16'd16) ? 5'd16 : rem_next[4:0];
+                        blk_px_cnt   <= (rem_next >= BLK_PX_MAX) ? BLK_PX_MAX[5:0] : rem_next[5:0];
                         // Advance sp to the next block's first pixel (row-major)
                         if (sp_ow + 1 >= out_tile_w) begin
                             sp_ow <= 0;
@@ -4071,6 +4099,24 @@ module npu_compute #(
                         wgt_pf_ph  <= 2'd0;
                     end
                 end
+            end
+
+            // Park the prefetched next-pass weights into each PE's shadow
+            // while this pass is still using weight_reg. One column per
+            // cycle. The psum drain then swaps them in one cycle.
+            if (!wgt_nxt_done && wgt_sh_ok && (wgt_sh_pass != k_pass)
+                    && (state == S_ACT_LOAD || state == S_ACT_EMIT
+                        || state == S_ACT_FLUSH || state == S_ACT_CMD
+                        || state == S_SPATIAL_SETUP
+                        || state == S_PSUM_COLLECT)) begin
+                sa_wgt_valid <= 1'b1;
+                for (i = 0; i < ARRAY_SIZE; i = i + 1)
+                    sa_wgt_data[i] <= wgt_sh[{wgt_nxt_col[COL_W-1:0], i[COL_W-1:0]}];
+                if (wgt_nxt_col >= {1'b0, COL_MAX}) begin
+                    wgt_nxt_done <= 1'b1;
+                    wgt_nxt_col  <= 0;
+                end else
+                    wgt_nxt_col <= wgt_nxt_col + 1'b1;
             end
         end
     end

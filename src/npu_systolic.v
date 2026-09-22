@@ -52,6 +52,9 @@ module npu_systolic #(
     // ─── Weight Load ───
     input  wire [DATA_W*ROWS-1:0]       wgt_data_flat,
     input  wire                         wgt_valid,
+    // While COMPUTE, wgt_valid fills weight_nxt one column per cycle.
+    // swap_wgt commits every column after the old psum chain has drained.
+    input  wire                         swap_wgt,
 
     // ─── Activation Input (unskewed; one vector per cycle) ───
     input  wire [DATA_W*ROWS-1:0]       act_data_flat,
@@ -90,6 +93,7 @@ module npu_systolic #(
 
     reg [2:0] state, state_next;
     reg [$clog2(COLS)-1:0] wgt_col_cnt;
+    reg [$clog2(COLS)-1:0] nxt_col;
     reg wgt_load_done;
 
     localparam [$clog2(COLS)-1:0] COL_MAX = COLS - 1;
@@ -146,6 +150,15 @@ module npu_systolic #(
             wgt_col_cnt <= wgt_col_cnt + 1;
         else if (state != S_WGT_LOAD)
             wgt_col_cnt <= 0;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            nxt_col <= 0;
+        else if (swap_wgt || state != S_COMPUTE)
+            nxt_col <= 0;
+        else if (wgt_valid)
+            nxt_col <= nxt_col + 1;
     end
 
     // ─── Status ───
@@ -243,6 +256,9 @@ module npu_systolic #(
                     .valid_in       (pe_valid[r][c]),
                     .act_in         (pe_act_in[r][c]),
                     .weight_in      (pe_wgt_in[r][c]),
+                    .load_nxt       ((state == S_COMPUTE) && wgt_valid
+                                     && (nxt_col == c[$clog2(COLS)-1:0])),
+                    .swap_wgt       (swap_wgt),
                     .psum_in        (pe_psum_in[r][c]),
                     .psum_out       (pe_psum_out[r][c]),
                     .psum_valid_out (pe_psum_val[r][c])
