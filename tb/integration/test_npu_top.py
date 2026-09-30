@@ -223,6 +223,24 @@ async def test_irq_generation(dut):
     assert busy_bit == 1, f"Expected busy after START, got status=0x{status:08X}"
 
 
+async def configure_slow_layer(wb):
+    """A 1x1 conv big enough that compute is still running after the DMA.
+
+    OUT_C=0 finishes immediately, so a layer left at its reset shape cannot
+    be used to hold the controller in its compute phase.
+    """
+    await wb.write(0x040, 0x0000)        # LAYER_MODE: conv2d, int8
+    await wb.write(0x044, 0x0008_0008)   # IN 8x8
+    await wb.write(0x048, 16)            # IN_C
+    await wb.write(0x04C, 0x0008_0008)   # OUT 8x8
+    await wb.write(0x050, 16)            # OUT_C
+    await wb.write(0x054, 0x0101)        # kernel 1x1
+    await wb.write(0x058, 0x0101)        # stride 1x1
+    await wb.write(0x05C, 0)             # no padding
+    await wb.write(0x070, 0)             # no tiling
+    await wb.write(0x074, 0x0001_0001)   # 1x1 tiles
+
+
 @cocotb.test()
 async def test_dma_load_weight(dut):
     """Load weight data from external memory into weight SRAM via DMA."""
@@ -245,6 +263,9 @@ async def test_dma_load_weight(dut):
     await wb.write(0x128, 0)          # DMA_IN_SIZE = 0
     await wb.write(0x10C, 0x9000_0000)  # DMA_PARAM_ADDR (different)
     await wb.write(0x188, 0)          # POST_PARAM_COUNT = 0
+    # A layer shape whose compute outlasts the DMA phase, so the busy check
+    # below is about the controller and not about an empty layer stalling.
+    await configure_slow_layer(wb)
 
     # Start layer
     await wb.write(0x000, 0x01)
@@ -354,6 +375,7 @@ async def test_full_dma_cycle_with_abort(dut):
     await wb.write(0x128, 0)           # DMA_IN_SIZE = 0 (skip)
     await wb.write(0x10C, 0x6000_0000) # DMA_PARAM_ADDR
     await wb.write(0x188, 0)           # POST_PARAM_COUNT = 0
+    await configure_slow_layer(wb)
 
     # Start
     await wb.write(0x000, 0x01)

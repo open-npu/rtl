@@ -18,6 +18,10 @@ import sys
 import os
 import subprocess
 import json
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wgt_layout import OC_MAJOR, K_MAJOR, conv_blob, dw_blob, words_from_bytes
 import numpy as np
 
 # Add tools to path
@@ -298,16 +302,14 @@ def pack_params_sram(ch_params, n_ch):
     return words
 
 
-def pack_conv_weights_sram_int16(weight, out_c, k_depth):
-    """Pack Conv2D weights for INT16 SRAM: [out_c][kh][kw][in_c] → 2 per word."""
-    flat = weight.reshape(out_c * k_depth).astype(np.int16)
-    return pack_int16_sram(flat)
+def pack_conv_weights_sram_int16(weight, out_c, k_depth, layout=K_MAJOR):
+    """Pack Conv2D weights for INT16 SRAM: [out_c][kh][kw][in_c] -> 2 per word."""
+    return pack_int16_sram(conv_blob(weight, out_c, k_depth, layout).astype(np.int16))
 
 
-def pack_dw_weights_sram_int16(weight, n_ch):
-    """Pack DW weights for INT16 SRAM: [ch][3][3] → 2 per word."""
-    flat = weight.flatten().astype(np.int16)
-    return pack_int16_sram(flat)
+def pack_dw_weights_sram_int16(weight, n_ch, layout=K_MAJOR):
+    """Pack DW weights for INT16 SRAM: [ch][3][3] -> 2 per word."""
+    return pack_int16_sram(dw_blob(weight, n_ch, layout).astype(np.int16))
 
 
 def generate_golden(output_dir):

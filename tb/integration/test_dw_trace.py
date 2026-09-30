@@ -15,6 +15,7 @@ async def test_dw_trace(dut):
     dut.cfg_act_base.value = 0
     dut.cfg_out_base.value = 0
     dut.db_prefetch_done.value = 1
+    dut.cfg_wgt_layout.value = 1  # K-major: conv/dw run on the 64-lane row
     for _ in range(5):
         await RisingEdge(dut.clk)
     dut.rst_n.value = 1

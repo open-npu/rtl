@@ -63,6 +63,7 @@ module npu_ctrl #(
     input  wire [31:0]  cfg_dma_in_size,     // in bytes
     input  wire [31:0]  cfg_dma_wgt_size,    // in bytes
     input  wire [31:0]  cfg_dma_wgt_per_oc, // per-oc_group weight words (0=all at once)
+    input  wire         cfg_wgt_layout,     // 0=OC-major (systolic), 1=K-major (64-lane row)
     input  wire [31:0]  cfg_dma_out_size,    // in bytes
     input  wire [31:0]  cfg_tile_in_size,    // per-tile input size (bytes), 0=use full in_size
     input  wire [15:0]  cfg_param_count,     // number of output channels
@@ -239,7 +240,7 @@ module npu_ctrl #(
     // ctrl-side replica of compute's grp8_mode (16-ch per-oc block > WGT SRAM)
     wire [31:0] kd_bytes    = ({24'd0, cfg_kernel_h} * {24'd0, cfg_kernel_w}
                                * {16'd0, cfg_in_c}) << (cfg_int16 ? 1 : 0);
-    wire        grp8_mode   = (cfg_dma_wgt_per_oc != 32'd0)
+    wire        grp8_mode   = !cfg_wgt_layout && (cfg_dma_wgt_per_oc != 32'd0)
                            && ((kd_bytes << 2) > (`SPAD_KB * 128));
     // Guard helpers (evaluated at S_IDLE, see E4-E7 below)
     wire [31:0] kd_elems32  = {24'd0, cfg_kernel_h} * {24'd0, cfg_kernel_w}

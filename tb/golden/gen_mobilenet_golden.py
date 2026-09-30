@@ -24,6 +24,10 @@ SPDX-License-Identifier: Apache-2.0
 import numpy as np
 import os
 import json
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wgt_layout import OC_MAJOR, K_MAJOR, conv_blob, dw_blob, words_from_bytes
 
 
 def compute_ms(eff_scale):
@@ -155,43 +159,16 @@ def pack_params_for_sram(M_arr, S_arr, bias_arr, zp_arr, n_ch):
     return words
 
 
-def pack_conv_weights_for_sram(weight_ohwi, out_c, k_depth):
-    """Pack Conv2D weights in contiguous OHWI byte format for SRAM.
-
-    weight_ohwi: [out_c][kh][kw][in_c] int8
-    Returns list of uint32 words.
-    """
-    # Flatten to bytes: col c starts at byte c*k_depth
-    flat = weight_ohwi.reshape(out_c, k_depth).astype(np.int8)
-    # Pack all bytes contiguously
-    total_bytes = out_c * k_depth
-    byte_arr = flat.tobytes()  # contiguous in memory
-    # Pad to word boundary
-    pad_len = (4 - len(byte_arr) % 4) % 4
-    byte_arr = byte_arr + b'\x00' * pad_len
-    # Convert to uint32 words (little-endian)
-    words = []
-    for i in range(0, len(byte_arr), 4):
-        w = int.from_bytes(byte_arr[i:i+4], 'little', signed=False)
-        words.append(w)
-    return words
+def pack_conv_weights_for_sram(weight_ohwi, out_c, k_depth, layout=K_MAJOR):
+    """Pack Conv2D weights [out_c][kh][kw][in_c] into uint32 SRAM words."""
+    blob = conv_blob(weight_ohwi, out_c, k_depth, layout).astype(np.int8)
+    return words_from_bytes(blob.tobytes())
 
 
-def pack_dw_weights_for_sram(weight_chw, n_ch, kernel_size):
-    """Pack DW Conv weights for SRAM.
-
-    weight_chw: [ch][kh][kw] int8
-    Each channel's kernel (kh*kw bytes) packed contiguously.
-    Returns list of uint32 words.
-    """
-    byte_arr = weight_chw.astype(np.int8).tobytes()
-    pad_len = (4 - len(byte_arr) % 4) % 4
-    byte_arr = byte_arr + b'\x00' * pad_len
-    words = []
-    for i in range(0, len(byte_arr), 4):
-        w = int.from_bytes(byte_arr[i:i+4], 'little', signed=False)
-        words.append(w)
-    return words
+def pack_dw_weights_for_sram(weight_chw, n_ch, kernel_size, layout=K_MAJOR):
+    """Pack DW Conv weights [ch][kh][kw] into uint32 SRAM words."""
+    blob = dw_blob(weight_chw, n_ch, layout).astype(np.int8)
+    return words_from_bytes(blob.tobytes())
 
 
 def pack_activations_for_sram(act_nhwc):

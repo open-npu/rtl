@@ -20,6 +20,9 @@ TOPLEVEL_LANG ?= verilog
 # ─── Hardware parameters (override to test different configs) ───
 ARRAY_SIZE ?= 8
 SPAD_KB    ?= 192
+# Tests that size flattened operand buses read these back from the environment.
+export ARRAY_SIZE
+export SPAD_KB
 ACC_WIDTH  ?= 44     # 40: model_b (C_in≤64); 44: ResNet18 (C_in≤256, k_depth≤2304); 48: future-proof
 
 # ─── Paths ───
@@ -102,6 +105,12 @@ COMPILE_ARGS += +define+SYNTHESIS
 endif
 else
 COMPILE_ARGS = -g2012 -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH)
+ifdef FORCE_MESH
+COMPILE_ARGS += -DFORCE_MESH
+endif
+ifdef DBG_ROW
+COMPILE_ARGS += -DDBG_ROW
+endif
 endif
 
 # ─── cocotb config ───

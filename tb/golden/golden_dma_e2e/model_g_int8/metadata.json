@@ -1,0 +1,83 @@
+[
+  {
+    "name": "c0",
+    "op_type": 0,
+    "data_type": 0,
+    "in_h": 32, "in_w": 32, "in_c": 3,
+    "out_h": 32, "out_w": 32, "out_c": 16,
+    "kernel_h": 3, "kernel_w": 3, "stride_h": 1, "stride_w": 1,
+    "pad_top": 1, "pad_left": 1, "k_depth": 27
+  },
+  {
+    "name": "c1",
+    "op_type": 0,
+    "data_type": 0,
+    "in_h": 32, "in_w": 32, "in_c": 16,
+    "out_h": 32, "out_w": 32, "out_c": 16,
+    "kernel_h": 3, "kernel_w": 3, "stride_h": 1, "stride_w": 1,
+    "pad_top": 1, "pad_left": 1, "k_depth": 144
+  },
+  {
+    "name": "p0",
+    "op_type": 3,
+    "data_type": 0,
+    "in_h": 32, "in_w": 32, "in_c": 16,
+    "out_h": 16, "out_w": 16, "out_c": 16,
+    "kernel_h": 2, "kernel_w": 2, "stride_h": 2, "stride_w": 2,
+    "pad_top": 0, "pad_left": 0, "k_depth": 1
+  },
+  {
+    "name": "c2",
+    "op_type": 0,
+    "data_type": 0,
+    "in_h": 16, "in_w": 16, "in_c": 16,
+    "out_h": 16, "out_w": 16, "out_c": 32,
+    "kernel_h": 3, "kernel_w": 3, "stride_h": 1, "stride_w": 1,
+    "pad_top": 1, "pad_left": 1, "k_depth": 144
+  },
+  {
+    "name": "c3",
+    "op_type": 0,
+    "data_type": 0,
+    "in_h": 16, "in_w": 16, "in_c": 32,
+    "out_h": 16, "out_w": 16, "out_c": 32,
+    "kernel_h": 3, "kernel_w": 3, "stride_h": 1, "stride_w": 1,
+    "pad_top": 1, "pad_left": 1, "k_depth": 288
+  },
+  {
+    "name": "p1",
+    "op_type": 3,
+    "data_type": 0,
+    "in_h": 16, "in_w": 16, "in_c": 32,
+    "out_h": 8, "out_w": 8, "out_c": 32,
+    "kernel_h": 2, "kernel_w": 2, "stride_h": 2, "stride_w": 2,
+    "pad_top": 0, "pad_left": 0, "k_depth": 1
+  },
+  {
+    "name": "c4",
+    "op_type": 0,
+    "data_type": 0,
+    "in_h": 8, "in_w": 8, "in_c": 32,
+    "out_h": 8, "out_w": 8, "out_c": 64,
+    "kernel_h": 3, "kernel_w": 3, "stride_h": 1, "stride_w": 1,
+    "pad_top": 1, "pad_left": 1, "k_depth": 288
+  },
+  {
+    "name": "gap",
+    "op_type": 3,
+    "data_type": 0,
+    "in_h": 8, "in_w": 8, "in_c": 64,
+    "out_h": 1, "out_w": 1, "out_c": 64,
+    "kernel_h": 8, "kernel_w": 8, "stride_h": 1, "stride_w": 1,
+    "pad_top": 0, "pad_left": 0, "k_depth": 1
+  },
+  {
+    "name": "fc",
+    "op_type": 2,
+    "data_type": 0,
+    "in_h": 1, "in_w": 1, "in_c": 64,
+    "out_h": 1, "out_w": 1, "out_c": 2,
+    "kernel_h": 1, "kernel_w": 1, "stride_h": 1, "stride_w": 1,
+    "pad_top": 0, "pad_left": 0, "k_depth": 64
+  }
+]

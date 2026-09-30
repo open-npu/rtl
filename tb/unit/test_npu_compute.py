@@ -40,6 +40,8 @@ async def reset_dut(dut):
     dut.db_prefetch_done.value = 1  # No DB_EN in unit tests — always ready
     dut.wgt_reload_done.value = 1
     dut.cfg_wgt_per_oc.value = 0
+    # K-major: these shapes are the ones the compiler routes to the 64-lane row.
+    dut.cfg_wgt_layout.value = 1
     dut.cfg_int16.value = 0
     dut.cfg_in_zp.value = 0
     dut.cfg_act_base.value = 0
@@ -104,7 +106,7 @@ async def systolic_ppu_stub(dut):
         except Exception:
             pass
 
-        if ppu_in == 1:
+        if ppu_in:
             ppu_pipeline.append(cycle + 4)  # 4-cycle PPU pipeline
 
         # Check if any PPU outputs are due
@@ -193,50 +195,54 @@ async def test_start_pulse(dut):
 
 @cocotb.test()
 async def test_weight_load_timing(dut):
-    """Verify weight load produces ARRAY_SIZE wgt_valid pulses."""
+    """Conv issues one WGT_LOAD per 64-channel group, then one MAC per K.
+
+    The 8x8 mesh is not on this path, so sa_wgt_valid stays low.
+    """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
+    cocotb.start_soon(systolic_ppu_stub(dut))
 
     ARRAY_SIZE = get_array_size(dut)
     in_c = ARRAY_SIZE
     out_c = ARRAY_SIZE
     set_cfg_conv2d(dut, in_c=in_c, out_c=out_c, kh=1, kw=1, out_h=1, out_w=1)
 
-    # Pulse start
     dut.start.value = 1
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    # Count wgt_valid pulses
+    wgt_cmds = 0
+    mac_fires = 0
     wgt_valid_count = 0
-    for _ in range(500):
+    for _ in range(5000):
         await RisingEdge(dut.clk)
         await ReadOnly()
+        if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 1:
+            wgt_cmds += 1
         if int(dut.sa_wgt_valid.value) == 1:
             wgt_valid_count += 1
-        # Stop after seeing compute command
-        if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 2:  # MODE_COMPUTE
+        if int(dut.mac1d_fire.value) == 1:
+            mac_fires += 1
+        if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert wgt_valid_count == ARRAY_SIZE, \
-        f"Expected {ARRAY_SIZE} wgt_valid pulses, got {wgt_valid_count}"
+    assert wgt_cmds == 1, f"Expected 1 WGT_LOAD for out_c={out_c}, got {wgt_cmds}"
+    assert wgt_valid_count == 0, "row conv must not drive the mesh weight port"
+    assert mac_fires == in_c, \
+        f"Expected {in_c} MAC issues (one per K), got {mac_fires}"
 
 
 @cocotb.test()
 async def test_act_vector_timing(dut):
-    """The k-slots for one pixel are presented as one vector, not k_depth scalars.
+    """One pixel issues one MAC per K on the 64-lane row, not a mesh vector.
 
-    The old feed drove a single lane per cycle (one-hot), so a k_depth-deep
-    pixel cost k_depth act_valid pulses and left the other lanes multiplying by
-    zero. The vector feed asserts sa_act_valid once.
-
-    This DUT is bare npu_compute with no SRAM attached, so the lane *contents*
-    are meaningless here; integration.test_npu_compute_tb's
-    test_act_vector_single_pulse checks those against real activation data.
+    Bare npu_compute has no SRAM, so activation values are not checked here.
     """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
+    cocotb.start_soon(systolic_ppu_stub(dut))
 
     ARRAY_SIZE = get_array_size(dut)
     in_c = ARRAY_SIZE
@@ -247,29 +253,27 @@ async def test_act_vector_timing(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
+    mac_fires = 0
     act_valid_count = 0
-    in_act_phase = False
-    for _ in range(500):
+    for _ in range(5000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 2:  # MODE_COMPUTE
-            in_act_phase = True
-        if in_act_phase and int(dut.sa_act_valid.value) == 1:
+        if int(dut.sa_act_valid.value) == 1:
             act_valid_count += 1
+        if int(dut.mac1d_fire.value) == 1:
+            mac_fires += 1
+        if int(dut.done.value) == 1:
+            break
         await Timer(1, unit="step")
 
-    assert act_valid_count == 1, \
-        f"Expected 1 activation vector for k_depth={k_depth}, got {act_valid_count}"
+    assert act_valid_count == 0, "row conv must not pulse sa_act_valid"
+    assert mac_fires == k_depth, \
+        f"Expected {k_depth} MAC issues for one pixel, got {mac_fires}"
 
 
 @cocotb.test()
 async def test_no_drain_commands(dut):
-    """The compute FSM must never issue MODE_DRAIN.
-
-    Reduction moved inside the array (psum chain), so the per-column drain
-    sequence is gone. A single-pixel 1x1 conv should present exactly one
-    activation vector and consume exactly one result vector.
-    """
+    """The row path never issues MODE_DRAIN and does not feed the mesh."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
     cocotb.start_soon(systolic_ppu_stub(dut))
@@ -283,6 +287,7 @@ async def test_no_drain_commands(dut):
 
     drain_count = 0
     act_vector_count = 0
+    mac_fires = 0
     for _ in range(10000):
         await RisingEdge(dut.clk)
         await ReadOnly()
@@ -290,14 +295,18 @@ async def test_no_drain_commands(dut):
             drain_count += 1
         if int(dut.sa_act_valid.value) == 1:
             act_vector_count += 1
+        if int(dut.mac1d_fire.value) == 1:
+            mac_fires += 1
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
     assert drain_count == 0, \
-        f"Compute issued {drain_count} MODE_DRAIN commands; the array has no drain phase"
-    assert act_vector_count == 1, \
-        f"Expected 1 activation vector for one pixel, got {act_vector_count}"
+        f"Compute issued {drain_count} MODE_DRAIN commands"
+    assert act_vector_count == 0, \
+        f"row conv pulsed sa_act_valid {act_vector_count} times"
+    assert mac_fires == ARRAY_SIZE, \
+        f"Expected {ARRAY_SIZE} MAC issues for one 1x1 pixel, got {mac_fires}"
 
 
 @cocotb.test()
@@ -330,13 +339,13 @@ async def test_done_pulse(dut):
 
 @cocotb.test()
 async def test_oc_tiling(dut):
-    """With 2*ARRAY_SIZE output channels, should process 2 OC groups."""
+    """128 output channels is two groups of 64, so two WGT_LOAD commands."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
     cocotb.start_soon(systolic_ppu_stub(dut))
 
     ARRAY_SIZE = get_array_size(dut)
-    out_c = ARRAY_SIZE * 2  # 2 OC groups
+    out_c = 128
 
     set_cfg_conv2d(dut, in_c=ARRAY_SIZE, out_c=out_c, kh=1, kw=1, out_h=1, out_w=1)
 

@@ -13,6 +13,10 @@ SPDX-License-Identifier: Apache-2.0
 import numpy as np
 import os
 import json
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wgt_layout import OC_MAJOR, K_MAJOR, conv_blob, dw_blob, words_from_bytes
 
 
 def compute_ms(eff_scale):
@@ -162,25 +166,14 @@ def pack_int16_for_sram(data_int16):
     return words
 
 
-def pack_conv_weights_for_sram_int16(weight_ohwi, out_c, k_depth):
-    """Pack Conv2D weights in contiguous OHWI format for INT16 SRAM.
-
-    weight_ohwi: [out_c][kh][kw][in_c] int16
-    Layout: col c occupies k_depth elements starting at element c*k_depth.
-    Returns list of uint32 words (2 int16 per word).
-    """
-    flat = weight_ohwi.reshape(out_c * k_depth).astype(np.int16)
-    return pack_int16_for_sram(flat)
+def pack_conv_weights_for_sram_int16(weight_ohwi, out_c, k_depth, layout=K_MAJOR):
+    """Pack Conv2D INT16 weights [out_c][kh][kw][in_c] into uint32 SRAM words."""
+    return pack_int16_for_sram(conv_blob(weight_ohwi, out_c, k_depth, layout).astype(np.int16))
 
 
-def pack_dw_weights_for_sram_int16(weight_chw, n_ch, kernel_size):
-    """Pack DW Conv weights for INT16 SRAM.
-
-    weight_chw: [ch][kh][kw] int16
-    Returns list of uint32 words (2 int16 per word).
-    """
-    flat = weight_chw.flatten().astype(np.int16)
-    return pack_int16_for_sram(flat)
+def pack_dw_weights_for_sram_int16(weight_chw, n_ch, kernel_size, layout=K_MAJOR):
+    """Pack DW Conv INT16 weights [ch][kh][kw] into uint32 SRAM words."""
+    return pack_int16_for_sram(dw_blob(weight_chw, n_ch, layout).astype(np.int16))
 
 
 def build_mobilenetv2_tiny_int16():

@@ -22,6 +22,10 @@ SPDX-License-Identifier: Apache-2.0
 import numpy as np
 import os
 import json
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wgt_layout import OC_MAJOR, K_MAJOR, conv_blob, dw_blob, words_from_bytes
 
 ACT_SRAM_WORDS = 8192
 
@@ -161,36 +165,24 @@ def pack_params_for_sram(M_arr, S_arr, bias_arr, zp_arr, n_ch):
     return words
 
 
-def pack_conv_weights_i8(weight_ohwi, out_c, k_depth):
-    byte_arr = weight_ohwi.astype(np.int8).tobytes()
-    pad_len = (4 - len(byte_arr) % 4) % 4
-    byte_arr = byte_arr + b'\x00' * pad_len
-    words = []
-    for i in range(0, len(byte_arr), 4):
-        w = int.from_bytes(byte_arr[i:i+4], 'little', signed=False)
-        words.append(w)
-    return words
+def pack_conv_weights_i8(weight_ohwi, out_c, k_depth, layout=K_MAJOR):
+    blob = conv_blob(weight_ohwi, out_c, k_depth, layout).astype(np.int8)
+    return words_from_bytes(blob.tobytes())
 
 
-def pack_conv_weights_i16(weight_ohwi, out_c, k_depth):
-    flat = weight_ohwi.reshape(out_c * k_depth).astype(np.int16)
-    return pack_i16_to_words(flat)
+def pack_conv_weights_i16(weight_ohwi, out_c, k_depth, layout=K_MAJOR):
+    blob = conv_blob(weight_ohwi, out_c, k_depth, layout).astype(np.int16)
+    return pack_i16_to_words(blob)
 
 
-def pack_dw_weights_i8(weight_chw, n_ch):
-    byte_arr = weight_chw.astype(np.int8).tobytes()
-    pad_len = (4 - len(byte_arr) % 4) % 4
-    byte_arr = byte_arr + b'\x00' * pad_len
-    words = []
-    for i in range(0, len(byte_arr), 4):
-        w = int.from_bytes(byte_arr[i:i+4], 'little', signed=False)
-        words.append(w)
-    return words
+def pack_dw_weights_i8(weight_chw, n_ch, layout=K_MAJOR):
+    blob = dw_blob(weight_chw, n_ch, layout).astype(np.int8)
+    return words_from_bytes(blob.tobytes())
 
 
-def pack_dw_weights_i16(weight_chw, n_ch):
-    flat = weight_chw.flatten().astype(np.int16)
-    return pack_i16_to_words(flat)
+def pack_dw_weights_i16(weight_chw, n_ch, layout=K_MAJOR):
+    blob = dw_blob(weight_chw, n_ch, layout).astype(np.int16)
+    return pack_i16_to_words(blob)
 
 
 # ═══════════════════════════════════════════════════════════════════════

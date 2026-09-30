@@ -31,7 +31,8 @@ async def reset_dut(dut):
 def set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1,
             stride_h=1, stride_w=1, pad_top=0, pad_left=0,
             tile_h=0, tile_w=0, tile_num_h=1, tile_num_w=1,
-            in_h=1, in_w=1, op_type=0, act_base=0, out_base=0):
+            in_h=1, in_w=1, op_type=0, act_base=0, out_base=0, wgt_layout=1,
+            int16=False):
     """Set layer configuration."""
     dut.cfg_op_type.value = op_type
     dut.cfg_in_c.value = in_c
@@ -52,6 +53,10 @@ def set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1,
     dut.cfg_in_h.value = in_h
     dut.cfg_act_base.value = act_base
     dut.cfg_out_base.value = out_base
+    dut.cfg_wgt_layout.value = wgt_layout
+    dw = (op_type == 1)
+    _wgt_commit(dut, out_c, kh * kw if dw else kh * kw * in_c, int16, dw,
+                wgt_layout)
 
 
 def write_sram_word(dut, bank, addr, data):
@@ -66,6 +71,52 @@ def write_sram_word(dut, bank, addr, data):
         dut.u_sram_ofm.mem[addr].value = data
     elif bank == 'param':
         dut.u_sram_param.mem[addr].value = data
+
+
+# Tests below write weights in the natural OC-major order. The 64-lane row
+# reads the K-major blob instead (see tools/model_packer.py), so the words are
+# staged here and transposed by set_cfg, which is always called after the
+# weights are written and knows the shape needed to do it.
+_WGT_STAGE = {}
+
+
+def wgt_put(dut, addr, word):
+    """Stage one OC-major weight word."""
+    _WGT_STAGE[addr] = word
+
+
+def _wgt_commit(dut, out_c, k_depth, int16, dw, layout=1):
+    if not _WGT_STAGE:
+        return
+    nbytes = (max(_WGT_STAGE) + 1) * 4
+    src = bytearray(nbytes)
+    for addr, word in _WGT_STAGE.items():
+        src[addr * 4:addr * 4 + 4] = int(word).to_bytes(4, 'little')
+    _WGT_STAGE.clear()
+    elem = 2 if int16 else 1
+    lanes = 64
+    dst = bytearray(src)
+    if not layout:
+        pass
+    elif dw:
+        # [C][taps] -> [taps][C]
+        taps = k_depth
+        for c in range(out_c):
+            for t in range(taps):
+                s = (c * taps + t) * elem
+                d = (t * out_c + c) * elem
+                dst[d:d + elem] = src[s:s + elem]
+    else:
+        for g in range(0, out_c, lanes):
+            gw = min(lanes, out_c - g)
+            for c in range(gw):
+                for k in range(k_depth):
+                    s = ((g + c) * k_depth + k) * elem
+                    d = (g * lanes * k_depth + k * gw + c) * elem
+                    dst[d:d + elem] = src[s:s + elem]
+    for w in range(len(dst) // 4):
+        write_sram_word(dut, 'wgt', w,
+                        int.from_bytes(dst[w * 4:w * 4 + 4], 'little'))
 
 
 def read_sram_word(dut, bank, addr):
@@ -126,55 +177,44 @@ async def test_idle_after_reset(dut):
 
 @cocotb.test()
 async def test_weight_load_4x4(dut):
-    """Load weights and verify systolic wgt_valid timing."""
+    """One 64-lane group issues a single WGT_LOAD and does not feed the mesh."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
     ARRAY_SIZE = get_array_size(dut)
-    # 1x1 conv, 4 IC, 4 OC → k_depth=4, ARRAY_SIZE columns of 4 weights each
-    # Weight SRAM: column-major in OHWI order
-    # Col 0 (OC0): weights[0..3] at word 0 = pack_i8x4(w00,w01,w02,w03)
-    # Col 1 (OC1): weights[4..7] at word 1
-    # etc.
     for oc in range(ARRAY_SIZE):
         w = [(oc * 4 + i + 1) & 0xFF for i in range(4)]
-        write_sram_word(dut, 'wgt', oc, pack_i8x4(w[0], w[1], w[2], w[3]))
+        wgt_put(dut, oc, pack_i8x4(w[0], w[1], w[2], w[3]))
 
     set_cfg(dut, in_c=4, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
 
-    # Pulse start
     dut.start.value = 1
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    # Count wgt_valid pulses until COMPUTE cmd
     wgt_valid_count = 0
-    for _ in range(500):
+    wgt_cmds = 0
+    for _ in range(5000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        sv = int(dut.u_compute.sa_wgt_valid.value)
-        if sv == 1:
+        if int(dut.u_compute.sa_wgt_valid.value) == 1:
             wgt_valid_count += 1
-        # Check for COMPUTE command (end of weight phase)
         cmd_v = int(dut.u_compute.sa_cmd_valid.value)
         cmd = int(dut.u_compute.sa_cmd.value)
-        if cmd_v == 1 and cmd == 2:  # MODE_COMPUTE
+        if cmd_v == 1 and cmd == 1:
+            wgt_cmds += 1
+        if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert wgt_valid_count == ARRAY_SIZE, \
-        f"Expected {ARRAY_SIZE} wgt_valid pulses, got {wgt_valid_count}"
+    assert wgt_cmds == 1, f"Expected 1 WGT_LOAD, got {wgt_cmds}"
+    assert wgt_valid_count == 0, \
+        f"row conv drove sa_wgt_valid {wgt_valid_count} times"
 
 
 @cocotb.test()
 async def test_act_vector_single_pulse(dut):
-    """One (pixel, pass) presents the whole k-vector in a single act_valid cycle.
-
-    The array reduces down its psum chain, so the feed is one ROWS-wide vector
-    per cycle rather than one scalar per cycle. For a single-pixel 1x1 conv with
-    k_depth=4 that means exactly one pulse, carrying the 4 k-slots in lanes 0..3
-    and zeros above.
-    """
+    """A 1x1 pixel issues one broadcast MAC per input channel, in channel order."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
@@ -183,7 +223,7 @@ async def test_act_vector_single_pulse(dut):
     acts = (10, 20, 30, 40)
 
     for i in range(ARRAY_SIZE):
-        write_sram_word(dut, 'wgt', i, pack_i8x4(1, 1, 1, 1))
+        wgt_put(dut, i, pack_i8x4(1, 1, 1, 1))
     write_sram_word(dut, 'act', 0, pack_i8x4(*acts))
 
     set_cfg(dut, in_c=4, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
@@ -192,50 +232,34 @@ async def test_act_vector_single_pulse(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    act_valid_count = 0
-    vectors = []
-    in_compute = False
-    for _ in range(500):
+    seen = []
+    mesh_pulses = 0
+    for _ in range(5000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        cmd_v = int(dut.u_compute.sa_cmd_valid.value)
-        cmd = int(dut.u_compute.sa_cmd.value)
-        if cmd_v == 1 and cmd == 2:  # MODE_COMPUTE
-            in_compute = True
-        if in_compute and int(dut.u_compute.sa_act_valid.value) == 1:
-            act_valid_count += 1
-            flat = int(dut.sa_act_data_flat.value)
-            vectors.append([
-                (flat >> (16 * lane)) & 0xFFFF for lane in range(ARRAY_SIZE)
-            ])
+        if int(dut.u_compute.sa_act_valid.value) == 1:
+            mesh_pulses += 1
+        if int(dut.u_compute.mac1d_fire.value) == 1:
+            seen.append(int(dut.u_compute.mac1d_act.value) & 0xFFFF)
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert act_valid_count == 1, \
-        f"Expected 1 act_valid pulse for one pixel, got {act_valid_count}"
-    vec = vectors[0]
-    assert vec[:k_depth] == list(acts), \
-        f"Expected k-slots {list(acts)} in lanes 0..{k_depth-1}, got {vec[:k_depth]}"
-    assert all(v == 0 for v in vec[k_depth:]), \
-        f"Lanes beyond k_depth must be zero, got {vec[k_depth:]}"
+    assert mesh_pulses == 0, f"row conv pulsed sa_act_valid {mesh_pulses} times"
+    assert seen == list(acts), \
+        f"Expected broadcast acts {list(acts)}, got {seen}"
 
 
 @cocotb.test()
 async def test_psum_vector_per_pixel(dut):
-    """The array emits one full result vector per (pixel, pass), not per column.
-
-    Replaces the old per-column drain sequence: there is no MODE_DRAIN and no
-    drain_col_sel any more. A single-pixel single-pass conv must therefore
-    produce exactly one psum_out_valid cycle.
-    """
+    """The row keeps the mesh idle and feeds the 64-wide PPU once per pixel."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
     ARRAY_SIZE = get_array_size(dut)
 
     for i in range(ARRAY_SIZE):
-        write_sram_word(dut, 'wgt', i, pack_i8x4(1, 0, 0, 0))
+        wgt_put(dut, i, pack_i8x4(1, 0, 0, 0))
     write_sram_word(dut, 'act', 0, pack_i8x4(1, 0, 0, 0))
     for ch in range(ARRAY_SIZE):
         base = ch * 4
@@ -255,27 +279,22 @@ async def test_psum_vector_per_pixel(dut):
     dut.start.value = 0
 
     psum_valid_count = 0
-    feed_cycle = None
-    result_cycle = None
-    for cyc in range(20000):
+    ppu_feeds = 0
+    for _cyc in range(20000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        if int(dut.u_compute.sa_act_valid.value) == 1 and feed_cycle is None:
-            feed_cycle = cyc
         if int(dut.sa_psum_out_valid.value) == 1:
             psum_valid_count += 1
-            if result_cycle is None:
-                result_cycle = cyc
+        if int(dut.u_compute.ppu_valid_w.value) != 0:
+            ppu_feeds += 1
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert psum_valid_count == 1, \
-        f"Expected 1 psum result vector for one pixel, got {psum_valid_count}"
-    # The result leaves the bottom of the chain ROWS cycles after the feed.
-    latency = result_cycle - feed_cycle
-    assert latency == ARRAY_SIZE, \
-        f"Expected psum latency of {ARRAY_SIZE} cycles, got {latency}"
+    assert psum_valid_count == 0, \
+        f"row conv produced {psum_valid_count} mesh psum pulses"
+    assert ppu_feeds == 1, \
+        f"Expected 1 PPU feed for one pixel, got {ppu_feeds}"
 
 
 @cocotb.test()
@@ -287,7 +306,7 @@ async def test_done_pulse(dut):
     ARRAY_SIZE = get_array_size(dut)
     # Minimal setup
     for i in range(ARRAY_SIZE):
-        write_sram_word(dut, 'wgt', i, pack_i8x4(1, 0, 0, 0))
+        wgt_put(dut, i, pack_i8x4(1, 0, 0, 0))
     write_sram_word(dut, 'act', 0, pack_i8x4(1, 0, 0, 0))
     for ch in range(ARRAY_SIZE):
         base = ch * 4
@@ -324,7 +343,7 @@ async def test_conv1x1_golden(dut):
             w[oc] = 1
         else:
             w = [0]*4
-        write_sram_word(dut, 'wgt', oc, pack_i8x4(w[0], w[1], w[2], w[3]))
+        wgt_put(dut, oc, pack_i8x4(w[0], w[1], w[2], w[3]))
 
     # Activations: [10, 20, 30, 40]
     write_sram_word(dut, 'act', 0, pack_i8x4(10, 20, 30, 40))
@@ -352,16 +371,16 @@ async def test_conv1x1_golden(dut):
 
 @cocotb.test()
 async def test_oc_tiling_2groups(dut):
-    """OC = 2*ARRAY_SIZE → 2 OC groups, 2 WGT_LOAD cmds."""
+    """80 output channels is two row groups (64+16) and two WGT_LOAD commands."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
     ARRAY_SIZE = get_array_size(dut)
-    out_c = ARRAY_SIZE * 2  # 2 OC groups
+    out_c = 80
 
     # Load weights for out_c OC channels
     for oc in range(out_c):
-        write_sram_word(dut, 'wgt', oc, pack_i8x4(1, 0, 0, 0))
+        wgt_put(dut, oc, pack_i8x4(1, 0, 0, 0))
     write_sram_word(dut, 'act', 0, pack_i8x4(1, 0, 0, 0))
     for ch in range(out_c):
         base = ch * 4
@@ -406,7 +425,7 @@ async def test_spatial_tiling_2x2(dut):
 
     # Fill SRAMs with dummy data
     for i in range(64):
-        write_sram_word(dut, 'wgt', i, pack_i8x4(1, 0, 0, 0))
+        wgt_put(dut, i, pack_i8x4(1, 0, 0, 0))
         write_sram_word(dut, 'act', i, pack_i8x4(1, 0, 0, 0))
     for ch in range(ARRAY_SIZE):
         base = ch * 4
@@ -460,7 +479,7 @@ async def test_conv1x1_verify_output(dut):
 
     # Use all-ones weights so dot product = sum of activations.
     for oc in range(ARRAY_SIZE):
-        write_sram_word(dut, 'wgt', oc, pack_i8x4(1, 1, 1, 1))
+        wgt_put(dut, oc, pack_i8x4(1, 1, 1, 1))
 
     # Pre-zero output area (output will be at same location for 1-pixel case)
     for i in range(64):
@@ -521,9 +540,9 @@ async def test_conv1x1_dotproduct(dut):
 
     # Non-uniform weights: col 0 = [1,2,3,4], cols 1..N-1 = [1,1,1,1]
     # Weight SRAM layout: col c at word address c (for k_depth=4)
-    write_sram_word(dut, 'wgt', 0, pack_i8x4(1, 2, 3, 4))  # col 0: w[0][k] = k+1
+    wgt_put(dut, 0, pack_i8x4(1, 2, 3, 4))  # col 0: w[0][k] = k+1
     for oc in range(1, ARRAY_SIZE):
-        write_sram_word(dut, 'wgt', oc, pack_i8x4(1, 1, 1, 1))  # cols 1+: all ones
+        wgt_put(dut, oc, pack_i8x4(1, 1, 1, 1))  # cols 1+: all ones
 
     # Pre-zero and set activations at word 0
     for i in range(64):
@@ -591,7 +610,7 @@ async def test_conv_spatial_2x2(dut):
             b1 = w * 4 + 2
             b2 = w * 4 + 3
             b3 = w * 4 + 4
-            write_sram_word(dut, 'wgt', base_addr + w, pack_i8x4(b0, b1, b2, b3))
+            wgt_put(dut, base_addr + w, pack_i8x4(b0, b1, b2, b3))
 
     # 4 pixels, constant activation per pixel: pval = 1, 2, 3, 4
     pixel_vals = [1, 2, 3, 4]
@@ -661,7 +680,7 @@ async def test_conv_spatial_3x3(dut):
     for oc in range(ARRAY_SIZE):
         base_addr = oc * wgt_words_per_col
         for w in range(wgt_words_per_col):
-            write_sram_word(dut, 'wgt', base_addr + w, pack_i8x4(1, 1, 1, 1))
+            wgt_put(dut, base_addr + w, pack_i8x4(1, 1, 1, 1))
 
     # 9 pixels with distinct values: pval = 1..9
     pixel_vals = list(range(1, 10))
@@ -724,7 +743,7 @@ async def test_dw_conv_1x1_single_ch(dut):
     await reset_dut(dut)
 
     # Weight: channel 0, 1x1 kernel = 1 byte at word 0
-    write_sram_word(dut, 'wgt', 0, pack_i8x4(3, 0, 0, 0))
+    wgt_put(dut, 0, pack_i8x4(3, 0, 0, 0))
 
     # Activation: pixel(0,0) channel 0 at byte 0
     write_sram_word(dut, 'act', 0, pack_i8x4(7, 0, 0, 0))
@@ -763,9 +782,9 @@ async def test_dw_conv_3x3_golden(dut):
 
     # 3x3 Sobel-like weights
     weights = [1, 2, 1, 0, 0, 0, -1, -2, -1]
-    write_sram_word(dut, 'wgt', 0, pack_i8x4(weights[0], weights[1], weights[2], weights[3]))
-    write_sram_word(dut, 'wgt', 1, pack_i8x4(weights[4], weights[5], weights[6], weights[7]))
-    write_sram_word(dut, 'wgt', 2, pack_i8x4(weights[8], 0, 0, 0))
+    wgt_put(dut, 0, pack_i8x4(weights[0], weights[1], weights[2], weights[3]))
+    wgt_put(dut, 1, pack_i8x4(weights[4], weights[5], weights[6], weights[7]))
+    wgt_put(dut, 2, pack_i8x4(weights[8], 0, 0, 0))
 
     # Input: 3x3 spatial, 1 channel (NHWC [3][3][1])
     inputs = [10, 20, 30, 40, 50, 60, 70, 80, 90]
@@ -813,7 +832,7 @@ async def test_dw_conv_multichannel(dut):
 
     # 4 channels × 1x1 kernel: packed in weight SRAM word 0
     # ch0=2, ch1=3, ch2=4, ch3=5
-    write_sram_word(dut, 'wgt', 0, pack_i8x4(2, 3, 4, 5))
+    wgt_put(dut, 0, pack_i8x4(2, 3, 4, 5))
 
     # Activations: 1×1 spatial, 4ch NHWC → word 0
     # ch0=10, ch1=20, ch2=30, ch3=40
@@ -868,9 +887,9 @@ async def test_dw_conv_3x3_with_padding(dut):
     await reset_dut(dut)
 
     # All-ones 3x3 kernel
-    write_sram_word(dut, 'wgt', 0, pack_i8x4(1, 1, 1, 1))
-    write_sram_word(dut, 'wgt', 1, pack_i8x4(1, 1, 1, 1))
-    write_sram_word(dut, 'wgt', 2, pack_i8x4(1, 0, 0, 0))
+    wgt_put(dut, 0, pack_i8x4(1, 1, 1, 1))
+    wgt_put(dut, 1, pack_i8x4(1, 1, 1, 1))
+    wgt_put(dut, 2, pack_i8x4(1, 0, 0, 0))
 
     # Input: 3x3, 1ch, values 1-9
     write_sram_word(dut, 'act', 0, pack_i8x4(1, 2, 3, 4))
@@ -925,7 +944,7 @@ async def test_conv1x1_kdepth_32(dut):
     # Each column has 32 weights (k_depth=32), packed 4 per word = 8 words/col
     for col in range(ARRAY_SIZE):
         for w in range(in_c // 4):
-            write_sram_word(dut, 'wgt', col * (in_c // 4) + w, pack_i8x4(1, 1, 1, 1))
+            wgt_put(dut, col * (in_c // 4) + w, pack_i8x4(1, 1, 1, 1))
 
     # Activations: values 1..32. Packed 4 per word at addresses 0..7
     # Separate from output: put acts starting at word 0, output at word 64+
@@ -1007,12 +1026,12 @@ async def test_conv1x1_kdepth_32_nonuniform(dut):
     # Col 0: weights = [1, 2, 3, ..., 32]
     for w in range(in_c // 4):
         b0 = w * 4 + 1
-        write_sram_word(dut, 'wgt', w, pack_i8x4(b0, b0+1, b0+2, b0+3))
+        wgt_put(dut, w, pack_i8x4(b0, b0+1, b0+2, b0+3))
 
     # Cols 1..15: weights = all ones
     for col in range(1, ARRAY_SIZE):
         for w in range(in_c // 4):
-            write_sram_word(dut, 'wgt', col * (in_c // 4) + w, pack_i8x4(1, 1, 1, 1))
+            wgt_put(dut, col * (in_c // 4) + w, pack_i8x4(1, 1, 1, 1))
 
     # Activations: all ones (32 bytes)
     for w in range(in_c // 4):
@@ -1072,7 +1091,7 @@ async def test_conv1x1_kdepth_24_spatial_2x2(dut):
     words_per_col = in_c // 4  # 6
     for col in range(ARRAY_SIZE):
         for w in range(words_per_col):
-            write_sram_word(dut, 'wgt', col * words_per_col + w,
+            wgt_put(dut, col * words_per_col + w,
                             pack_i8x4(1, 1, 1, 1))
 
     # Activations: 2x2 input with in_c=24 per pixel = 96 bytes = 24 words
@@ -1149,7 +1168,7 @@ async def test_conv3x3_single_pixel(dut):
         b1 = wgt_bytes[w_idx+1] if w_idx+1 < total_wgt_bytes else 0
         b2 = wgt_bytes[w_idx+2] if w_idx+2 < total_wgt_bytes else 0
         b3 = wgt_bytes[w_idx+3] if w_idx+3 < total_wgt_bytes else 0
-        write_sram_word(dut, 'wgt', w_idx // 4, pack_i8x4(b0, b1, b2, b3))
+        wgt_put(dut, w_idx // 4, pack_i8x4(b0, b1, b2, b3))
 
     # Activations: 3×3×1 = 9 bytes → values 1..9
     # NHWC layout: pixel(y,x) at byte offset (y*in_w + x)*in_c
@@ -1239,7 +1258,7 @@ async def test_conv3x3_with_padding(dut):
         b1 = wgt_bytes[w_idx+1] if w_idx+1 < total_wgt_bytes else 0
         b2 = wgt_bytes[w_idx+2] if w_idx+2 < total_wgt_bytes else 0
         b3 = wgt_bytes[w_idx+3] if w_idx+3 < total_wgt_bytes else 0
-        write_sram_word(dut, 'wgt', w_idx // 4, pack_i8x4(b0, b1, b2, b3))
+        wgt_put(dut, w_idx // 4, pack_i8x4(b0, b1, b2, b3))
 
     # Activations: 2×2×1 = 4 bytes → values 1,2,3,4
     # Put input at word offset 64 to avoid overlap with output at word 0
@@ -1330,8 +1349,8 @@ async def test_conv1x1_int16_basic(dut):
     # Weights: all ones, INT16 packed — 2 elements per word, 2 words per column
     for oc in range(ARRAY_SIZE):
         word_base = oc * (in_c // 2)  # 2 words per column
-        write_sram_word(dut, 'wgt', word_base + 0, pack_i16x2(1, 1))
-        write_sram_word(dut, 'wgt', word_base + 1, pack_i16x2(1, 1))
+        wgt_put(dut, word_base + 0, pack_i16x2(1, 1))
+        wgt_put(dut, word_base + 1, pack_i16x2(1, 1))
 
     # Activations: [300, -200, 150, -50] packed as INT16
     write_sram_word(dut, 'act', 0, pack_i16x2(300, -200))
@@ -1350,7 +1369,7 @@ async def test_conv1x1_int16_basic(dut):
     dut.ppu_zp_en.value = 0
 
     set_cfg(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=1, kw=1,
-            out_h=1, out_w=1, in_h=1, in_w=1)
+            out_h=1, out_w=1, in_h=1, in_w=1, int16=True)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)
@@ -1390,7 +1409,7 @@ async def test_conv1x1_int16_large_values(dut):
 
     # Weights: [3, 7] for all columns — 1 word per column
     for oc in range(ARRAY_SIZE):
-        write_sram_word(dut, 'wgt', oc, pack_i16x2(3, 7))
+        wgt_put(dut, oc, pack_i16x2(3, 7))
 
     # Activations: [100, 200]
     write_sram_word(dut, 'act', 0, pack_i16x2(100, 200))
@@ -1408,7 +1427,7 @@ async def test_conv1x1_int16_large_values(dut):
     dut.ppu_zp_en.value = 0
 
     set_cfg(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=1, kw=1,
-            out_h=1, out_w=1, in_h=1, in_w=1)
+            out_h=1, out_w=1, in_h=1, in_w=1, int16=True)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)
@@ -1442,7 +1461,7 @@ async def test_dw_conv_int16(dut):
 
     # DW Conv: op_type=1, kh=1, kw=1, in_c=out_c=1
     # Weight: single value 5 at word 0
-    write_sram_word(dut, 'wgt', 0, pack_i16x2(5, 0))
+    wgt_put(dut, 0, pack_i16x2(5, 0))
 
     # Activation: single value 400
     write_sram_word(dut, 'act', 0, pack_i16x2(400, 0))
@@ -1458,7 +1477,7 @@ async def test_dw_conv_int16(dut):
     dut.ppu_zp_en.value = 0
 
     set_cfg(dut, in_c=1, out_c=1, kh=1, kw=1, out_h=1, out_w=1,
-            in_h=1, in_w=1, op_type=1)
+            in_h=1, in_w=1, op_type=1, int16=True)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)
@@ -1493,7 +1512,7 @@ async def test_conv_spatial_2x2_int16(dut):
 
     # Weights: all ones, 1 word per column (2 elements)
     for oc in range(ARRAY_SIZE):
-        write_sram_word(dut, 'wgt', oc, pack_i16x2(1, 1))
+        wgt_put(dut, oc, pack_i16x2(1, 1))
 
     # Activations: 2×2 spatial, 2 channels, value=500
     # NHWC layout: (h, w, c) — 2 channels per word
@@ -1516,7 +1535,7 @@ async def test_conv_spatial_2x2_int16(dut):
     out_base = out_h * out_w  # 4 words for input
     set_cfg(dut, in_c=in_c, out_c=ARRAY_SIZE, kh=1, kw=1,
             out_h=out_h, out_w=out_w, in_h=in_h, in_w=in_w,
-            out_base=out_base)
+            out_base=out_base, int16=True)
 
     dut.start.value = 1
     await RisingEdge(dut.clk)

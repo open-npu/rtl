@@ -15,6 +15,10 @@ SPDX-License-Identifier: Apache-2.0
 
 import os
 import json
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wgt_layout import OC_MAJOR, K_MAJOR, conv_blob, dw_blob, words_from_bytes
 import numpy as np
 
 
@@ -129,29 +133,16 @@ def pack_activations_for_sram(act_nhwc):
     return words
 
 
-def pack_conv_weights_for_sram(weight_ohwi, out_c, k_depth):
-    """Pack Conv2D weights: [out_c][kh][kw][in_c] → 4 int8 per uint32."""
-    flat = weight_ohwi.reshape(out_c, k_depth).astype(np.int8)
-    byte_arr = flat.tobytes()
-    pad_len = (4 - len(byte_arr) % 4) % 4
-    byte_arr = byte_arr + b'\x00' * pad_len
-    words = []
-    for i in range(0, len(byte_arr), 4):
-        w = int.from_bytes(byte_arr[i:i+4], 'little', signed=False)
-        words.append(w)
-    return words
+def pack_conv_weights_for_sram(weight_ohwi, out_c, k_depth, layout=K_MAJOR):
+    """Pack Conv2D weights: [out_c][kh][kw][in_c] -> 4 int8 per uint32."""
+    blob = conv_blob(weight_ohwi, out_c, k_depth, layout).astype(np.int8)
+    return words_from_bytes(blob.tobytes())
 
 
-def pack_dw_weights_for_sram(weight_chw, n_ch):
-    """Pack DW Conv weights: [ch][3][3] → 4 int8 per uint32."""
-    byte_arr = weight_chw.astype(np.int8).tobytes()
-    pad_len = (4 - len(byte_arr) % 4) % 4
-    byte_arr = byte_arr + b'\x00' * pad_len
-    words = []
-    for i in range(0, len(byte_arr), 4):
-        w = int.from_bytes(byte_arr[i:i+4], 'little', signed=False)
-        words.append(w)
-    return words
+def pack_dw_weights_for_sram(weight_chw, n_ch, layout=K_MAJOR):
+    """Pack DW Conv weights: [ch][3][3] -> 4 int8 per uint32."""
+    blob = dw_blob(weight_chw, n_ch, layout).astype(np.int8)
+    return words_from_bytes(blob.tobytes())
 
 
 def pack_params_for_sram(M_arr, S_arr, bias_arr, zp_arr, n_ch):
