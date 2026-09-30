@@ -37,7 +37,7 @@ module npu_sram_wide #(
     input  wire                 b_we,
     input  wire [ADDR_W-1:0]   b_addr,
     input  wire [31:0]          b_wdata,
-    input  wire [7:0]           b_wmask,
+    input  wire [BEAT_W/32-1:0] b_wmask,
     input  wire [BEAT_W-1:0]    b_wdata_wide,
     output reg  [BEAT_W-1:0]   b_rdata
 );
@@ -63,8 +63,8 @@ module npu_sram_wide #(
     // treat the whole array as a single variable being read and written
     // in one block (Icarus then X's every location).
     always @(posedge clk) begin
-        if (b_en && (b_wmask != 8'd0)) begin
-            for (wb = 0; wb < 8; wb = wb + 1)
+        if (b_en && (b_wmask != {BEAT_W/32{1'b0}})) begin
+            for (wb = 0; wb < BEAT_W/32; wb = wb + 1)
                 if (b_wmask[wb])
                     mem[b_addr + wb] <= b_wdata_wide[32*wb +: 32];
         end else if (b_en && b_we)
@@ -73,14 +73,8 @@ module npu_sram_wide #(
 
     always @(posedge clk) begin
         if (b_en) begin
-            b_rdata[31:0]    <= mem[b_addr];
-            b_rdata[63:32]   <= mem[b_addr + 1];
-            b_rdata[95:64]   <= mem[b_addr + 2];
-            b_rdata[127:96]  <= mem[b_addr + 3];
-            b_rdata[159:128] <= mem[b_addr + 4];
-            b_rdata[191:160] <= mem[b_addr + 5];
-            b_rdata[223:192] <= mem[b_addr + 6];
-            b_rdata[255:224] <= mem[b_addr + 7];
+            for (ii = 0; ii < BEAT_W/32; ii = ii + 1)
+                b_rdata[32*ii +: 32] <= mem[b_addr + ii];
         end
     end
 

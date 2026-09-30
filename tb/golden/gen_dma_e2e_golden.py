@@ -18,6 +18,10 @@ SPDX-License-Identifier: Apache-2.0
 import numpy as np
 import os
 import json
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wgt_layout import OC_MAJOR, K_MAJOR, conv_blob, dw_blob, words_from_bytes
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -339,40 +343,28 @@ def pack_params_for_sram(M_arr, S_arr, bias_arr, zp_arr, n_ch):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def pack_conv_weights_i8(weight_ohwi, out_c, k_depth):
+def pack_conv_weights_i8(weight_ohwi, out_c, k_depth, layout=K_MAJOR):
     """Pack Conv2D INT8 weights: [out_c][kh][kw][in_c] -> uint32 words."""
-    byte_arr = weight_ohwi.astype(np.int8).tobytes()
-    pad_len = (4 - len(byte_arr) % 4) % 4
-    byte_arr = byte_arr + b'\x00' * pad_len
-    words = []
-    for i in range(0, len(byte_arr), 4):
-        w = int.from_bytes(byte_arr[i:i+4], 'little', signed=False)
-        words.append(w)
-    return words
+    blob = conv_blob(weight_ohwi, out_c, k_depth, layout).astype(np.int8)
+    return words_from_bytes(blob.tobytes())
 
 
-def pack_dw_weights_i8(weight_chw, n_ch):
+def pack_dw_weights_i8(weight_chw, n_ch, layout=K_MAJOR):
     """Pack DW Conv INT8 weights: [ch][3][3] -> uint32 words."""
-    byte_arr = weight_chw.astype(np.int8).tobytes()
-    pad_len = (4 - len(byte_arr) % 4) % 4
-    byte_arr = byte_arr + b'\x00' * pad_len
-    words = []
-    for i in range(0, len(byte_arr), 4):
-        w = int.from_bytes(byte_arr[i:i+4], 'little', signed=False)
-        words.append(w)
-    return words
+    blob = dw_blob(weight_chw, n_ch, layout).astype(np.int8)
+    return words_from_bytes(blob.tobytes())
 
 
-def pack_conv_weights_i16(weight_ohwi, out_c, k_depth):
+def pack_conv_weights_i16(weight_ohwi, out_c, k_depth, layout=K_MAJOR):
     """Pack Conv2D INT16 weights: [out_c][kh][kw][in_c] -> uint32 words."""
-    flat = weight_ohwi.flatten().astype(np.int16)
-    return pack_i16_to_words(flat)
+    blob = conv_blob(weight_ohwi, out_c, k_depth, layout).astype(np.int16)
+    return pack_i16_to_words(blob)
 
 
-def pack_dw_weights_i16(weight_chw, n_ch):
+def pack_dw_weights_i16(weight_chw, n_ch, layout=K_MAJOR):
     """Pack DW Conv INT16 weights: [ch][3][3] -> uint32 words."""
-    flat = weight_chw.flatten().astype(np.int16)
-    return pack_i16_to_words(flat)
+    blob = dw_blob(weight_chw, n_ch, layout).astype(np.int16)
+    return pack_i16_to_words(blob)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1052,13 +1044,14 @@ def gen_fc_test(in_c=8, out_c=4, relu6=True, int16_mode=False, seed=400):
     out = ref_postproc(acc, M_arr, S_arr, bias_arr, zp_arr,
                        relu6=relu6, clamp_min=clamp_min, clamp_max=clamp_max)
 
-    # Pack data — FC uses Conv2D weight packing (same systolic path)
+    # Pack data — FC uses Conv2D weight packing (same systolic path), which
+    # is also why it stays OC-major: FC never reaches the 64-lane row.
     if int16_mode:
-        wgt_words = pack_conv_weights_i16(weight_ohwi, out_c, in_c)
+        wgt_words = pack_conv_weights_i16(weight_ohwi, out_c, in_c, OC_MAJOR)
         input_words = pack_i16_to_words(input_nhwc)
         output_words = pack_i16_to_words(out)
     else:
-        wgt_words = pack_conv_weights_i8(weight_ohwi, out_c, in_c)
+        wgt_words = pack_conv_weights_i8(weight_ohwi, out_c, in_c, OC_MAJOR)
         input_words = pack_i8_to_words(input_nhwc)
         output_words = pack_i8_to_words(out)
     param_words = pack_params_for_sram(M_arr, S_arr, bias_arr, zp_arr, out_c)
@@ -1462,14 +1455,14 @@ def gen_deconv_test(in_h=4, in_w=4, in_c=4, out_c=4,
     out = ref_postproc(acc, M_arr, S_arr, bias_arr, zp_arr,
                        relu6=False, clamp_min=clamp_min, clamp_max=clamp_max)
 
-    # Pack data
+    # Pack data — deconv runs on the systolic path only, so OC-major.
     if int16_mode:
         input_words = pack_i16_to_words(input_nhwc)
-        wgt_words = pack_conv_weights_i16(weight_ohwi, out_c, k_depth)
+        wgt_words = pack_conv_weights_i16(weight_ohwi, out_c, k_depth, OC_MAJOR)
         output_words = pack_i16_to_words(out)
     else:
         input_words = pack_i8_to_words(input_nhwc)
-        wgt_words = pack_conv_weights_i8(weight_ohwi, out_c, k_depth)
+        wgt_words = pack_conv_weights_i8(weight_ohwi, out_c, k_depth, OC_MAJOR)
         output_words = pack_i8_to_words(out)
     param_words = pack_params_for_sram(M_arr, S_arr, bias_arr, zp_arr, out_c)
 

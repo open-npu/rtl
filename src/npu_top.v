@@ -102,6 +102,7 @@ module npu_top #(
     wire [31:0] reg_dma_store_mode;
     wire [31:0] reg_dma_row_cfg;
     wire [31:0] reg_dma_wgt_per_oc;
+    wire [31:0] reg_wgt_layout;
     wire [31:0] reg_tile_in_hw;
 
     // --- CSR Post-Processing Config outputs ---
@@ -220,6 +221,7 @@ module npu_top #(
         .reg_dma_store_mode (reg_dma_store_mode),
         .reg_dma_row_cfg    (reg_dma_row_cfg),
         .reg_dma_wgt_per_oc (reg_dma_wgt_per_oc),
+        .reg_wgt_layout     (reg_wgt_layout),
         .reg_tile_in_hw      (reg_tile_in_hw),
         // Post-processing config
         .reg_post_ctrl          (reg_post_ctrl),
@@ -276,6 +278,7 @@ module npu_top #(
         .cfg_dma_in_size    (reg_dma_in_size),
         .cfg_dma_wgt_size   (reg_dma_wgt_size),
         .cfg_dma_wgt_per_oc (reg_dma_wgt_per_oc),
+        .cfg_wgt_layout     (reg_wgt_layout[0]),
         .cfg_dma_out_size   (reg_dma_out_size),
         .cfg_tile_in_size   (reg_dma_tile_in_size),
         .cfg_param_count    (reg_post_param_count[15:0]),
@@ -409,7 +412,7 @@ module npu_top #(
         .b_we   (act_phys0_b_we),
         .b_addr (act_b_addr),
         .b_wdata(act_b_wr_data),
-        .b_wmask(act_phys0_b_we ? act_b_wr_mask : 8'd0),
+        .b_wmask(act_phys0_b_we ? act_b_wr_mask : 16'd0),
         .b_wdata_wide(act_b_wr_wide),
         .b_rdata(act_b_rdata)
     );
@@ -427,7 +430,7 @@ module npu_top #(
         .b_we   (ofm_phys1_b_we),
         .b_addr (ofm_b_addr),
         .b_wdata(act_b_wr_data),
-        .b_wmask(ofm_phys1_b_we ? act_b_wr_mask : 8'd0),
+        .b_wmask(ofm_phys1_b_we ? act_b_wr_mask : 16'd0),
         .b_wdata_wide(act_b_wr_wide),
         .b_rdata(ofm_b_rdata)
     );
@@ -455,7 +458,7 @@ module npu_top #(
         .b_we   (1'b0),
         .b_addr (wgt_b_addr),
         .b_wdata(32'd0),
-        .b_wmask(8'd0),
+        .b_wmask(16'd0),
         .b_wdata_wide({`SRAM_B_WIDTH{1'b0}}),
         .b_rdata(wgt_b_rdata)
     );
@@ -645,15 +648,15 @@ module npu_top #(
     wire [`PARAM_S_BITS-1:0]      ppu_shift_s;
     wire signed [`PARAM_ZP_BITS-1:0] ppu_zero_point;
 
-    wire [`ACC_WIDTH*ARRAY_SIZE-1:0]  ppu_acc_w, ppu_bias_w;
-    wire [ARRAY_SIZE-1:0]              ppu_valid_w, ppu_vout_w;
-    wire [15*ARRAY_SIZE-1:0]           ppu_mult_w;
-    wire [6*ARRAY_SIZE-1:0]            ppu_shift_w;
-    wire [16*ARRAY_SIZE-1:0]           ppu_zp_w;
-    wire [`DATA_WIDTH*ARRAY_SIZE-1:0] ppu_out_w;
+    wire [`ACC_WIDTH*`MAC_LANES-1:0]  ppu_acc_w, ppu_bias_w;
+    wire [`MAC_LANES-1:0]              ppu_valid_w, ppu_vout_w;
+    wire [15*`MAC_LANES-1:0]           ppu_mult_w;
+    wire [6*`MAC_LANES-1:0]            ppu_shift_w;
+    wire [16*`MAC_LANES-1:0]           ppu_zp_w;
+    wire [`DATA_WIDTH*`MAC_LANES-1:0] ppu_out_w;
 
     npu_ppu_bank #(
-        .N       (ARRAY_SIZE),
+        .N       (`MAC_LANES),
         .ACC_W   (`ACC_WIDTH),
         .DATA_W  (`DATA_WIDTH),
         .BIAS_W  (`BIAS_WIDTH),
@@ -696,7 +699,7 @@ module npu_top #(
     wire        act_b_wr_en;
     wire [ACT_ADDR_W-1:0] act_b_wr_addr;
     wire [31:0] act_b_wr_data;
-    wire [7:0]  act_b_wr_mask;
+    wire [15:0] act_b_wr_mask;
     wire [`SRAM_B_WIDTH-1:0] act_b_wr_wide;
     wire        act_b_rd_en;
     wire [ACT_ADDR_W-1:0] act_b_rd_addr;
@@ -819,6 +822,7 @@ module npu_top #(
         .oc_group_out       (oc_group_idx),
         .wgt_reload_done    (wgt_reload_done),
         .cfg_wgt_per_oc     (reg_dma_wgt_per_oc),
+        .cfg_wgt_layout     (reg_wgt_layout[0]),
         .db_prefetch_done   (db_prefetch_done),
         .tile_out_h_actual  (tile_out_h_actual),
         .tile_out_w_actual  (tile_out_w_actual)

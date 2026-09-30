@@ -5,9 +5,9 @@
 
 module npu_compute_tb #(
     parameter ARRAY_SIZE   = `ARRAY_SIZE,
-    parameter ACT_DEPTH    = 1024,
-    parameter WGT_DEPTH    = 1024,
-    parameter PARAM_DEPTH  = 256
+    parameter ACT_DEPTH    = 32768,  // 128KB: model A L61 DW is 14*14*512
+    parameter WGT_DEPTH    = 589824, // model E 3x3 512->512 is 2304KB
+    parameter PARAM_DEPTH  = 8192    // mesh groups param by 16 ch; OC 512 needs ~4K words
 )(
     input  wire clk,
     input  wire rst_n,
@@ -19,6 +19,7 @@ module npu_compute_tb #(
     input  wire        db_prefetch_done,
 
     // Configuration
+    input  wire        cfg_wgt_layout,  // 0=OC-major (systolic), 1=K-major (row)
     input  wire [7:0]  cfg_op_type,
     input  wire [15:0] cfg_in_c,
     input  wire [15:0] cfg_out_h,
@@ -65,7 +66,7 @@ module npu_compute_tb #(
     wire                    act_wr_en;
     wire [ACT_ADDR_W-1:0]  act_wr_addr;
     wire [31:0]             act_wr_data;
-    wire [7:0]              act_wr_mask;
+    wire [15:0]             act_wr_mask;
     wire [`SRAM_B_WIDTH-1:0] act_wr_wide;
 
     wire                    param_rd_en;
@@ -102,12 +103,12 @@ module npu_compute_tb #(
     wire signed [15:0]                 ppu_zero_point;
     wire signed [DATA_W-1:0]           ppu_out_data;
     wire                                ppu_out_valid;
-    wire [ACC_W*ARRAY_SIZE-1:0]        ppu_acc_w, ppu_bias_w;
-    wire [ARRAY_SIZE-1:0]              ppu_valid_w, ppu_vout_w;
-    wire [15*ARRAY_SIZE-1:0]           ppu_mult_w;
-    wire [6*ARRAY_SIZE-1:0]            ppu_shift_w;
-    wire [16*ARRAY_SIZE-1:0]           ppu_zp_w;
-    wire [DATA_W*ARRAY_SIZE-1:0]       ppu_out_w;
+    wire [ACC_W*`MAC_LANES-1:0]        ppu_acc_w, ppu_bias_w;
+    wire [`MAC_LANES-1:0]              ppu_valid_w, ppu_vout_w;
+    wire [15*`MAC_LANES-1:0]           ppu_mult_w;
+    wire [6*`MAC_LANES-1:0]            ppu_shift_w;
+    wire [16*`MAC_LANES-1:0]           ppu_zp_w;
+    wire [DATA_W*`MAC_LANES-1:0]       ppu_out_w;
 
     // ═══════════════════════════════════════════════════════════════════
     // SRAMs (Port A unused here — would be DMA in full system)
@@ -121,7 +122,7 @@ module npu_compute_tb #(
         .a_wdata(32'd0), .a_rdata(),
         .b_en(wgt_rd_en), .b_we(1'b0), .b_addr(wgt_rd_addr),
         .b_wdata(32'd0),
-        .b_wmask(8'd0),
+        .b_wmask(16'd0),
         .b_wdata_wide({`SRAM_B_WIDTH{1'b0}}),
         .b_rdata(wgt_rd_data)
     );
@@ -133,7 +134,7 @@ module npu_compute_tb #(
         .a_wdata(32'd0), .a_rdata(),
         .b_en(act_rd_en && !act_rd_ofm), .b_we(1'b0), .b_addr(act_rd_addr),
         .b_wdata(32'd0),
-        .b_wmask(8'd0),
+        .b_wmask(16'd0),
         .b_wdata_wide({`SRAM_B_WIDTH{1'b0}}),
         .b_rdata(ifm_rd_data)
     );
@@ -178,6 +179,7 @@ module npu_compute_tb #(
         .start(start), .done(done), .tile_done(tile_done),
         .oc_group_done(), .oc_group_out(),
         .wgt_reload_done(1'b1), .cfg_wgt_per_oc(32'd0),
+        .cfg_wgt_layout(cfg_wgt_layout),
         .db_prefetch_done(db_prefetch_done),
         .tile_out_h_actual(), .tile_out_w_actual(),
         .cfg_op_type(cfg_op_type),
@@ -269,7 +271,7 @@ module npu_compute_tb #(
     // ═══════════════════════════════════════════════════════════════════
 
     npu_ppu_bank #(
-        .N(ARRAY_SIZE), .ACC_W(ACC_W), .DATA_W(DATA_W),
+        .N(`MAC_LANES), .ACC_W(ACC_W), .DATA_W(DATA_W),
         .BIAS_W(`BIAS_WIDTH), .MULT_W(`PARAM_M_BITS),
         .SHIFT_W(`PARAM_S_BITS), .ZP_W(`PARAM_ZP_BITS)
     ) u_ppu_bank (

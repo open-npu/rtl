@@ -8,14 +8,17 @@ the array emits, ROWS cycles later, the COLS dot products
 one vector per cycle.
 """
 
+import os
 import random
 
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge
 
-ROWS = 16
-COLS = 16
+# The build picks the array dimension via -DARRAY_SIZE; the Makefile default
+# is 8. Pinning 16 here silently overflows the flattened operand buses.
+ROWS = int(os.environ.get("ARRAY_SIZE", "8"))
+COLS = ROWS
 DATA_W = 16
 ACC_W = 44
 

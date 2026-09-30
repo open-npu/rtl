@@ -52,9 +52,10 @@
 `define WB_ADDR_WIDTH  32     // Wishbone address bus width
 `define WB_SEL_WIDTH   4      // Wishbone byte select width
 `ifndef SRAM_B_WIDTH
-`define SRAM_B_WIDTH   256    // Compute-side act/wgt read width (8 × 32-bit words)
+`define SRAM_B_WIDTH   512    // Compute port: 64 bytes, one INT8 lane-group
 `endif
 `define SRAM_B_WORDS   (`SRAM_B_WIDTH / 32)
+`define MAC_LANES      64
 
 // ─── Register map base addresses ───
 `define CSR_BASE       12'h000  // Control & Status (Group 0)

@@ -172,6 +172,16 @@ def load_golden(mode='int8'):
 # ═══════════════════════════════════════════════════════════════════════
 
 
+async def program_wgt_layout(wb, meta):
+    """Tell the engine how the weight blob is laid out (CSR 0x14C).
+
+    The generators emit K-major for conv and depthwise — the ops the 64-lane
+    row runs — and OC-major for FC and deconv, which stay on the array.
+    """
+    default_layout = 1 if meta['op_type'] in (0, 1) else 0
+    await wb.write(0x14C, meta.get('wgt_layout', default_layout))
+
+
 async def program_layer(wb, meta):
     """Program all CSR registers for one layer."""
     # LAYER_MODE: op_type | (data_type << 4) | (in_zp << 8)
@@ -219,6 +229,7 @@ async def program_layer(wb, meta):
     # Per-oc weight words (0=all weights fit, >0=per-oc reload)
     if 'wgt_per_oc_words' in meta:
         await wb.write(0x148, meta['wgt_per_oc_words'])  # DMA_WGT_PER_OC
+    await program_wgt_layout(wb, meta)
 
     # Per-tile input size (for tiled layers with DB_EN)
     tile_in_size = meta.get('tile_in_size', 0)
@@ -260,6 +271,10 @@ async def run_layer_and_wait(wb, dut, timeout=500000):
     Falls back to Timer-based STATUS register polling for robustness.
     timeout is in clock cycles (each 10ns).
     """
+    # IRQ_STATUS (0x00C) is W1C and irq_o is the level |(status & en), so a
+    # leftover DONE from the previous layer would keep irq_o high and the
+    # RisingEdge below would never fire.
+    await wb.write(0x00C, 0x7)
     # Enable DONE IRQ (register 0x008, bit 0)
     await wb.write(0x008, 0x01)
     # Start layer
@@ -278,7 +293,7 @@ async def run_layer_and_wait(wb, dut, timeout=500000):
     try:
         irq_val = int(dut.irq_o.value)
         if irq_val == 1:
-            await wb.read(0x004)  # STATUS read clears the IRQ
+            await wb.write(0x00C, 0x7)  # W1C the pending IRQ
             return True
     except (ValueError, AttributeError):
         pass
@@ -832,6 +847,7 @@ async def program_layer_db_en(wb, meta):
     without crossing the boundary.  The int8_tiled_db_en golden data
     guarantees n_input_words + n_output_words <= ACT_DEPTH/2.
     """
+    await program_wgt_layout(wb, meta)
     # LAYER_MODE: op_type | (data_type << 4) | (in_zp << 8)
     await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4)
                    | ((meta.get('in_zp', 0) & 0xFFFF) << 8))
@@ -1024,6 +1040,7 @@ async def program_layer_fused_db_en(wb, meta, sched_ctrl, out_base=None, db_en=T
                   For FUSE_MID/END: previous layer's out_base (input already in SRAM).
         tile_h/w/num_h/num_w: override tiling (None = use meta defaults).
     """
+    await program_wgt_layout(wb, meta)
     await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
     await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
     await wb.write(0x048, meta['in_c'])
@@ -1246,6 +1263,7 @@ async def test_dma_e2e_tiling_perf_db_en(dut):
 async def program_layer_with_stride(wb, meta, in_stride, out_stride):
     """Program CSR for one layer with explicit DMA stride values."""
     # Same as program_layer, but also writes DMA_IN_STRIDE and DMA_OUT_STRIDE
+    await program_wgt_layout(wb, meta)
     await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
     await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
     await wb.write(0x048, meta['in_c'])
@@ -1519,6 +1537,7 @@ ADD_PARAM_ADDR  = 0x2001_0000
 
 async def program_pooling_layer(wb, meta, data):
     """Program CSR registers for a pooling test layer."""
+    await program_wgt_layout(wb, meta)
     # LAYER_MODE: op_type=3 | (data_type << 4)
     await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
 
@@ -1566,6 +1585,7 @@ async def program_pooling_layer(wb, meta, data):
 
 async def program_add_layer(wb, meta, data):
     """Program CSR registers for an eltwise add test layer."""
+    await program_wgt_layout(wb, meta)
     # LAYER_MODE: op_type=4 | (data_type << 4)
     await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
 
@@ -1613,6 +1633,7 @@ async def program_add_layer(wb, meta, data):
 
 async def program_resize_layer(wb, meta, data):
     """Program CSR registers for a resize test layer."""
+    await program_wgt_layout(wb, meta)
     await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
 
     await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
@@ -2171,6 +2192,7 @@ async def test_resize_bilinear_3x3to5x5(dut):
 
 async def program_deconv_layer(wb, meta, data):
     """Program CSR registers for a deconv test layer."""
+    await program_wgt_layout(wb, meta)
     # LAYER_MODE: op_type=6 | (data_type << 4)
     await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
 
@@ -2409,6 +2431,7 @@ async def test_deconv_multichannel(dut):
 
 async def program_concat_layer(wb, meta, data, out_base):
     """Program CSR registers for a concat branch layer."""
+    await program_wgt_layout(wb, meta)
     # LAYER_MODE: op_type=7 | (data_type << 4)
     await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
 
@@ -2536,6 +2559,7 @@ async def test_concat_int16(dut):
 
 async def program_conv1x1_layer(wb, meta):
     """Program CSR registers for Conv2D 1x1 (no tiling, no padding)."""
+    await program_wgt_layout(wb, meta)
     await wb.write(0x040, meta['op_type'] | (meta['data_type'] << 4))
     await wb.write(0x044, (meta['in_h'] << 16) | meta['in_w'])
     await wb.write(0x048, meta['in_c'])
@@ -2722,6 +2746,7 @@ async def program_generic_layer(wb, meta, out_base=None):
     """
     op_type = meta['op_type']
 
+    await program_wgt_layout(wb, meta)
     # LAYER_MODE: op_type | (data_type << 4)
     await wb.write(0x040, op_type | (meta['data_type'] << 4))
 
