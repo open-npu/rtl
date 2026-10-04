@@ -19,7 +19,7 @@ TOPLEVEL_LANG ?= verilog
 
 # ─── Hardware parameters (override to test different configs) ───
 ARRAY_SIZE ?= 8
-SPAD_KB    ?= 192
+SPAD_KB    ?= 164
 # Tests that size flattened operand buses read these back from the environment.
 export ARRAY_SIZE
 export SPAD_KB

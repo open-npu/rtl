@@ -247,15 +247,15 @@ module npu_ppu #(
                     shifted_full = s2_product >>> shift_amt;
                 else if (shift_amt >= PROD_W)
                     // Shift by >= PROD_W: result is 0 (positive) or -1 (negative)
-                    shifted_full = s2_product[PROD_W-1] ? -56'sd1 : 56'sd0;
+                    shifted_full = {PROD_W{s2_product[PROD_W-1]}};
                 else
                     shifted_full = s2_product;
                 // Saturate to 17-bit signed range to avoid truncation overflow
                 // 17-bit signed: [-65536, +65535]
-                if (shifted_full > 56'sd65535)
+                if (shifted_full > 17'sd65535)
                     shifted_v = 17'sd65535;
-                else if (shifted_full < -56'sd65536)
-                    shifted_v = -17'sd65536;
+                else if (shifted_full < -18'sd65536)
+                    shifted_v = 17'sh10000;
                 else
                     shifted_v = shifted_full[ZP_W:0];
             end else begin
@@ -277,7 +277,7 @@ module npu_ppu #(
             if (s1_mode == MODE_CONV_REQ)
                 product_v = s1_biased * $signed({1'b0, s1_mult_m});
             else
-                product_v = {{MULT_W{s1_biased[ACC_W-1]}}, s1_biased};  // sign-extend 40-bit
+                product_v = {{(PROD_W-ACC_W){s1_biased[ACC_W-1]}}, s1_biased};
 
             // Add rounding bit now (was in S3): product + (1 << (shift-1))
             if (s1_mode == MODE_CONV_REQ && s1_shift_s > 0 && s1_shift_s < PROD_W)

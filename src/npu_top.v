@@ -21,13 +21,12 @@
 
 module npu_top #(
     parameter ARRAY_SIZE = `ARRAY_SIZE,
-    parameter SPAD_KB    = `SPAD_KB,
-    // SRAM depths (words) — derived from SPAD_KB
-    // Allocation: IFM=SPAD/4, OFM=SPAD/4, Wgt=SPAD/2, Param=SPAD/16
-    // IFM and OFM each keep the old Act depth so act_base/out_base match.
-    parameter ACT_DEPTH   = SPAD_KB * 64,     // SPAD_KB * 1024 / 4 bytes / 4 B/word
-    parameter WGT_DEPTH   = SPAD_KB * 128,    // SPAD_KB * 1024 / 2 bytes / 4 B/word
-    parameter PARAM_DEPTH = SPAD_KB * 16      // SPAD_KB * 1024 / 16 bytes / 4 B/word
+    parameter SPAD_KB    = `SPAD_KB,          // total KB reported in HW_CONFIG
+    // IFM 24KB, OFM 48KB, weight 80KB, param 12KB. See npu_defines.vh.
+    parameter IFM_DEPTH   = `IFM_DEPTH,
+    parameter OFM_DEPTH   = `OFM_DEPTH,
+    parameter WGT_DEPTH   = `WGT_DEPTH_W,
+    parameter PARAM_DEPTH = `PARAM_DEPTH_W
 )(
     input  wire         clk,
     input  wire         rst_n,
@@ -239,7 +238,8 @@ module npu_top #(
     // ════════════════════════════════════════════════════════════════════
 
     npu_ctrl #(
-        .ACT_DEPTH   (ACT_DEPTH),
+        .IFM_DEPTH   (IFM_DEPTH),
+        .OFM_DEPTH   (OFM_DEPTH),
         .WGT_DEPTH   (WGT_DEPTH),
         .PARAM_DEPTH (PARAM_DEPTH)
     ) u_ctrl (
@@ -320,7 +320,8 @@ module npu_top #(
         .ping_pong_flag     (ping_pong_flag),
         .db_prefetch_done   (db_prefetch_done),
         .tile_done          (tile_done),
-        .cfg_act_bank_offset({1'b0, ACT_DEPTH[15:1]}),  // ACT_DEPTH/2 as 16-bit word offset
+        .cfg_act_bank_offset({1'b0, IFM_DEPTH[15:1]}),
+        .cfg_ofm_bank_offset({1'b0, OFM_DEPTH[15:1]}),
         // Auto-restart
         .ctrl_auto_next  (ctrl_auto_next),
         .cfg_layer_count (reg_layer_count)
@@ -376,7 +377,8 @@ module npu_top #(
     // ════════════════════════════════════════════════════════════════════
 
     // Address width calculations
-    localparam ACT_ADDR_W   = $clog2(ACT_DEPTH);
+    localparam ACT_ADDR_W   = $clog2(OFM_DEPTH); // OFM is the wider activation bank
+    localparam IFM_ADDR_W   = $clog2(IFM_DEPTH);
     localparam WGT_ADDR_W   = $clog2(WGT_DEPTH);
     localparam PARAM_ADDR_W = $clog2(PARAM_DEPTH);
 
@@ -400,25 +402,25 @@ module npu_top #(
     wire                    act_phys0_b_we, ofm_phys1_b_we;
 
     npu_sram_wide #(
-        .DEPTH  (ACT_DEPTH)
+        .DEPTH  (IFM_DEPTH)
     ) u_sram_act (
         .clk    (clk),
         .a_en   (act_a_en),
         .a_we   (act_a_we),
-        .a_addr (act_a_addr),
+        .a_addr (act_a_addr[IFM_ADDR_W-1:0]),
         .a_wdata(act_a_wdata),
         .a_rdata(act_a_rdata),
         .b_en   (act_b_en),
         .b_we   (act_phys0_b_we),
-        .b_addr (act_b_addr),
+        .b_addr (act_b_addr[IFM_ADDR_W-1:0]),
         .b_wdata(act_b_wr_data),
-        .b_wmask(act_phys0_b_we ? act_b_wr_mask : 16'd0),
+        .b_wmask(act_phys0_b_we ? act_b_wr_mask : 64'd0),
         .b_wdata_wide(act_b_wr_wide),
         .b_rdata(act_b_rdata)
     );
 
     npu_sram_wide #(
-        .DEPTH  (ACT_DEPTH)
+        .DEPTH  (OFM_DEPTH)
     ) u_sram_ofm (
         .clk    (clk),
         .a_en   (ofm_a_en),
@@ -430,7 +432,7 @@ module npu_top #(
         .b_we   (ofm_phys1_b_we),
         .b_addr (ofm_b_addr),
         .b_wdata(act_b_wr_data),
-        .b_wmask(ofm_phys1_b_we ? act_b_wr_mask : 16'd0),
+        .b_wmask(ofm_phys1_b_we ? act_b_wr_mask : 64'd0),
         .b_wdata_wide(act_b_wr_wide),
         .b_rdata(ofm_b_rdata)
     );
@@ -458,7 +460,7 @@ module npu_top #(
         .b_we   (1'b0),
         .b_addr (wgt_b_addr),
         .b_wdata(32'd0),
-        .b_wmask(16'd0),
+        .b_wmask(64'd0),
         .b_wdata_wide({`SRAM_B_WIDTH{1'b0}}),
         .b_rdata(wgt_b_rdata)
     );
@@ -699,7 +701,7 @@ module npu_top #(
     wire        act_b_wr_en;
     wire [ACT_ADDR_W-1:0] act_b_wr_addr;
     wire [31:0] act_b_wr_data;
-    wire [15:0] act_b_wr_mask;
+    wire [63:0] act_b_wr_mask;
     wire [`SRAM_B_WIDTH-1:0] act_b_wr_wide;
     wire        act_b_rd_en;
     wire [ACT_ADDR_W-1:0] act_b_rd_addr;
@@ -709,11 +711,14 @@ module npu_top #(
     // Compute engine handles full pipeline (compute + PPU + writeback) internally
     assign compute_done = compute_done_w;
 
-    // When DB_EN active, add bank offset (ACT_DEPTH/2) to compute's act_base
-    // based on ping_pong_flag. Each tile is placed at offset 0 within its bank;
-    // no intra-bank word offset needed (compute always reads from bank start).
+    // DB_EN places the current tile in one half of the bank compute is
+    // reading. After a fusion swap that bank is the physical OFM, whose
+    // half is larger than the IFM half.
+    wire [ACT_ADDR_W-1:0] ifm_db_half = act_role_swap
+        ? OFM_DEPTH[ACT_ADDR_W-1:0] >> 1
+        : IFM_DEPTH[ACT_ADDR_W-1:0] >> 1;
     wire [ACT_ADDR_W-1:0] effective_act_base = reg_sram_base[ACT_ADDR_W-1:0]
-        + (db_en_is_active && ping_pong_flag ? (ACT_DEPTH >> 1) : {ACT_ADDR_W{1'b0}});
+        + (db_en_is_active && ping_pong_flag ? ifm_db_half : {ACT_ADDR_W{1'b0}});
 
     npu_compute #(
         .ARRAY_SIZE   (ARRAY_SIZE),
