@@ -275,8 +275,8 @@ async def run_layer_and_wait(wb, dut, timeout=500000):
     # leftover DONE from the previous layer would keep irq_o high and the
     # RisingEdge below would never fire.
     await wb.write(0x00C, 0x7)
-    # Enable DONE IRQ (register 0x008, bit 0)
-    await wb.write(0x008, 0x01)
+    # Enable DONE and ERROR so either terminal condition wakes the waiter.
+    await wb.write(0x008, 0x03)
     # Start layer
     await wb.write(0x000, 0x01)  # CTRL: START
 
@@ -289,30 +289,44 @@ async def run_layer_and_wait(wb, dut, timeout=500000):
     except (ValueError, AttributeError):
         pass
 
-    # Check if IRQ fired BEFORE reading STATUS (which clears it)
+    # IRQ_STATUS is sticky; use it as the authoritative completion result.
     try:
-        irq_val = int(dut.irq_o.value)
-        if irq_val == 1:
+        irq_status = await wb.read(0x00C)
+        if irq_status & 0x2:
             await wb.write(0x00C, 0x7)  # W1C the pending IRQ
+            return False
+        if irq_status & 0x1:
+            await wb.write(0x00C, 0x7)
             return True
     except (ValueError, AttributeError):
         pass
 
-    # IRQ didn't fire — try STATUS read directly
+    # An idle engine without sticky DONE is not a successful completion.
     try:
         s = await wb.read(0x004)
+        if s & 0x4:
+            return False
         if (s & 0x1) == 0:
-            return True
+            return False
     except (ValueError, AttributeError):
         pass
 
-    # Timeout fallback: poll STATUS register until done or exhausted
+    # Timeout fallback: poll sticky IRQ status, with STATUS only for error/idle.
     for _ in range(100):  # up to 1M cycles
         await Timer(10000, unit='ns')
         try:
-            s = await wb.read(0x004)
-            if (s & 0x1) == 0:
+            irq_status = await wb.read(0x00C)
+            if irq_status & 0x2:
+                await wb.write(0x00C, 0x7)
+                return False
+            if irq_status & 0x1:
+                await wb.write(0x00C, 0x7)
                 return True
+            s = await wb.read(0x004)
+            if s & 0x4:
+                return False
+            if (s & 0x1) == 0:
+                return False
         except (ValueError, AttributeError):
             continue
     return False
@@ -2386,7 +2400,7 @@ async def test_deconv_int16(dut):
 # S_SPATIAL_SETUP precompute (spatial_setup_blk reassigns them later, NBA).
 @cocotb.test()
 async def test_deconv_multichannel(dut):
-    """Deconv multichannel: 4x4x8 -> 8x8x16, kernel 2x2 stride-2, INT8."""
+    """Deconv multichannel, including tails sharing a 32-bit output word."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset(dut)
 
@@ -2394,34 +2408,50 @@ async def test_deconv_multichannel(dut):
     mem = WbMasterMem(dut, dut.clk)
     cocotb.start_soon(mem.run())
 
-    meta, data = gen_deconv_test(in_h=4, in_w=4, in_c=8, out_c=16,
-                                  kernel_h=2, kernel_w=2, insert_h=1, insert_w=1,
-                                  pad_top=0, pad_left=0, int16_mode=False, seed=203)
+    cases = [
+        (16, False, 203),  # full mesh groups
+        (9,  False, 204),  # INT8 tail uses one byte of the shared word
+        (9,  True,  205),  # INT16 tail uses two bytes of the shared word
+    ]
+    for out_c, int16_mode, seed in cases:
+        meta, data = gen_deconv_test(
+            in_h=4, in_w=4, in_c=8, out_c=out_c,
+            kernel_h=2, kernel_w=2, insert_h=1, insert_w=1,
+            pad_top=0, pad_left=0, int16_mode=int16_mode, seed=seed,
+        )
 
-    mem.populate(POOL_WGT_ADDR, data['wgt_words'])
-    mem.populate(POOL_IN_ADDR, data['input_words'])
-    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+        mem.populate(POOL_WGT_ADDR, data['wgt_words'])
+        mem.populate(POOL_IN_ADDR, data['input_words'])
+        mem.populate(POOL_PARAM_ADDR, data['param_words'])
 
-    await program_deconv_layer(wb, meta, data)
-    done = await run_layer_and_wait(wb, dut, timeout=500000)
-    assert done, "Deconv multichannel did not complete"
+        await program_deconv_layer(wb, meta, data)
+        done = await run_layer_and_wait(wb, dut, timeout=500000)
+        assert done, f"Deconv out_c={out_c} int16={int16_mode} did not complete"
 
-    out_addr = POOL_OUT_ADDR
-    n_words = meta['n_output_words']
-    mismatches = []
-    for i in range(n_words):
-        got = mem.mem.get(out_addr + i * 4, None)
-        exp = int(data['output_words'][i])
-        if got is None:
-            mismatches.append((i, exp, 'NOT_WRITTEN'))
-        elif got != exp:
-            mismatches.append((i, exp, got))
+        n_words = meta['n_output_words']
+        mismatches = []
+        for i in range(n_words):
+            got = mem.mem.get(POOL_OUT_ADDR + i * 4, None)
+            exp = int(data['output_words'][i])
+            if got is None:
+                mismatches.append((i, exp, 'NOT_WRITTEN'))
+            elif got != exp:
+                mismatches.append((i, exp, got))
 
-    if mismatches:
-        for idx_m, exp, got in mismatches[:10]:
-            dut._log.error(f"  word[{idx_m}]: exp=0x{exp:08X} got={'NOT_WRITTEN' if got=='NOT_WRITTEN' else f'0x{got:08X}'}")
-    assert len(mismatches) == 0, f"Deconv multichannel: {len(mismatches)}/{n_words} mismatches"
-    dut._log.info(f"Deconv multichannel PASSED: {n_words} words bit-exact")
+        if mismatches:
+            for idx_m, exp, got in mismatches[:10]:
+                dut._log.error(
+                    f"  word[{idx_m}]: exp=0x{exp:08X} "
+                    f"got={'NOT_WRITTEN' if got == 'NOT_WRITTEN' else f'0x{got:08X}'}"
+                )
+        assert not mismatches, (
+            f"Deconv out_c={out_c} int16={int16_mode}: "
+            f"{len(mismatches)}/{n_words} mismatches"
+        )
+        dut._log.info(
+            f"Deconv out_c={out_c} int16={int16_mode} PASSED: "
+            f"{n_words} words bit-exact"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════

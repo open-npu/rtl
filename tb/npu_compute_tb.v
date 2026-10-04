@@ -37,6 +37,7 @@ module npu_compute_tb #(
     input  wire [15:0] cfg_tile_num_w,
     input  wire [15:0] cfg_in_w,
     input  wire [15:0] cfg_in_h,
+    input  wire signed [15:0] cfg_in_zp,
     input  wire [$clog2(ACT_DEPTH)-1:0] cfg_act_base,
     input  wire [$clog2(ACT_DEPTH)-1:0] cfg_out_base,
 
@@ -66,7 +67,7 @@ module npu_compute_tb #(
     wire                    act_wr_en;
     wire [ACT_ADDR_W-1:0]  act_wr_addr;
     wire [31:0]             act_wr_data;
-    wire [15:0]             act_wr_mask;
+    wire [63:0]             act_wr_mask;
     wire [`SRAM_B_WIDTH-1:0] act_wr_wide;
 
     wire                    param_rd_en;
@@ -122,7 +123,7 @@ module npu_compute_tb #(
         .a_wdata(32'd0), .a_rdata(),
         .b_en(wgt_rd_en), .b_we(1'b0), .b_addr(wgt_rd_addr),
         .b_wdata(32'd0),
-        .b_wmask(16'd0),
+        .b_wmask(64'd0),
         .b_wdata_wide({`SRAM_B_WIDTH{1'b0}}),
         .b_rdata(wgt_rd_data)
     );
@@ -134,7 +135,7 @@ module npu_compute_tb #(
         .a_wdata(32'd0), .a_rdata(),
         .b_en(act_rd_en && !act_rd_ofm), .b_we(1'b0), .b_addr(act_rd_addr),
         .b_wdata(32'd0),
-        .b_wmask(16'd0),
+        .b_wmask(64'd0),
         .b_wdata_wide({`SRAM_B_WIDTH{1'b0}}),
         .b_rdata(ifm_rd_data)
     );
@@ -190,7 +191,7 @@ module npu_compute_tb #(
         .cfg_pad_top(cfg_pad_top), .cfg_pad_left(cfg_pad_left),
         .cfg_tile_h(cfg_tile_h), .cfg_tile_w(cfg_tile_w),
         .cfg_tile_num_h(cfg_tile_num_h), .cfg_tile_num_w(cfg_tile_num_w),
-        .cfg_in_w(cfg_in_w), .cfg_in_h(cfg_in_h), .cfg_in_zp(16'sd0),
+        .cfg_in_w(cfg_in_w), .cfg_in_h(cfg_in_h), .cfg_in_zp(cfg_in_zp),
         .cfg_act_base(cfg_act_base), .cfg_out_base(cfg_out_base),
         .cfg_pool_cfg(32'd0), .cfg_resize_cfg(32'd0),
         .cfg_deconv_cfg(32'd0), .cfg_concat_cfg(32'd0),

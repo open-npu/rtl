@@ -18,9 +18,10 @@
 `include "npu_defines.vh"
 
 module npu_ctrl #(
-    parameter integer ACT_DEPTH   = `SPAD_KB * 64,
-    parameter integer WGT_DEPTH   = `SPAD_KB * 128,
-    parameter integer PARAM_DEPTH = `SPAD_KB * 16
+    parameter integer IFM_DEPTH   = `IFM_DEPTH,
+    parameter integer OFM_DEPTH   = `OFM_DEPTH,
+    parameter integer WGT_DEPTH   = `WGT_DEPTH_W,
+    parameter integer PARAM_DEPTH = `PARAM_DEPTH_W
 )(
     input  wire         clk,
     input  wire         rst_n,
@@ -106,7 +107,8 @@ module npu_ctrl #(
     output reg          ping_pong_flag,      // 0=compute reads lower half, 1=upper half
     output reg          db_prefetch_done,    // Prefetch complete; compute may start next tile
     input  wire         tile_done,           // Compute finished a non-final tile
-    input  wire [15:0]  cfg_act_bank_offset, // ACT_DEPTH/2 word offset, from npu_top
+    input  wire [15:0]  cfg_act_bank_offset, // IFM half, words
+    input  wire [15:0]  cfg_ofm_bank_offset, // OFM half, words
 
     // ─── Auto-Restart Interface ───
     input  wire         ctrl_auto_next,      // AUTO_NEXT latch from CSR
@@ -155,7 +157,7 @@ module npu_ctrl #(
     // 4 words/channel, so only (SPAD_KB*16/4) channels fit at once. When a
     // layer's channel count exceeds this (e.g. model_e L30 FC out_c=1000 > 768),
     // the params must be reloaded per oc_group (like per-OC weight reload).
-    wire param_needs_reload = ({17'd0, param_words} > (`SPAD_KB * 16));
+    wire param_needs_reload = ({17'd0, param_words} > PARAM_DEPTH);
 
     // Weight words = wgt_size / 4 (32-bit to handle large models)
     wire [31:0] wgt_words = cfg_dma_wgt_size >> 2;
@@ -171,10 +173,18 @@ module npu_ctrl #(
     // Output words = out_size / 4
     wire [15:0] out_words = cfg_dma_out_size[17:2];
 
-    // Physical SRAM limits, in 32-bit words. DB_EN confines each activation
-    // transfer/output to one half of the activation SRAM.
-    wire [31:0] act_capacity_words = db_en ? {16'd0, cfg_act_bank_offset}
-                                                : ACT_DEPTH;
+    // IFM and OFM are different sizes. Fusion swaps the physical banks, so
+    // the capacity check uses the bank each tensor will actually occupy
+    // after S_LOAD_ACT applies skip_act_load. DB_EN uses that bank's half.
+    wire        swap_next = skip_act_load ? ~act_role_swap : 1'b0;
+    wire [15:0] ifm_half_now = act_role_swap ? cfg_ofm_bank_offset : cfg_act_bank_offset;
+    wire [15:0] ofm_half_now = act_role_swap ? cfg_act_bank_offset : cfg_ofm_bank_offset;
+    wire [15:0] ifm_half_chk = swap_next ? cfg_ofm_bank_offset : cfg_act_bank_offset;
+    wire [15:0] ofm_half_chk = swap_next ? cfg_act_bank_offset : cfg_ofm_bank_offset;
+    wire [31:0] ifm_cap = db_en ? {16'd0, ifm_half_chk}
+                                : (swap_next ? OFM_DEPTH : IFM_DEPTH);
+    wire [31:0] ofm_cap = db_en ? {16'd0, ofm_half_chk}
+                                : (swap_next ? IFM_DEPTH : OFM_DEPTH);
     wire [31:0] initial_wgt_words = dw_stream ? {16'd0, dws_wgt_words}
                                 : ((cfg_dma_wgt_per_oc != 0)
                                    ? cfg_dma_wgt_per_oc : wgt_words);
@@ -223,7 +233,7 @@ module npu_ctrl #(
                              && ({8'd0, cfg_kernel_h} == cfg_in_h)
                              && ({8'd0, cfg_kernel_w} == cfg_in_w)
                              && (cfg_out_h == 16'd1) && (cfg_out_w == 16'd1)
-                             && ((cfg_dma_in_size >> 2) > (`SPAD_KB * 64));
+                             && ((cfg_dma_in_size >> 2) > IFM_DEPTH);
     wire [15:0] dws_row_len   = (`ARRAY_SIZE * dws_esz[15:0]) >> 2;  // 4 (int8) / 8 (int16) words
     wire [15:0] dws_row_count = cfg_in_h * cfg_in_w;                 // spatial positions
     wire [31:0] dws_stride    = {16'd0, cfg_in_c} * dws_esz;         // bytes between positions
@@ -235,13 +245,17 @@ module npu_ctrl #(
     // no weights — the per-group reload refetches only the act slice.
     wire        pool_stream  = (cfg_layer_mode[3:0] == 4'd3) && cfg_pool_cfg[20]
                             && (cfg_tile_h == 16'd0)
-                            && ((cfg_dma_in_size >> 2) > (`SPAD_KB * 64));
+                            && ((cfg_dma_in_size >> 2) > IFM_DEPTH);
     wire        slice_stream = dw_stream | pool_stream;
     // ctrl-side replica of compute's grp8_mode (16-ch per-oc block > WGT SRAM)
     wire [31:0] kd_bytes    = ({24'd0, cfg_kernel_h} * {24'd0, cfg_kernel_w}
                                * {16'd0, cfg_in_c}) << (cfg_int16 ? 1 : 0);
     wire        grp8_mode   = !cfg_wgt_layout && (cfg_dma_wgt_per_oc != 32'd0)
-                           && ((kd_bytes << 2) > (`SPAD_KB * 128));
+                           && ((kd_bytes << 2) > WGT_DEPTH);
+    // 16-channel reload, 8-wide mesh: two compute groups share one DMA.
+    // oc_group_idx counts groups of 8, so the block number is idx/2.
+    wire        mesh_half   = !cfg_wgt_layout && (cfg_dma_wgt_per_oc != 32'd0)
+                           && !grp8_mode && (`ARRAY_SIZE == 8);
     // Guard helpers (evaluated at S_IDLE, see E4-E7 below)
     wire [31:0] kd_elems32  = {24'd0, cfg_kernel_h} * {24'd0, cfg_kernel_w}
                               * {16'd0, cfg_in_c};
@@ -565,17 +579,17 @@ module npu_ctrl #(
                         // silently computing garbage) ───
                         // E1: slice-stream layers need all PPU params resident
                         //     (no per-oc param reload on this path)
-                        if (slice_stream && ({17'd0, cfg_out_c} * 4 > (`SPAD_KB * 16))) begin
+                        if (slice_stream && ({17'd0, cfg_out_c} * 4 > PARAM_DEPTH)) begin
                             hw_error_code <= 4'd1;
                             state <= S_ERROR;
                         // E2: 8-ch per-oc sub-groups incompatible with per-oc
                         //     param reload (reload granularity is 16 ch)
-                        end else if (grp8_mode && ({17'd0, cfg_out_c} * 4 > (`SPAD_KB * 16))) begin
+                        end else if (grp8_mode && ({17'd0, cfg_out_c} * 4 > PARAM_DEPTH)) begin
                             hw_error_code <= 4'd2;
                             state <= S_ERROR;
                         // E3: channel slice must fit below the stream output
                         //     region (DW_STREAM_OUT_BASE)
-                        end else if (slice_stream && (dws_act_words32 > `DW_STREAM_OUT_BASE)) begin
+                        end else if (slice_stream && (dws_act_words32 > ifm_cap)) begin
                             hw_error_code <= 4'd3;
                             state <= S_ERROR;
                         // E4: activation input transfer must fit its physical
@@ -585,20 +599,20 @@ module npu_ctrl #(
                         //     full dma_in_size is what overflowed SRAM and is
                         //     why the layer is streamed (A L61 DW, E L29 GAP).
                         end else if (!slice_stream
-                                     && active_input_words > act_capacity_words) begin
+                                     && active_input_words > ifm_cap) begin
                             hw_error_code <= 4'd4;
                             state <= S_ERROR;
                         // E5: output range must fit without address truncation.
                         //     Stream output lives at DW_STREAM_OUT_BASE in the
-                        //     full act SRAM, not in a DB bank.
+                        //     full OFM, not in a DB bank.
                         end else if (!slice_stream
                                      && (output_sram_base + active_output_words
-                                         > act_capacity_words)) begin
+                                         > ofm_cap)) begin
                             hw_error_code <= 4'd5;
                             state <= S_ERROR;
                         end else if (slice_stream
                                      && (output_sram_base + active_output_words
-                                         > ACT_DEPTH)) begin
+                                         > (swap_next ? IFM_DEPTH : OFM_DEPTH))) begin
                             hw_error_code <= 4'd5;
                             state <= S_ERROR;
                         // E6: Conv/FC k_depth exceeds 16-bit k_depth register
@@ -786,7 +800,7 @@ module npu_ctrl #(
                                     + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
                                 // Prefetch tile 1 to Bank[1] at offset 0
                                 // No intra-bank word offset: compute always reads from offset 0
-                                next_sram_offset   <= cfg_act_bank_offset;
+                                next_sram_offset   <= ifm_half_now;
                             end else begin
                                 // Fused: input is contiguous in SRAM, no prefetch
                                 ping_pong_flag     <= 1'b0;
@@ -864,8 +878,8 @@ module npu_ctrl #(
                                 if (!use_2d_load)
                                     next_tile_ddr_addr <= next_tile_ddr_addr
                                         + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
-                                next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
-                                                    16'd0 : cfg_act_bank_offset;
+                                next_sram_offset <= (next_sram_offset >= ifm_half_now) ?
+                                                    16'd0 : ifm_half_now;
                             end
                         end
 
@@ -950,9 +964,9 @@ module npu_ctrl #(
                         // everything else (incl. Concat, which also has
                         // add_b != 0 for its preload) stores from out region.
                         if (is_add_op)
-                            dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
+                            dma_sram_addr <= (db_en && store_bank ? ifm_half_now : 16'd0);
                         else
-                            dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
+                            dma_sram_addr <= cfg_out_base + (db_en && store_bank ? ofm_half_now : 16'd0);
                         dma_xfer_len  <= r_tile_row_len * r_tile_row_count;
                         // 2D parameters: all layers use clipped tile dims for DDR row_len.
                         // Add/Concat layers: SRAM uses padded tile_w, so src_row_len = padded.
@@ -969,7 +983,7 @@ module npu_ctrl #(
                         $display("[PTS_STORE] t=%0t ty=%0d tx=%0d ddr=0x%08x sram=%0d len=%0d row_len=%0d row_cnt=%0d stride=%0d bank=%0d",
                                  $time, tile_y_seq, tile_x_seq,
                                  cfg_dma_out_addr + r_tile_ddr_offset,
-                                 cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0),
+                                 cfg_out_base + (db_en && store_bank ? ofm_half_now : 16'd0),
                                  r_tile_row_len * r_tile_row_count, r_tile_row_len, r_tile_row_count, r_nhwc_row_stride, store_bank);
                         `endif
                         state          <= S_TILE_STORE_WAIT;
@@ -1029,8 +1043,8 @@ module npu_ctrl #(
                                     next_tile_ddr_addr <= next_tile_ddr_addr
                                         + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
                                 // Toggle target bank for next prefetch
-                                next_sram_offset <= (next_sram_offset >= cfg_act_bank_offset) ?
-                                                    16'd0 : cfg_act_bank_offset;
+                                next_sram_offset <= (next_sram_offset >= ifm_half_now) ?
+                                                    16'd0 : ifm_half_now;
                             end else begin
                                 db_prefetch_done <= 1'b1;
                             end
@@ -1048,7 +1062,9 @@ module npu_ctrl #(
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;  // load
                         dma_sram_sel  <= 2'd0;  // weight bank
-                        dma_ext_addr  <= cfg_dma_wgt_addr + oc_group_idx * cfg_dma_wgt_per_oc * 4;
+                        dma_ext_addr  <= cfg_dma_wgt_addr
+                            + (mesh_half ? (oc_group_idx >> 1) : oc_group_idx)
+                              * cfg_dma_wgt_per_oc * 4;
                         dma_sram_addr <= 16'd0;  // always load to SRAM[0]
                         dma_xfer_len  <= cfg_dma_wgt_per_oc[15:0];
                         state         <= S_WAIT_RELOAD_WGT;
@@ -1076,9 +1092,10 @@ module npu_ctrl #(
                 end
 
                 // ─── Per-oc_group param reload ───
-                // DDR layout: 4 words per channel, 16 channels per oc_group =
-                // 64 words (256 bytes) per oc_group. Load oc_group_idx's params to
-                // param SRAM[0] (compute reads param_base=0 for per-oc reload).
+                // DDR layout: 4 words per channel, 16 channels per reload =
+                // 64 words (256 bytes). An 8-wide mesh shares that block
+                // across two groups, so the block number is oc_group_idx/2.
+                // Compute reads the upper half at param_base, not SRAM[0].
                 S_RELOAD_PARAM: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;
@@ -1086,7 +1103,8 @@ module npu_ctrl #(
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;  // load
                         dma_sram_sel  <= 2'd2;  // param bank
-                        dma_ext_addr  <= cfg_dma_param_addr + oc_group_idx * 32'd256;
+                        dma_ext_addr  <= cfg_dma_param_addr
+                            + (mesh_half ? (oc_group_idx >> 1) : oc_group_idx) * 32'd256;
                         dma_sram_addr <= 16'd0;  // always load to param SRAM[0]
                         dma_xfer_len  <= 16'd64;  // 16 channels * 4 words
                         dma_row_len   <= 16'd0;
@@ -1224,11 +1242,11 @@ module npu_ctrl #(
                         // Concat has add_b != 0 (preload) but stores from out_base.
                         // DW/Pool stream: output accumulated in the fixed high region.
                         if (is_add_op)
-                            dma_sram_addr <= (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
+                            dma_sram_addr <= (db_en && store_bank ? ifm_half_now : 16'd0);
                         else if (slice_stream)
                             dma_sram_addr <= `DW_STREAM_OUT_BASE;
                         else
-                            dma_sram_addr <= cfg_out_base + (db_en && store_bank ? cfg_act_bank_offset : 16'd0);
+                            dma_sram_addr <= cfg_out_base + (db_en && store_bank ? ofm_half_now : 16'd0);
                         // For DB_EN Add: use tile_in_words (same as output size per tile)
                         dma_xfer_len  <= (db_en && is_add_op) ? tile_in_words : out_words;
                         // 1D mode for final store (clear any 2D params)
@@ -1264,7 +1282,9 @@ module npu_ctrl #(
                         dma_sram_sel  <= is_concat_op ? 2'd3 : 2'd1;
                         dma_ext_addr  <= cfg_dma_add_b_addr
                                          + (is_concat_op ? tile_ddr_offset : cur_tile_ddr_offset);
-                        dma_sram_addr <= cfg_out_base + (db_en && ping_pong_flag ? cfg_act_bank_offset : 16'd0);
+                        dma_sram_addr <= cfg_out_base + (db_en && ping_pong_flag
+                                            ? (is_concat_op ? ofm_half_now : ifm_half_now)
+                                            : 16'd0);
                         dma_xfer_len  <= is_concat_op ? concat_b_xfer_words : tile_in_words;
                         `ifndef SYNTHESIS
                         if (tile_x_seq == 0 && tile_y_seq == 0)
@@ -1309,7 +1329,21 @@ module npu_ctrl #(
                     hw_done       <= 1'b1;
                     hw_curr_layer <= hw_curr_layer + 1;
                     if (!aborted && ctrl_auto_next && (hw_curr_layer + 1 < cfg_layer_count)) begin
-                        // Auto-restart: stay busy, start next layer
+                        // Auto-restart repeats the programmed descriptor. Reset
+                        // all per-layer DB/tile state so the next iteration
+                        // starts from tile 0 and the first activation bank.
+                        act_role_swap       <= 1'b0;
+                        ping_pong_flag      <= 1'b0;
+                        prefetch_active     <= 1'b0;
+                        prefetch_pending    <= 1'b0;
+                        db_prefetch_done    <= 1'b1;
+                        next_tile_ddr_addr  <= 32'd0;
+                        cur_tile_ddr_offset <= 32'd0;
+                        add_b_reload        <= 1'b0;
+                        next_sram_offset    <= cfg_act_bank_offset;
+                        tile_y_seq          <= 16'd0;
+                        tile_x_seq          <= 16'd0;
+                        last_tile_store     <= 1'b0;
                         state <= S_LOAD_WGT;
                     end else begin
                         // Normal: deassert busy, return to idle

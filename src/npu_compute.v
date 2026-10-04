@@ -26,7 +26,7 @@
 module npu_compute #(
     parameter ARRAY_SIZE   = `ARRAY_SIZE,
     parameter ACT_ADDR_W   = 13,  // $clog2(SPAD_KB*64) for SPAD_KB=128 → $clog2(8192)=13
-    parameter WGT_ADDR_W   = $clog2(`SPAD_KB * 128),  // $clog2(WGT_DEPTH)
+    parameter WGT_ADDR_W   = $clog2(`WGT_DEPTH_W),
     parameter PARAM_ADDR_W = 11,  // $clog2(SPAD_KB*16) for SPAD_KB=128 → $clog2(2048)=11
     parameter DATA_W       = `DATA_WIDTH,
     parameter ACC_W        = `ACC_WIDTH
@@ -82,8 +82,9 @@ module npu_compute #(
     input  wire [`SRAM_B_WIDTH-1:0]     wgt_rd_data,
 
     // ─── Activation SRAM Port B (256-bit IFM read + OFM write) ───
-    // act_wr_mask == 0: one 32-bit word in act_wr_data (DW / pool / add / resize).
-    // act_wr_mask != 0: those words of act_wr_wide, starting at act_wr_addr.
+    // act_wr_mask == 0: one 32-bit word in act_wr_data (pool / add / resize).
+    // act_wr_mask != 0: byte enables for act_wr_wide, starting at act_wr_addr.
+    // Depthwise stores one OC group this way; the mesh PPU does too.
     output reg                          act_rd_en,
     output reg  [ACT_ADDR_W-1:0]       act_rd_addr,
     input  wire [`SRAM_B_WIDTH-1:0]     act_rd_data,
@@ -91,7 +92,7 @@ module npu_compute #(
     output reg                          act_wr_en,
     output reg  [ACT_ADDR_W-1:0]       act_wr_addr,
     output reg  [31:0]                  act_wr_data,
-    output reg  [15:0]                  act_wr_mask,
+    output reg  [63:0]                  act_wr_mask,
     output reg  [`SRAM_B_WIDTH-1:0]     act_wr_wide,
 
     // ─── Parameter SRAM Port B (read-only) ───
@@ -434,6 +435,18 @@ module npu_compute #(
     reg [1:0]  dw_wb_bytesel;          // byte position within word
     reg [ACT_ADDR_W-1:0] dw_wb_addr;  // target word address
     reg [1:0]  dw_wgt_bsel_base;       // starting byte offset for weight reads
+    // Act-read pipe for the OC-major / stream DW engine. SRAM data is
+    // visible two cycles after the issue, so iss is the newer request and
+    // ret is consumed this cycle. Pads skip the pipe when it is empty.
+    reg        dw_iss_vld;
+    reg        dw_ret_vld;
+    reg [1:0]  dw_iss_bsel;
+    reg [1:0]  dw_ret_bsel;
+    reg        dw_iss_last;
+    reg        dw_ret_last;
+    reg        dw_iss_clr;
+    reg        dw_ret_clr;
+    reg        dw_kdone;              // last tap of this pixel has been issued
     reg [15:0] dw_grp_base;            // stream mode: first channel of resident 16-ch group
     reg [15:0] pool_grp_base;          // pool stream mode: ditto
 
@@ -450,8 +463,8 @@ module npu_compute #(
     // ─── Pixel-block weight reuse ───
     // One k_pass of weights is reused across BLK_PX_MAX pixels. Two banks:
     // PPU reads bank rd while the next block accumulates into bank wr.
-    // 32 (not 16) so a pass is long enough to park the next pass's weights
-    // in the PE shadow before the psum drain ends.
+    // 32 hides the next-pass prefetch behind the pixels. A shorter tail
+    // waits in PSUM_COLLECT until the same park finishes, then swaps.
     localparam BLK_PX_MAX = 32;
     localparam ACC_N = 2 * BLK_PX_MAX * ARRAY_SIZE;
     reg signed [ACC_W-1:0] px_acc_buf [0:ACC_N-1];
@@ -517,7 +530,7 @@ module npu_compute #(
                          && ({8'd0, cfg_kernel_h} == cfg_in_h)
                          && ({8'd0, cfg_kernel_w} == cfg_in_w)
                          && (cfg_out_h == 16'd1) && (cfg_out_w == 16'd1)
-                         && (dws_total_words > (`SPAD_KB * 64));
+                         && (dws_total_words > `IFM_DEPTH);
 
     wire [31:0] k_depth_cfg = {8'd0, cfg_kernel_h} * {8'd0, cfg_kernel_w}
                             * {16'd0, cfg_in_c};
@@ -564,7 +577,7 @@ module npu_compute #(
     reg        row_last;
     reg [7:0]  ob_n, ob_i;
     // 64 lanes of INT16 is 128 bytes, twice what the 512-bit wide port takes.
-    reg [7:0]  obytes [0:127];
+    reg [1023:0] obuf;
     reg [31:0] pk;
     reg [1:0]  pk_pos;
     reg [ACT_ADDR_W-1:0] pk_addr;
@@ -606,6 +619,13 @@ module npu_compute #(
     reg [1:0]  ga_f_vld;       // descriptor pipeline: issue -> +1 -> sample
     reg [1:0]  ga_f_pad;
     reg [5:0]  ga_f_skip [0:1];
+    reg [6:0]  ga_f_base [0:1]; // first lane this beat fills
+    reg [6:0]  ga_f_nelt [0:1]; // elements in the whole read, not this beat
+    reg [1:0]  ga_f_tend;       // this beat completes a depthwise tap
+    reg [6:0]  ga_base_r;       // held across the beats of one read
+    reg [6:0]  ga_nelt_r;
+    reg        ga_tend_r;
+    reg [4:0]  ga_step_r;       // pixels this read covers
     reg        ga_bank;        // abuf chunk buffer being filled
     // The P packed pixels are consecutive in raster order, so their outputs
     // are contiguous in NHWC and one origin plus row_pv describes them all.
@@ -638,10 +658,15 @@ module npu_compute #(
     // K-major layers reload in whole 64-channel groups, so the 8/16-channel
     // sub-grouping never applies to them.
     wire        grp8_mode = !cfg_wgt_layout && (cfg_wgt_per_oc != 32'd0)
-                         && ((kd_bytes << 2) > (`SPAD_KB * 128));  // 16ch words = kd_bytes*16/4
+                         && ((kd_bytes << 2) > `WGT_DEPTH_W);  // 16ch words = kd_bytes*16/4
     // Channels per OC group. oc_groups_total and wgt_base step by ARRAY_SIZE,
     // so the param base and the writeback offset have to use the same stride.
     wire [4:0]  grp_oc    = grp8_mode ? 5'd8 : ARRAY_SIZE[4:0];
+    // Packer reloads a 16-channel block whenever that block fits. The
+    // mesh is 8 wide, so the upper 8 channels stay in SRAM and the next
+    // group reads them at wgt_base instead of issuing another DMA.
+    wire        mesh_half = !cfg_wgt_layout && (cfg_wgt_per_oc != 32'd0)
+                         && !grp8_mode && (ARRAY_SIZE == 8);
     // FORCE_MESH keeps conv on the 8x8 array so util tests can compare
     // the mesh against the 64-MAC row on the same layer.
 `ifdef FORCE_MESH
@@ -697,7 +722,7 @@ module npu_compute #(
     // act slice.
     wire        pool_stream = (cfg_op_type == 8'd3) && global_pool
                            && (cfg_tile_h == 16'd0)
-                           && (dws_total_words > (`SPAD_KB * 64));
+                           && (dws_total_words > `IFM_DEPTH);
     wire        slice_stream = dw_stream | pool_stream;
     wire        resize_mode   = cfg_resize_cfg[0];   // 0=nearest, 1=bilinear
     // ─── Deconv state ───
@@ -881,8 +906,8 @@ module npu_compute #(
     reg signed [55:0]      recip_scale_h_m1;   // ((cfg_in_h-1)<<8) * recip_out_h_m1
     reg signed [55:0]      recip_scale_w_m1;   // ((cfg_in_w-1)<<8) * recip_out_w_m1
     // Tile-origin hoist (avoid 4x redundant division per pixel)
-    reg [15:0]             rsz_tile_ih_origin;  // (tile_oh_origin * in_h) / out_h
-    reg [15:0]             rsz_tile_iw_origin;  // (tile_ow_origin * in_w) / out_w
+    reg [15:0]             rsz_tile_ih_origin;  // first input row used by this output tile
+    reg [15:0]             rsz_tile_iw_origin;  // first input column used by this output tile
     // Bilinear interp pipeline register (for 2-cycle interp split)
     reg signed [63:0]      rsz_top_r, rsz_bot_r;
 
@@ -944,7 +969,7 @@ module npu_compute #(
             act_wr_en   <= 1'b0;
             act_wr_addr <= 0;
             act_wr_data <= 32'd0;
-            act_wr_mask <= 16'd0;
+            act_wr_mask <= 64'd0;
             act_wr_wide <= {`SRAM_B_WIDTH{1'b0}};
             param_rd_en <= 1'b0;
             param_rd_addr <= 0;
@@ -990,6 +1015,11 @@ module npu_compute #(
             dw_acc_buf <= 0; dw_kernel_size <= 0;
             dw_wb_phase <= 0; dw_wb_byte <= 0; dw_wb_bytesel <= 0; dw_wb_addr <= 0;
             dw_wgt_bsel_base <= 0;
+            dw_iss_vld <= 1'b0; dw_ret_vld <= 1'b0;
+            dw_iss_bsel <= 2'd0; dw_ret_bsel <= 2'd0;
+            dw_iss_last <= 1'b0; dw_ret_last <= 1'b0;
+            dw_iss_clr <= 1'b0; dw_ret_clr <= 1'b0;
+            dw_kdone <= 1'b0;
             dw_grp_base <= 0;
             pool_grp_base <= 0;
             flush_cnt <= 0;
@@ -1076,7 +1106,7 @@ module npu_compute #(
             act_rd_en   <= 1'b0;
             act_rd_ofm  <= 1'b0;
             act_wr_en   <= 1'b0;
-            act_wr_mask <= 16'd0;
+            act_wr_mask <= 64'd0;
             mac1d_fire  <= 1'b0;
             param_rd_en <= 1'b0;
             ppu_in_valid <= 1'b0;
@@ -1119,12 +1149,14 @@ module npu_compute #(
             if (ppu_bg || (state == S_PPU_STREAM)) begin
                 begin : ppu_stream_blk
                     reg [31:0] elem_off;
+                    reg [31:0] byte_off;
                     reg [4:0]  nch;
-                    reg [3:0]  nwords;
                     reg [4:0]  inflight;
+                    reg [511:0] wrwide;
+                    reg [63:0]  wrmask;
+                    reg signed [DATA_W-1:0] oval;
+                    integer bi;
                     nch = {1'b0, ppu_col_last} + 5'd1;
-                    // One beat holds the whole OC group: 4 INT8 or 2 INT16 per word.
-                    nwords = cfg_int16 ? ((nch + 5'd1) >> 1) : ((nch + 5'd3) >> 2);
                     inflight = ppu_px - wb_px;
 
                     // PPU latency is 4 and throughput is 1/cycle. Write the
@@ -1133,42 +1165,28 @@ module npu_compute #(
                     if (ppu_vout_w[0] || ppu_out_valid) begin
                         elem_off = (spw_oh * out_tile_w + spw_ow) * cfg_out_c
                                  + ppu_oc_save * {11'd0, grp_oc};
+                        byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                        wrwide = 512'd0;
+                        wrmask = 64'd0;
+                        for (bi = 0; bi < ARRAY_SIZE; bi = bi + 1) begin
+                            if (bi < nch) begin
+                                if (bi == 0 && !ppu_vout_w[0])
+                                    oval = ppu_out_data;
+                                else
+                                    oval = ppu_out_w[DATA_W*bi +: DATA_W];
+                                if (cfg_int16) begin
+                                    wrwide[8*(byte_off[1:0] + 2*bi) +: 16] = oval;
+                                    wrmask[byte_off[1:0] + 2*bi +: 2] = 2'b11;
+                                end else begin
+                                    wrwide[8*(byte_off[1:0] + bi) +: 8] = oval[7:0];
+                                    wrmask[byte_off[1:0] + bi] = 1'b1;
+                                end
+                            end
+                        end
                         act_wr_en <= 1'b1;
-                        if (cfg_int16) begin
-                            act_wr_addr <= out_base + elem_off[17:1];
-                            for (i = 0; i < 8; i = i + 1) begin
-                                act_wr_mask[i] <= (i < nwords);
-                                act_wr_wide[32*i +: 16] <=
-                                    ((2*i) < ARRAY_SIZE)
-                                    ? ppu_out_w[DATA_W*(2*i) +: DATA_W] : 16'd0;
-                                act_wr_wide[32*i+16 +: 16] <=
-                                    ((2*i+1) < ARRAY_SIZE)
-                                    ? ppu_out_w[DATA_W*(2*i+1) +: DATA_W] : 16'd0;
-                            end
-                        end else begin
-                            act_wr_addr <= out_base + elem_off[17:2];
-                            for (i = 0; i < 8; i = i + 1) begin
-                                act_wr_mask[i] <= (i < nwords);
-                                act_wr_wide[32*i +: 8] <=
-                                    ((4*i) < ARRAY_SIZE)
-                                    ? ppu_out_w[DATA_W*(4*i) +: 8] : 8'd0;
-                                act_wr_wide[32*i+8 +: 8] <=
-                                    ((4*i+1) < ARRAY_SIZE)
-                                    ? ppu_out_w[DATA_W*(4*i+1) +: 8] : 8'd0;
-                                act_wr_wide[32*i+16 +: 8] <=
-                                    ((4*i+2) < ARRAY_SIZE)
-                                    ? ppu_out_w[DATA_W*(4*i+2) +: 8] : 8'd0;
-                                act_wr_wide[32*i+24 +: 8] <=
-                                    ((4*i+3) < ARRAY_SIZE)
-                                    ? ppu_out_w[DATA_W*(4*i+3) +: 8] : 8'd0;
-                            end
-                        end
-                        if (!ppu_vout_w[0]) begin
-                            if (cfg_int16)
-                                act_wr_wide[15:0] <= ppu_out_data;
-                            else
-                                act_wr_wide[7:0] <= ppu_out_data[7:0];
-                        end
+                        act_wr_addr <= out_base + byte_off[ACT_ADDR_W+1:2];
+                        act_wr_wide <= wrwide;
+                        act_wr_mask <= wrmask;
                         if (wb_px + 1 >= ppu_blk_save) begin
                             if (!ppu_bg) begin
                                 sp_oh <= spw_oh;
@@ -1367,24 +1385,36 @@ module npu_compute #(
             ga_f_vld[1]  <= ga_f_vld[0];
             ga_f_pad[1]  <= ga_f_pad[0];
             ga_f_skip[1] <= ga_f_skip[0];
+            ga_f_base[1] <= ga_f_base[0];
+            ga_f_nelt[1] <= ga_f_nelt[0];
+            ga_f_tend[1] <= ga_f_tend[0];
             ga_f_vld[0]  <= 1'b0;
+            ga_f_base[0] <= 7'd0;
+            ga_f_nelt[0] <= 7'd0;
+            ga_f_tend[0] <= 1'b0;
 
             if (ga_on) begin : row_gather_issue
-                reg signed [31:0] ih, iw;
+                reg signed [31:0] ih, iw, remain, run;
                 reg [15:0] poh, pow;
-                reg        is_pad, last_beat;
+                reg        is_pad, last_beat, tap_done;
                 reg [15:0] nelt, nbyte;
                 reg [31:0] elem, byte_off;
                 reg [5:0]  skip;
-                reg        go;
+                reg [6:0]  base;
+                reg [4:0]  step;
+                reg        go, tend;
                 nelt = row_dw ? {9'd0, row_nch} : cfg_in_c;
+                base = 7'd0;
+                tend = 1'b1;
+                tap_done = 1'b1;
+                step = 5'd1;
                 // DW walks taps continuously and may run three ahead of the
                 // MAC; conv stops at the end of the chunk it is filling.
                 go = row_dw ? ((ga_t - row_ki) < 16'd3) : ga_busy;
                 if (go) begin
                     last_beat = 1'b0;
                     if (ga_left != 16'd0) begin
-                        // Continuation beat of a tap wider than 64 bytes.
+                        // Continuation beat of a read wider than 64 bytes.
                         act_rd_en   <= 1'b1;
                         act_rd_ofm  <= 1'b0;
                         act_rd_addr <= ga_addr[ACT_ADDR_W-1:0];
@@ -1393,10 +1423,23 @@ module npu_compute #(
                         ga_f_vld[0]  <= 1'b1;
                         ga_f_pad[0]  <= 1'b0;
                         ga_f_skip[0] <= 6'd0;
+                        ga_f_base[0] <= ga_base_r;
+                        ga_f_nelt[0] <= ga_nelt_r;
                         last_beat    = (ga_left <= 16'd64);
+                        ga_f_tend[0] <= last_beat && ga_tend_r;
+                        tap_done     = ga_tend_r;
+                        step         = ga_step_r;
                     end else begin
-                        poh = row_dw ? sp_oh : gp_oh[ga_p[2:0]];
-                        pow = row_dw ? sp_ow : gp_ow[ga_p[2:0]];
+                        // Depthwise pixels of one group sit on one row, so
+                        // pixel ga_p is (sp_oh, sp_ow + ga_p). Stride 1 makes
+                        // those pixels contiguous in NHWC.
+                        if (row_dw) begin
+                            poh = sp_oh;
+                            pow = sp_ow + {11'd0, ga_p};
+                        end else begin
+                            poh = gp_oh[ga_p[2:0]];
+                            pow = gp_ow[ga_p[2:0]];
+                        end
                         ih = $signed({1'b0, tile_oh_origin + poh})
                            * $signed({1'b0, cfg_stride_h})
                            + $signed({16'd0, ga_fh}) - $signed({16'd0, cfg_pad_top});
@@ -1405,11 +1448,49 @@ module npu_compute #(
                            + $signed({16'd0, ga_fw}) - $signed({16'd0, cfg_pad_left});
                         is_pad = (ih < 0) || (ih >= $signed({1'b0, cfg_in_h}))
                               || (iw < 0) || (iw >= $signed({1'b0, cfg_in_w}));
-                        ga_f_vld[0] <= 1'b1;
-                        ga_f_pad[0] <= is_pad;
+                        // Depthwise pixels of a group are contiguous in NHWC
+                        // when stride is 1, so an in-bounds run is one read and
+                        // a padding run is one zero-point fill. A group that
+                        // crosses the image edge is those two runs, not one
+                        // read per pixel.
+                        if (row_dw) begin
+                            remain = $signed({27'd0, row_pv}) - $signed({27'd0, ga_p});
+                            if (remain < 32'sd1)
+                                remain = 32'sd1;
+                            if ((ih < 0) || (ih >= $signed({1'b0, cfg_in_h}))
+                                    || (iw >= $signed({1'b0, cfg_in_w}))) begin
+                                run = remain;
+                                is_pad = 1'b1;
+                            end else if (iw < 0) begin
+                                run = -iw;
+                                if (run > remain)
+                                    run = remain;
+                                is_pad = 1'b1;
+                            end else begin
+                                run = $signed({1'b0, cfg_in_w}) - iw;
+                                if (run > remain)
+                                    run = remain;
+                                is_pad = 1'b0;
+                            end
+                            if (run < 32'sd1)
+                                run = 32'sd1;
+                            step = run[4:0];
+                            nelt = {11'd0, step} * {9'd0, row_nch};
+                            base = {2'd0, ga_p} * {2'd0, row_nch};
+                            tend = ({11'd0, ga_p} + {11'd0, step} >= {11'd0, row_pv});
+                        end
+                        ga_base_r <= base;
+                        ga_nelt_r <= nelt[6:0];
+                        ga_tend_r <= tend;
+                        ga_step_r <= step;
+                        ga_f_vld[0]  <= 1'b1;
+                        ga_f_pad[0]  <= is_pad;
+                        ga_f_base[0] <= base;
+                        ga_f_nelt[0] <= nelt[6:0];
                         if (is_pad) begin
                             act_rd_en    <= 1'b0;
                             ga_f_skip[0] <= 6'd0;
+                            ga_f_tend[0] <= tend;
                             last_beat    = 1'b1;
                         end else begin
                             if (cfg_tile_h == 16'd0)
@@ -1430,36 +1511,45 @@ module npu_compute #(
                             ga_addr      <= {16'd0, act_base + byte_off[ACT_ADDR_W+1:2]} + 32'd16;
                             ga_f_skip[0] <= skip;
                             // The first beat delivers 64-skip bytes.
-                            if ({10'd0, skip} + nbyte > 16'd64)
+                            if ({10'd0, skip} + nbyte > 16'd64) begin
                                 ga_left <= nbyte - (16'd64 - {10'd0, skip});
-                            else begin
-                                ga_left   <= 16'd0;
-                                last_beat = 1'b1;
+                                ga_f_tend[0] <= 1'b0;
+                            end else begin
+                                ga_left      <= 16'd0;
+                                last_beat    = 1'b1;
+                                ga_f_tend[0] <= tend;
                             end
                         end
+                        tap_done = tend;
                     end
                     if (last_beat) begin
-                        if (ga_fw + 16'd1 >= {8'd0, cfg_kernel_w}) begin
-                            ga_fw <= 16'd0;
-                            if (ga_fh + 16'd1 >= {8'd0, cfg_kernel_h})
-                                ga_fh <= 16'd0;
-                            else
-                                ga_fh <= ga_fh + 16'd1;
-                        end else
-                            ga_fw <= ga_fw + 16'd1;
-                        if (row_dw)
-                            ga_t <= ga_t + 16'd1;
-                        else if (ga_t + 16'd1 >= ga_tpc) begin
-                            ga_t <= 16'd0;
-                            // Next pixel restarts at the chunk's first tap.
-                            ga_fh <= ga_fh0;
-                            ga_fw <= ga_fw0;
-                            if (ga_p + 5'd1 >= row_pv)
-                                ga_busy <= 1'b0;
-                            else
-                                ga_p <= ga_p + 5'd1;
-                        end else
-                            ga_t <= ga_t + 16'd1;
+                        if (row_dw && !tap_done)
+                            ga_p <= ga_p + step;
+                        else begin
+                            if (row_dw)
+                                ga_p <= 5'd0;
+                            if (ga_fw + 16'd1 >= {8'd0, cfg_kernel_w}) begin
+                                ga_fw <= 16'd0;
+                                if (ga_fh + 16'd1 >= {8'd0, cfg_kernel_h})
+                                    ga_fh <= 16'd0;
+                                else
+                                    ga_fh <= ga_fh + 16'd1;
+                            end else
+                                ga_fw <= ga_fw + 16'd1;
+                            if (row_dw)
+                                ga_t <= ga_t + 16'd1;
+                            else if (ga_t + 16'd1 >= ga_tpc) begin
+                                ga_t <= 16'd0;
+                                // Next pixel restarts at the chunk's first tap.
+                                ga_fh <= ga_fh0;
+                                ga_fw <= ga_fw0;
+                                if (ga_p + 5'd1 >= row_pv)
+                                    ga_busy <= 1'b0;
+                                else
+                                    ga_p <= ga_p + 5'd1;
+                            end else
+                                ga_t <= ga_t + 16'd1;
+                        end
                     end
                 end else
                     act_rd_en <= 1'b0;
@@ -1472,12 +1562,13 @@ module npu_compute #(
                 reg [31:0] dbase, dst;
                 reg signed [DATA_W-1:0] zpv;
                 reg        done;
-                nelt = row_dw ? {9'd0, row_nch} : cfg_in_c;
+                nelt = row_dw ? {9'd0, ga_f_nelt[1]} : cfg_in_c;
                 zpv  = cfg_int16 ? cfg_in_zp : {{8{cfg_in_zp[7]}}, cfg_in_zp[7:0]};
                 // DW lands in a four-deep tap ring; conv lands in bank
-                // (ga_bank, gs_p) at the tap's im2col offset.
+                // (ga_bank, gs_p) at the tap's im2col offset. A packed group
+                // writes its pixels contiguously from ga_f_base.
                 dbase = row_dw
-                      ? {24'd0, gs_t[1:0], 6'd0}
+                      ? ({24'd0, gs_t[1:0], 6'd0} + {25'd0, ga_f_base[1]})
                       : ((({31'd0, ga_bank} << row_pix_sh) + {27'd0, gs_p}) << row_bank_sh)
                         + {16'd0, gs_t} * {16'd0, cfg_in_c};
                 done = 1'b0;
@@ -1518,9 +1609,10 @@ module npu_compute #(
                 if (done) begin
                     gs_e    <= 16'd0;
                     gs_left <= 16'd0;
-                    if (row_dw)
-                        gs_t <= gs_t + 16'd1;
-                    else if (gs_t + 16'd1 >= ga_tpc) begin
+                    if (row_dw) begin
+                        if (ga_f_tend[1])
+                            gs_t <= gs_t + 16'd1;
+                    end else if (gs_t + 16'd1 >= ga_tpc) begin
                         gs_t <= 16'd0;
                         gs_p <= gs_p + 5'd1;
                     end else
@@ -1622,11 +1714,22 @@ module npu_compute #(
                     // Hoist tile-input origin for Resize (avoid 4x redundant division)
                     if (cfg_op_type == 8'd5) begin
                         begin : rsz_tile_origin_blk
-                            reg [71:0] prod_th, prod_tw;
-                            prod_th = (tile_y * cfg_tile_h) * cfg_in_h * recip_out_h;
-                            prod_tw = (tile_x * cfg_tile_w) * cfg_in_w * recip_out_w;
-                            rsz_tile_ih_origin <= prod_th[71:40];
-                            rsz_tile_iw_origin <= prod_tw[71:40];
+                            reg [31:0] out_start_h, out_start_w;
+                            out_start_h = tile_y * cfg_tile_h;
+                            out_start_w = tile_x * cfg_tile_w;
+                            if (resize_mode) begin
+                                rsz_tile_ih_origin <= (cfg_out_h > 1)
+                                    ? (out_start_h * (cfg_in_h - 1)) / (cfg_out_h - 1)
+                                    : 0;
+                                rsz_tile_iw_origin <= (cfg_out_w > 1)
+                                    ? (out_start_w * (cfg_in_w - 1)) / (cfg_out_w - 1)
+                                    : 0;
+                            end else begin
+                                rsz_tile_ih_origin <= (cfg_out_h != 0)
+                                    ? (out_start_h * cfg_in_h) / cfg_out_h : 0;
+                                rsz_tile_iw_origin <= (cfg_out_w != 0)
+                                    ? (out_start_w * cfg_in_w) / cfg_out_w : 0;
+                            end
                         end
                     end
                 end
@@ -1702,9 +1805,15 @@ module npu_compute #(
             // ══════════════════════════════════════════════════════════════
             S_OC_SETUP: begin
                 // Weight base: 0 if per-oc reload, else offset into full weight SRAM
-                if (cfg_wgt_per_oc != 0)
-                    wgt_base <= 0;  // per-oc: weights reloaded to SRAM[0]
-                else if (cfg_int16)
+                if (cfg_wgt_per_oc != 0) begin
+                    // Upper half of a 16-channel block already resident.
+                    if (mesh_half && oc_group[0])
+                        wgt_base <= cfg_int16
+                            ? ((ARRAY_SIZE_16 * k_depth) >> 1)
+                            : ((ARRAY_SIZE_16 * k_depth) >> 2);
+                    else
+                        wgt_base <= 0;
+                end else if (cfg_int16)
                     wgt_base <= (oc_group * ARRAY_SIZE_16 * k_depth) >> 1;
                 else
                     wgt_base <= (oc_group * ARRAY_SIZE_16 * k_depth) >> 2;
@@ -1723,9 +1832,14 @@ module npu_compute #(
                 // AND out_c exceeds the param SRAM capacity of SPAD_KB*16/4
                 // channels), the controller reloads this oc_group's params to
                 // param SRAM[0], so param_base must be 0 (not oc_group*64).
-                if (cfg_wgt_per_oc != 0 && ({17'd0, cfg_out_c} * 4 > (`SPAD_KB * 16)))
-                    param_base <= 16'd0;  // per-oc param reload → params at SRAM[0]
-                else
+                if (cfg_wgt_per_oc != 0 && ({17'd0, cfg_out_c} * 4 > `PARAM_DEPTH_W)) begin
+                    // Param DMA is one 16-channel block. The odd mesh group
+                    // is the upper 8 channels of that block, 4 words each.
+                    if (mesh_half && oc_group[0])
+                        param_base <= {11'd0, grp_oc} * 16'd4;
+                    else
+                        param_base <= 16'd0;
+                end else
                     // 4 words per channel; grp_oc channels per group (8 in grp8 mode)
                     param_base <= oc_group * {11'd0, grp_oc} * 16'd4;
 
@@ -1735,6 +1849,11 @@ module npu_compute #(
                 k_first <= 16'd0;
                 k_fin_cnt <= 16'd0;
                 wgt_held <= 1'b0;
+                // Previous group's shadow is still tagged pass 0. A hit
+                // here would skip the SRAM that the reload just filled.
+                wgt_sh_ok    <= 1'b0;
+                wgt_nxt_done <= 1'b0;
+                wgt_nxt_col  <= 0;
 
                 // Last valid drain column for this oc_group
                 begin : col_last_blk
@@ -1796,15 +1915,19 @@ module npu_compute #(
                         row_klen <= klen;
                         row_ntap <= ntap;
                         // Pack P = 64/G output pixels into the lanes when the
-                        // group is narrower than the row, bounded by what one
-                        // abuf bank can hold. Depthwise stays at P=1: its P
-                        // pixels need P separate gathers, so packing would
-                        // only move the bottleneck to the activation port.
+                        // group is narrower than the row. Conv is bounded by
+                        // what one abuf bank can hold. Depthwise packs only
+                        // when stride is 1 and this group is the whole channel
+                        // axis: one tap of those pixels is then a single
+                        // contiguous NHWC read, and the outputs are one run.
                         psh = 3'd0;
-                        if (cfg_op_type != 8'd1) begin
+                        if (cfg_op_type != 8'd1
+                                || (cfg_stride_w == 8'd1 && rem_oc == cfg_out_c
+                                    && cfg_in_c == cfg_out_c)) begin
                             for (ps = 1; ps <= ROW_PSH_MAX; ps = ps + 1)
                                 if ((({9'd0, nch} << ps) <= ROW_N)
-                                        && (({16'd0, cfg_in_c} << (ps + 1)) <= ABUF_WORDS))
+                                        && (cfg_op_type == 8'd1
+                                            || (({16'd0, cfg_in_c} << (ps + 1)) <= ABUF_WORDS)))
                                     psh = ps[2:0];
                         end
                         row_pix_sh  <= psh;
@@ -1941,9 +2064,16 @@ module npu_compute #(
             // Start a new group of P output pixels.
             S_ROW_GRP: begin : row_grp
                 reg [4:0]  pv;
-                reg [15:0] t_oh, t_ow;
+                reg [15:0] t_oh, t_ow, room;
                 integer q;
                 pv = (px_remaining >= {11'd0, row_pix}) ? row_pix : px_remaining[4:0];
+                // Packed depthwise pixels have to stay on one row, so the
+                // group shrinks at the right edge instead of wrapping.
+                if (row_dw) begin
+                    room = out_tile_w - sp_ow;
+                    if (room < {11'd0, pv})
+                        pv = room[4:0];
+                end
                 row_pv <= pv;
                 grp_oh <= sp_oh;
                 grp_ow <= sp_ow;
@@ -1960,8 +2090,8 @@ module npu_compute #(
                             t_ow = t_ow + 16'd1;
                     end
                 end
-                // Depthwise runs one pixel at a time and advances sp itself
-                // in S_ROW_PUSH.
+                // Depthwise advances sp itself in S_ROW_PUSH, by the whole
+                // packed group, and comes back here for the next one.
                 if (!row_dw) begin
                     sp_oh <= t_oh;
                     sp_ow <= t_ow;
@@ -1992,6 +2122,8 @@ module npu_compute #(
                     gs_e  <= 16'd0;
                     gs_left <= 16'd0;
                     ga_f_vld <= 2'd0;
+                    ga_p  <= 5'd0;
+                    ga_left <= 16'd0;
                     ga_on <= 1'b1;
                     state <= S_ROW_MAC;
                     mac_kend <= row_klen;
@@ -2029,20 +2161,25 @@ module npu_compute #(
                         reg [6:0] nz;
                         reg signed [31:0] prod;
                         reg [31:0] wslot, aslot;
+                        // Lane l = p * G + c. Every packed pixel of channel c
+                        // reuses that channel's tap weight.
                         nz = 7'd0;
                         c  = 7'd0;
                         for (l = 0; l < ROW_N; l = l + 1) begin
-                            if (l < {25'd0, row_nch}) begin
-                                aslot = ({30'd0, row_ki[1:0]} << 6) + {25'd0, c};
+                            if (l < ({7'd0, row_pv} * {9'd0, row_nch})) begin
+                                aslot = ({30'd0, row_ki[1:0]} << 6) + l[31:0];
                                 wslot = ({16'd0, row_ki[5:0]} * ROW_N) + {25'd0, c};
                                 if (avec[aslot[7:0]] != 0)
                                     nz = nz + 7'd1;
                                 prod = avec[aslot[7:0]] * wrow[wslot[12:0]];
                                 if (row_ki == 16'd0)
-                                    racc[c] <= prod;
+                                    racc[l] <= prod;
                                 else
-                                    racc[c] <= racc[c] + prod;
-                                c = c + 7'd1;
+                                    racc[l] <= racc[l] + prod;
+                                if (c + 7'd1 >= row_nch)
+                                    c = 7'd0;
+                                else
+                                    c = c + 7'd1;
                             end
                         end
                         mac1d_fire  <= 1'b1;
@@ -2140,22 +2277,29 @@ module npu_compute #(
                     ppu_ow  <= row_dw ? sp_ow : grp_ow;
                     ppu_nlane <= {4'd0, row_pv} * {2'd0, row_nch};
                     if (row_dw) begin
-                        if (px_remaining > 16'd1) begin
-                            if (sp_ow + 16'd1 >= out_tile_w) begin
+                        if (px_remaining > {11'd0, row_pv}) begin
+                            if (sp_ow + {11'd0, row_pv} >= out_tile_w) begin
                                 sp_ow <= 16'd0;
                                 sp_oh <= sp_oh + 16'd1;
                             end else
-                                sp_ow <= sp_ow + 16'd1;
-                            px_remaining <= px_remaining - 16'd1;
-                            row_ki   <= 16'd0;
-                            ga_t     <= 16'd0;
-                            gs_t     <= 16'd0;
-                            ga_fh    <= 16'd0;
-                            ga_fw    <= 16'd0;
-                            gs_e     <= 16'd0;
-                            gs_left  <= 16'd0;
-                            ga_f_vld <= 2'd0;
-                            state    <= S_ROW_MAC;
+                                sp_ow <= sp_ow + {11'd0, row_pv};
+                            px_remaining <= px_remaining - {11'd0, row_pv};
+                            if (row_pix == 5'd1) begin
+                                // Nothing about the group changes, so stay in
+                                // the MAC instead of paying a setup cycle.
+                                row_ki   <= 16'd0;
+                                ga_t     <= 16'd0;
+                                gs_t     <= 16'd0;
+                                ga_p     <= 5'd0;
+                                ga_left  <= 16'd0;
+                                ga_fh    <= 16'd0;
+                                ga_fw    <= 16'd0;
+                                gs_e     <= 16'd0;
+                                gs_left  <= 16'd0;
+                                ga_f_vld <= 2'd0;
+                                state    <= S_ROW_MAC;
+                            end else
+                                state <= S_ROW_GRP;
                         end else begin
                             ga_on    <= 1'b0;
                             row_last <= 1'b1;
@@ -2225,7 +2369,7 @@ module npu_compute #(
                 if (!wgt_read_issued) begin
                     // Phase 0: Issue SRAM read
                     wgt_rd_en   <= 1'b1;
-                    wgt_rd_addr <= wgt_word_addr[WGT_ADDR_W-1:0];
+                    wgt_rd_addr <= wgt_word_addr;
                     wgt_read_issued <= 1'b1;
                     wgt_data_ready  <= 1'b0;
                 end else if (!wgt_data_ready) begin
@@ -2533,7 +2677,6 @@ module npu_compute #(
                     if (remain_k  < npack) npack = remain_k;
                     if (remain_ch < npack) npack = remain_ch;
                     if (npack > ARRAY_SIZE) npack = ARRAY_SIZE;
-
                     for (ei = 0; ei < ARRAY_SIZE; ei = ei + 1) begin
                         if (ei < npack)
                             sa_act_data[act_cnt + ei[15:0]] <= lanes[ei];
@@ -2890,6 +3033,19 @@ module npu_compute #(
                             reg [15:0] nxt;
                             nxt = wgt_pass_after(k_pass, k_first, k_fin_cnt,
                                                  k_pass_max);
+                            // A full block hides the next-pass prefetch behind
+                            // the pixels. A short tail can reach this drain
+                            // first. Stay here — prefetch and the PE park both
+                            // run in PSUM_COLLECT — and swap on the same path
+                            // the long block uses. Falling through to WGT_LOAD
+                            // installs whatever columns the shadow has so far.
+                            if ((cfg_op_type == 8'd0 || cfg_op_type == 8'd2)
+                                    && !(wgt_nxt_done && (wgt_sh_pass == nxt))
+                                    && !(wgt_held && (nxt == wgt_held_pass))
+                                    && ((wgt_sh_ok && (wgt_sh_pass == nxt))
+                                        || !wgt_sh_ok)) begin
+                                // park / prefetch still catching up
+                            end else begin
                             k_pass <= nxt;
                             k_fin_cnt <= k_fin_cnt + 16'd1;
                             wgt_col_idx <= 0;
@@ -2915,8 +3071,13 @@ module npu_compute #(
                                     ? (k_depth - nxt * ARRAY_SIZE_16)
                                     : ARRAY_SIZE_16;
                                 state <= S_SPATIAL_SETUP;
-                            end else
+                            end else begin
+                                // Shadow is for a different pass. Drop it so
+                                // a later swap cannot commit those columns.
+                                wgt_sh_ok <= 1'b0;
                                 state <= S_WGT_CMD;
+                            end
+                            end
                         end
                     end
                 end
@@ -3336,8 +3497,14 @@ module npu_compute #(
                     end else begin
                         // Conv2D/FC: request weight reload if per-oc enabled
                         if (cfg_wgt_per_oc != 0) begin
-                            oc_group_done <= 1'b1;
-                            state <= S_WAIT_WGT_RELOAD;
+                            // Even group just finished: its pair is the
+                            // upper 8 channels of the block already loaded.
+                            if (mesh_half && !oc_group[0])
+                                state <= S_OC_SETUP;
+                            else begin
+                                oc_group_done <= 1'b1;
+                                state <= S_WAIT_WGT_RELOAD;
+                            end
                         end else begin
                             // All weights fit in SRAM, go directly
                             state <= S_OC_SETUP;
@@ -3425,8 +3592,12 @@ module npu_compute #(
             end
 
             // ══════════════════════════════════════════════════════════════
-            // DW Conv Path — Full Implementation
-            // Flow: WGT_LOAD → PARAM → COMPUTE → (ACT_STREAM → PPU_WAIT)* → PPU → OC_NEXT
+            // OC-major / stream DW. K-major depthwise uses the 64-lane row
+            // (S_ROW_*); this engine is ARRAY_SIZE npu_dw_conv lanes.
+            // Flow: WGT_LOAD → PARAM → COMPUTE → (ACT_STREAM → PPU_WAIT)* → OC_NEXT
+            // ACT_STREAM issues one tap per cycle. The wide port returns two
+            // cycles later and already holds the whole channel group, so the
+            // group is stored as one masked beat instead of a per-channel RMW.
             // ══════════════════════════════════════════════════════════════
             S_DW_WGT_LOAD: begin
                 // Load kh*kw weights for channel oc_group from Weight SRAM
@@ -3461,7 +3632,7 @@ module npu_compute #(
                     // Phase 1: send acc_clear, issue first SRAM read
                     dw_acc_clear <= 1'b1;
                     wgt_rd_en   <= 1'b1;
-                    wgt_rd_addr <= wgt_word_addr[WGT_ADDR_W-1:0];
+                    wgt_rd_addr <= wgt_word_addr;
                     dw_read_issued <= 1'b0;
                     dw_init_phase <= 2'd2;
                 end
@@ -3523,7 +3694,7 @@ module npu_compute #(
                                 if (({dw_cnt[0], 1'b0} + dw_wgt_bsel_base) >= 2'd2) begin
                                     wgt_word_addr <= wgt_word_addr + 1;
                                     wgt_rd_en    <= 1'b1;
-                                    wgt_rd_addr  <= wgt_word_addr[WGT_ADDR_W-1:0] + 1;
+                                    wgt_rd_addr  <= wgt_word_addr + 1'b1;
                                     dw_read_issued <= 1'b0;
                                 end
                             end else begin
@@ -3531,7 +3702,7 @@ module npu_compute #(
                                 if ((dw_cnt[1:0] + dw_wgt_bsel_base) == 2'd3) begin
                                     wgt_word_addr <= wgt_word_addr + 1;
                                     wgt_rd_en    <= 1'b1;
-                                    wgt_rd_addr  <= wgt_word_addr[WGT_ADDR_W-1:0] + 1;
+                                    wgt_rd_addr  <= wgt_word_addr + 1'b1;
                                     dw_read_issued <= 1'b0;
                                 end
                             end
@@ -3587,69 +3758,100 @@ module npu_compute #(
                 dw_fh <= 0;
                 dw_fw <= 0;
                 dw_read_issued <= 1'b0;
+                dw_kdone <= 1'b0;
+                dw_iss_vld <= 1'b0;
+                dw_ret_vld <= 1'b0;
                 state <= S_DW_ACT_STREAM;
             end
 
             S_DW_ACT_STREAM: begin
-                // Stream window elements for pixel (dw_oh, dw_ow)
+                // One kernel tap per cycle once the pipe is full. dw_fh/dw_fw
+                // is the next tap to issue; dw_ret_* is the tap whose SRAM
+                // beat is valid this cycle.
                 begin : dw_act_stream_blk
                     reg signed [15:0] ih_s, iw_s;
-                    reg               is_pad;
-                    ih_s = $signed({1'b0, tile_oh_origin + dw_oh}) * $signed({1'b0, cfg_stride_h[7:0]})
-                         - $signed({1'b0, cfg_pad_top[7:0]}) + $signed({1'b0, dw_fh});
-                    iw_s = $signed({1'b0, tile_ow_origin + dw_ow}) * $signed({1'b0, cfg_stride_w[7:0]})
-                         - $signed({1'b0, cfg_pad_left[7:0]}) + $signed({1'b0, dw_fw});
-                    is_pad = (ih_s < 0) || (ih_s >= $signed({1'b0, cfg_in_h}))
-                          || (iw_s < 0) || (iw_s >= $signed({1'b0, cfg_in_w}));
+                    reg               is_pad, is_last, is_first, consumed_last;
+                    reg [1:0]         bsel;
+                    reg signed [DATA_W-1:0] zp;
+                    integer ci;
+                    reg [SRAM_B_W-1:0] sh;
+                    reg [ACT_ADDR_W+15:0] elem_off, byte_off;
 
-                    if (is_pad) begin
-                        // Padding: feed zero to all live lanes
+                    zp = cfg_int16 ? cfg_in_zp
+                                   : {{8{cfg_in_zp[7]}}, cfg_in_zp[7:0]};
+                    consumed_last = 1'b0;
+                    if (dw_ret_vld) begin
+                        sh = act_rd_data >> (dw_ret_bsel * 8);
                         dw_in_valid <= 1'b1;
-                        dw_in_data  <= {DATA_W{1'b0}};
-                        dw_in_valid_w <= {ARRAY_SIZE{1'b0}};
-                        dw_in_data_w  <= {DATA_W*ARRAY_SIZE{1'b0}};
-                        begin : dw_pad_wide
-                            integer ci;
-                            for (ci = 0; ci < ARRAY_SIZE; ci = ci + 1)
-                                if (ci[4:0] < dw_nch)
-                                    dw_in_valid_w[ci] <= 1'b1;
+                        dw_in_data  <= cfg_int16 ? $signed(sh[15:0])
+                                                : {{8{sh[7]}}, sh[7:0]};
+                        for (ci = 0; ci < ARRAY_SIZE; ci = ci + 1) begin
+                            if (ci[4:0] < dw_nch) begin
+                                if (cfg_int16)
+                                    dw_in_data_w[DATA_W*ci +: DATA_W]
+                                        <= $signed(sh[16*ci +: 16]);
+                                else
+                                    dw_in_data_w[DATA_W*ci +: DATA_W]
+                                        <= {{8{sh[8*ci+7]}}, sh[8*ci +: 8]};
+                                dw_in_valid_w[ci] <= 1'b1;
+                            end
                         end
-                        if (dw_fh == 0 && dw_fw == 0)
+                        if (dw_ret_clr)
                             dw_acc_clear <= 1'b1;
+                        if (dw_ret_last)
+                            consumed_last = 1'b1;
+                    end
 
-                        // Advance filter position
-                        if (dw_fw + 1 >= cfg_kernel_w[3:0]) begin
-                            dw_fw <= 0;
-                            if (dw_fh + 1 >= cfg_kernel_h[3:0]) begin
+                    dw_ret_vld  <= dw_iss_vld;
+                    dw_ret_bsel <= dw_iss_bsel;
+                    dw_ret_last <= dw_iss_last;
+                    dw_ret_clr  <= dw_iss_clr;
+                    dw_iss_vld  <= 1'b0;
+
+                    if (consumed_last) begin
+                        state <= S_DW_PPU_WAIT;
+                        ppu_wait_cnt <= 0;
+                    end else if (!dw_kdone) begin
+                        ih_s = $signed({1'b0, tile_oh_origin + dw_oh}) * $signed({1'b0, cfg_stride_h[7:0]})
+                             - $signed({1'b0, cfg_pad_top[7:0]}) + $signed({1'b0, dw_fh});
+                        iw_s = $signed({1'b0, tile_ow_origin + dw_ow}) * $signed({1'b0, cfg_stride_w[7:0]})
+                             - $signed({1'b0, cfg_pad_left[7:0]}) + $signed({1'b0, dw_fw});
+                        is_pad = (ih_s < 0) || (ih_s >= $signed({1'b0, cfg_in_h}))
+                              || (iw_s < 0) || (iw_s >= $signed({1'b0, cfg_in_w}));
+                        is_last = (dw_fw + 4'd1 >= cfg_kernel_w[3:0])
+                               && (dw_fh + 4'd1 >= cfg_kernel_h[3:0]);
+                        is_first = (dw_fh == 4'd0) && (dw_fw == 4'd0);
+                        // A pad has to follow the reads already in the pipe,
+                        // and the MAC accepts one tap per cycle.
+                        if (is_pad && !dw_ret_vld && !dw_iss_vld) begin
+                            dw_in_valid <= 1'b1;
+                            dw_in_data  <= zp;
+                            for (ci = 0; ci < ARRAY_SIZE; ci = ci + 1) begin
+                                if (ci[4:0] < dw_nch) begin
+                                    dw_in_valid_w[ci] <= 1'b1;
+                                    dw_in_data_w[DATA_W*ci +: DATA_W] <= zp;
+                                end
+                            end
+                            if (is_first)
+                                dw_acc_clear <= 1'b1;
+                            if (is_last) begin
+                                dw_kdone <= 1'b1;
                                 state <= S_DW_PPU_WAIT;
                                 ppu_wait_cnt <= 0;
-                            end else begin
-                                dw_fh <= dw_fh + 1;
-                            end
-                        end else begin
-                            dw_fw <= dw_fw + 1;
-                        end
-                        dw_read_issued <= 1'b0;
-                    end else if (!dw_read_issued) begin
-                        // In-bounds: issue SRAM read
-                        begin : dw_addr_calc
-                            reg [ACT_ADDR_W+15:0] elem_off;
-                            reg [ACT_ADDR_W+15:0] byte_off;
+                            end else if (dw_fw + 4'd1 >= cfg_kernel_w[3:0]) begin
+                                dw_fw <= 4'd0;
+                                dw_fh <= dw_fh + 4'd1;
+                            end else
+                                dw_fw <= dw_fw + 4'd1;
+                        end else if (!is_pad) begin
                             if (dw_stream) begin
-                                // Stream mode: resident slice is packed
-                                // [pos][ch_local], ARRAY_SIZE channels per
-                                // spatial position (ch_local = oc_group - base)
                                 elem_off = (ih_s[15:0] * cfg_in_w + iw_s[15:0])
                                          * ARRAY_SIZE + (dw_ch_base - dw_grp_base);
                             end else if (cfg_tile_h == 17'd0) begin
-                                // Non-tiled: full image address
                                 elem_off = (ih_s[15:0] * cfg_in_w * cfg_in_c)
                                          + (iw_s[15:0] * cfg_in_c)
                                          + dw_ch_base;
                             end else begin
-                                // Tiled: tile-local address (dw_oh/dw_ow are tile-local
-                                // output coords; input row = dw_oh*stride + dw_fh,
-                                // input col = dw_ow*stride + dw_fw, both within tile_in_h/w)
                                 begin : dw_addr_2d_blk
                                     reg [17:0] row_rel, col_rel;
                                     row_rel = {2'd0, dw_oh} * {10'd0, cfg_stride_h} + {14'd0, dw_fh};
@@ -3659,63 +3861,25 @@ module npu_compute #(
                                 end
                             end
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                            bsel = byte_off[1:0];
                             act_rd_en   <= 1'b1;
                             act_rd_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
-                            act_byte_sel <= byte_off[1:0];
-                        end
-                        dw_read_issued <= 1'b1;
-                        act_read_issued <= 1'b0;
-                        if (dw_fh == 0 && dw_fw == 0)
-                            dw_acc_clear <= 1'b1;
-                    end else if (!act_read_issued) begin
-                        act_read_issued <= 1'b1;
-                    end else begin
-                        // SRAM data available — extract element and feed
-                        if (cfg_int16) begin : dw_act_extract_int16
-                            case (act_byte_sel[1])
-                                1'b0: dw_in_data <= $signed(act_rd_data[15:0]);
-                                1'b1: dw_in_data <= $signed(act_rd_data[31:16]);
-                            endcase
-                        end else begin : dw_act_extract_int8
-                            case (act_byte_sel)
-                                2'd0: dw_in_data <= {{8{act_rd_data[7]}},  act_rd_data[7:0]};
-                                2'd1: dw_in_data <= {{8{act_rd_data[15]}}, act_rd_data[15:8]};
-                                2'd2: dw_in_data <= {{8{act_rd_data[23]}}, act_rd_data[23:16]};
-                                2'd3: dw_in_data <= {{8{act_rd_data[31]}}, act_rd_data[31:24]};
-                            endcase
-                        end
-                        dw_in_valid <= 1'b0;
-                        begin : dw_act_wide
-                            integer ci;
-                            reg [SRAM_B_W-1:0] sh;
-                            sh = act_rd_data >> (act_byte_sel * 8);
-                            for (ci = 0; ci < ARRAY_SIZE; ci = ci + 1) begin
-                                if (ci[4:0] < dw_nch) begin
-                                    if (cfg_int16)
-                                        dw_in_data_w[DATA_W*ci +: DATA_W]
-                                            <= $signed(sh[16*ci +: 16]);
-                                    else
-                                        dw_in_data_w[DATA_W*ci +: DATA_W]
-                                            <= {{8{sh[8*ci+7]}}, sh[8*ci +: 8]};
-                                    dw_in_valid_w[ci] <= 1'b1;
-                                end
-                            end
-                            dw_in_data <= cfg_int16 ? $signed(sh[15:0])
-                                                    : {{8{sh[7]}}, sh[7:0]};
-                        end
-                        dw_read_issued <= 1'b0;
-
-                        // Advance filter position
-                        if (dw_fw + 1 >= cfg_kernel_w[3:0]) begin
-                            dw_fw <= 0;
-                            if (dw_fh + 1 >= cfg_kernel_h[3:0]) begin
-                                state <= S_DW_PPU_WAIT;
-                                ppu_wait_cnt <= 0;
-                            end else begin
-                                dw_fh <= dw_fh + 1;
-                            end
-                        end else begin
-                            dw_fw <= dw_fw + 1;
+                            dw_iss_vld  <= 1'b1;
+                            dw_iss_bsel <= bsel;
+                            dw_iss_last <= is_last;
+                            dw_iss_clr  <= is_first;
+                            // No activation is fed on this cycle when the
+                            // pipe was empty, so the clear resets the MAC
+                            // index before the first product arrives.
+                            if (is_first && !dw_ret_vld)
+                                dw_acc_clear <= 1'b1;
+                            if (is_last)
+                                dw_kdone <= 1'b1;
+                            else if (dw_fw + 4'd1 >= cfg_kernel_w[3:0]) begin
+                                dw_fw <= 4'd0;
+                                dw_fh <= dw_fh + 4'd1;
+                            end else
+                                dw_fw <= dw_fw + 4'd1;
                         end
                     end
                 end
@@ -3741,24 +3905,56 @@ module npu_compute #(
                     end
                 end else begin
                     if (ppu_vout_w[0] || ppu_out_valid) begin
-                        for (i = 0; i < ARRAY_SIZE; i = i + 1)
-                            ppu_lat[i] <= ppu_out_w[DATA_W*i +: DATA_W];
-                        if (!ppu_vout_w[0])
-                            ppu_lat[0] <= ppu_out_data;
-                        dw_ch_idx <= 16'd0;
-                        // Compute NHWC address for this pixel/channel
-                        begin : dw_wb_addr_calc
-                            reg [31:0] elem_off;
-                            reg [31:0] byte_off;
+                        // The ARRAY_SIZE channels of this pixel are contiguous
+                        // in NHWC and fit in one 64-byte beat (8×INT16 = 16 B).
+                        begin : dw_wide_wb
+                            reg [31:0] elem_off, byte_off;
+                            reg [SRAM_B_W-1:0] wrwide;
+                            reg [63:0] wrmask;
+                            reg signed [DATA_W-1:0] oval;
+                            integer bi;
                             elem_off = (dw_oh * out_tile_w + dw_ow)
                                      * cfg_out_c + dw_ch_base;
                             byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
-                            dw_wb_addr    <= out_base + byte_off[ACT_ADDR_W+1:2];
-                            dw_wb_bytesel <= byte_off[1:0];
+                            wrwide = {SRAM_B_W{1'b0}};
+                            wrmask = 64'd0;
+                            for (bi = 0; bi < ARRAY_SIZE; bi = bi + 1) begin
+                                if (bi[4:0] < dw_nch) begin
+                                    if (bi == 0 && !ppu_vout_w[0])
+                                        oval = ppu_out_data;
+                                    else
+                                        oval = ppu_out_w[DATA_W*bi +: DATA_W];
+                                    if (cfg_int16) begin
+                                        wrwide[8*(byte_off[1:0] + 2*bi) +: 16] = oval;
+                                        wrmask[byte_off[1:0] + 2*bi +: 2] = 2'b11;
+                                    end else begin
+                                        wrwide[8*(byte_off[1:0] + bi) +: 8] = oval[7:0];
+                                        wrmask[byte_off[1:0] + bi] = 1'b1;
+                                    end
+                                end
+                            end
+                            act_wr_en   <= 1'b1;
+                            act_wr_addr <= out_base + byte_off[ACT_ADDR_W+1:2];
+                            act_wr_wide <= wrwide;
+                            act_wr_mask <= wrmask;
                         end
-                        dw_wb_byte  <= ppu_vout_w[0] ? ppu_out_w[DATA_W-1:0] : ppu_out_data;
-                        dw_wb_phase <= 2'd0;
-                        state <= S_DW_WB;
+                        dw_kdone   <= 1'b0;
+                        dw_iss_vld <= 1'b0;
+                        dw_ret_vld <= 1'b0;
+                        dw_fh <= 4'd0;
+                        dw_fw <= 4'd0;
+                        if (dw_ow + 16'd1 >= out_tile_w) begin
+                            dw_ow <= 16'd0;
+                            if (dw_oh + 16'd1 >= out_tile_h)
+                                state <= S_OC_NEXT;
+                            else begin
+                                dw_oh <= dw_oh + 16'd1;
+                                state <= S_DW_ACT_STREAM;
+                            end
+                        end else begin
+                            dw_ow <= dw_ow + 16'd1;
+                            state <= S_DW_ACT_STREAM;
+                        end
                     end else begin
                         ppu_wait_cnt <= ppu_wait_cnt + 1;
                     end
@@ -3766,6 +3962,8 @@ module npu_compute #(
             end
 
             S_DW_WB: begin
+                // No longer entered. S_DW_PPU_WAIT writes the whole group
+                // with one masked beat. Kept so a stray state still finishes.
                 // Read-modify-write: place output element at correct NHWC position
                 act_rd_ofm <= 1'b1;
                 case (dw_wb_phase)
@@ -4940,13 +5138,32 @@ module npu_compute #(
                 end else begin
                     begin : wgt_pf_unpack
                         integer ei;
+                        reg [31:0] elem_off, byte_off;
+                        reg [SRAM_B_W-1:0] shifted;
+                        reg [15:0] pf_remain;
+                        // Same byte lane as S_WGT_LOAD. The address is word-
+                        // aligned, so an odd k_depth (bsel=2) must shift off
+                        // the previous channel's last INT16. Pixel 0's live
+                        // taps sit in later k-passes, which only travel
+                        // through this shadow.
+                        elem_off = {11'd0, wgt_pf_col} * k_depth
+                                 + wgt_pf_tgt * ARRAY_SIZE_16;
+                        byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
+                        shifted = wgt_rd_data >> (byte_off[1:0] * 8);
+                        pf_remain = (wgt_pf_tgt == k_pass_max)
+                            ? (k_depth - wgt_pf_tgt * ARRAY_SIZE_16)
+                            : ARRAY_SIZE_16;
                         for (ei = 0; ei < ARRAY_SIZE; ei = ei + 1) begin
-                            if (cfg_int16)
-                                wgt_sh[{wgt_pf_col[COL_W-1:0], ei[COL_W-1:0]}]
-                                    <= $signed(wgt_rd_data[16*ei +: 16]);
-                            else
-                                wgt_sh[{wgt_pf_col[COL_W-1:0], ei[COL_W-1:0]}]
-                                    <= {{8{wgt_rd_data[8*ei+7]}}, wgt_rd_data[8*ei +: 8]};
+                            if (ei < pf_remain) begin
+                                if (cfg_int16)
+                                    wgt_sh[{wgt_pf_col[COL_W-1:0], ei[COL_W-1:0]}]
+                                        <= $signed(shifted[16*ei +: 16]);
+                                else
+                                    wgt_sh[{wgt_pf_col[COL_W-1:0], ei[COL_W-1:0]}]
+                                        <= {{8{shifted[8*ei+7]}}, shifted[8*ei +: 8]};
+                            end else begin
+                                wgt_sh[{wgt_pf_col[COL_W-1:0], ei[COL_W-1:0]}] <= 0;
+                            end
                         end
                     end
                     if (wgt_pf_col >= {1'b0, COL_MAX}) begin
@@ -4985,6 +5202,7 @@ module npu_compute #(
                 reg [8:0] nbytes, nlane;
                 reg [31:0] elem, bbase;
                 reg [511:0] wide;
+                reg [1023:0] bytes;
                 reg signed [DATA_W-1:0] lane;
                 reg [7:0] nb;
                 // Packed pixels are consecutive in raster order and packing
@@ -4998,28 +5216,42 @@ module npu_compute #(
                 if (bbase[1:0] == 2'b00 && nbytes[1:0] == 2'b00
                         && nbytes != 0 && nbytes <= 9'd64) begin
                     wide = 512'd0;
-                    for (c = 0; c < ROW_N; c = c + 1) begin
-                        if (c < nlane) begin
-                            if (ppu_vout_w[c])
-                                lane = ppu_out_w[DATA_W*c +: DATA_W];
-                            else if (c == 0 && ppu_out_valid)
-                                lane = ppu_out_data;
-                            else
-                                lane = {DATA_W{1'b0}};
-                            if (cfg_int16)
+                    if (cfg_int16) begin
+                        // A 512-bit beat holds at most 32 INT16 lanes.  Keep
+                        // the static part-selects in range as well as gating
+                        // them with the runtime lane count.
+                        for (c = 0; c < 32; c = c + 1) begin
+                            if (c < nlane) begin
+                                if (ppu_vout_w[c])
+                                    lane = ppu_out_w[DATA_W*c +: DATA_W];
+                                else if (c == 0 && ppu_out_valid)
+                                    lane = ppu_out_data;
+                                else
+                                    lane = {DATA_W{1'b0}};
                                 wide[16*c +: 16] = lane;
-                            else
+                            end
+                        end
+                    end else begin
+                        for (c = 0; c < ROW_N; c = c + 1) begin
+                            if (c < nlane) begin
+                                if (ppu_vout_w[c])
+                                    lane = ppu_out_w[DATA_W*c +: DATA_W];
+                                else if (c == 0 && ppu_out_valid)
+                                    lane = ppu_out_data;
+                                else
+                                    lane = {DATA_W{1'b0}};
                                 wide[8*c +: 8] = lane[7:0];
+                            end
                         end
                     end
                     act_wr_en   <= 1'b1;
                     act_wr_addr <= out_base + bbase[ACT_ADDR_W+1:2];
                     act_wr_wide <= wide;
                     act_wr_data <= wide[31:0];
-                    if (nbytes[8:2] >= 7'd16)
-                        act_wr_mask <= 16'hFFFF;
+                    if (nbytes >= 9'd64)
+                        act_wr_mask <= 64'hFFFF_FFFF_FFFF_FFFF;
                     else
-                        act_wr_mask <= (16'h1 << nbytes[8:2]) - 16'h1;
+                        act_wr_mask <= (64'h1 << nbytes) - 64'h1;
                     // A later group may be narrow enough to need the byte
                     // packer, which continues the same NHWC byte stream.
                     pk      <= 32'd0;
@@ -5029,6 +5261,7 @@ module npu_compute #(
                     row_ppu <= 1'b0;
                 end else begin
                     nb = 8'd0;
+                    bytes = 1024'd0;
                     for (c = 0; c < ROW_N; c = c + 1) begin
                         if (c < nlane) begin
                             if (ppu_vout_w[c])
@@ -5038,15 +5271,15 @@ module npu_compute #(
                             else
                                 lane = {DATA_W{1'b0}};
                             if (cfg_int16) begin
-                                obytes[nb] <= lane[7:0];
-                                obytes[nb + 8'd1] <= lane[15:8];
+                                bytes[16*c +: 16] = lane;
                                 nb = nb + 8'd2;
                             end else begin
-                                obytes[nb] <= lane[7:0];
+                                bytes[8*c +: 8] = lane[7:0];
                                 nb = nb + 8'd1;
                             end
                         end
                     end
+                    obuf <= bytes;
                     ob_n <= nb;
                     ob_i <= 8'd0;
                     row_drain <= 1'b1;
@@ -5063,14 +5296,14 @@ module npu_compute #(
                 wrote = 1'b0;
                 for (t = 0; t < 4; t = t + 1) begin
                     if (!wrote && ii < ob_n) begin
-                        word[pos*8 +: 8] = obytes[ii];
+                        word[pos*8 +: 8] = obuf[8*ii +: 8];
                         ii = ii + 8'd1;
                         if (pos == 2'd3) begin
                             act_wr_en   <= 1'b1;
                             act_wr_addr <= pk_addr;
                             act_wr_data <= word;
                             act_wr_wide <= {480'd0, word};
-                            act_wr_mask <= 16'd1;
+                            act_wr_mask <= 64'hF;
                             wrote = 1'b1;
                             pos = 2'd0;
                             word = 32'd0;
@@ -5091,7 +5324,10 @@ module npu_compute #(
                         act_wr_addr <= pk_addr;
                         act_wr_data <= word;
                         act_wr_wide <= {480'd0, word};
-                        act_wr_mask <= 16'd1;
+                        // DMA stores this 32-bit word whole. Unused high
+                        // bytes are zero in `word`, so the full byte enable
+                        // clears stale data left by the previous layer.
+                        act_wr_mask <= 64'hF;
                         pk      <= 32'd0;
                         pk_pos  <= 2'd0;
                         pk_addr <= pk_addr + 1'b1;

@@ -21,6 +21,7 @@ async def reset_dut(dut):
     dut.ppu_bias_en.value = 1
     dut.ppu_zp_en.value = 1
     dut.cfg_int16.value = 0     # INT8 mode (default)
+    dut.cfg_in_zp.value = 0
     dut.db_prefetch_done.value = 1  # No DB_EN in unit tests — always ready
     for _ in range(5):
         await RisingEdge(dut.clk)
@@ -32,7 +33,7 @@ def set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1,
             stride_h=1, stride_w=1, pad_top=0, pad_left=0,
             tile_h=0, tile_w=0, tile_num_h=1, tile_num_w=1,
             in_h=1, in_w=1, op_type=0, act_base=0, out_base=0, wgt_layout=1,
-            int16=False):
+            int16=False, in_zp=0):
     """Set layer configuration."""
     dut.cfg_op_type.value = op_type
     dut.cfg_in_c.value = in_c
@@ -54,6 +55,7 @@ def set_cfg(dut, in_c=4, out_c=4, kh=1, kw=1, out_h=1, out_w=1,
     dut.cfg_act_base.value = act_base
     dut.cfg_out_base.value = out_base
     dut.cfg_wgt_layout.value = wgt_layout
+    dut.cfg_in_zp.value = in_zp
     dw = (op_type == 1)
     _wgt_commit(dut, out_c, kh * kw if dw else kh * kw * in_c, int16, dw,
                 wgt_layout)
@@ -920,6 +922,39 @@ async def test_dw_conv_3x3_with_padding(dut):
     # 9 output pixels. Center pixel (1,1) sums all 9 inputs = 45
     # Output byte offset for (1,1) ch0 = (1*3+1)*1 + 0 = 4 → word 1, byte 0
     # Note: output overwrites input SRAM in this test, so only verify completion.
+
+
+@cocotb.test()
+async def test_mesh_dw_padding_uses_input_zero_point(dut):
+    """OC-major mesh DW must pad with the quantized input zero-point."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+
+    # One real activation (7), eight padded taps (in_zp=5), all weights 1.
+    wgt_put(dut, 0, pack_i8x4(1, 1, 1, 1))
+    wgt_put(dut, 1, pack_i8x4(1, 1, 1, 1))
+    wgt_put(dut, 2, pack_i8x4(1, 0, 0, 0))
+    write_sram_word(dut, 'act', 0, pack_i8x4(7, 0, 0, 0))
+    for word in range(4):
+        write_sram_word(dut, 'param', word, 1 if word == 0 else 0)
+
+    dut.ppu_mode.value = 3
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+    set_cfg(
+        dut, op_type=1, in_c=1, out_c=1, kh=3, kw=3,
+        out_h=1, out_w=1, in_h=1, in_w=1,
+        stride_h=1, stride_w=1, pad_top=1, pad_left=1,
+        out_base=64, wgt_layout=0, in_zp=5,
+    )
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+    assert await wait_done(dut, timeout=5000), "Mesh DW padded run never completed"
+
+    out_byte = read_sram_word(dut, 'act', 64) & 0xFF
+    assert out_byte == 47, f"Expected 7 + 8*5 = 47, got {out_byte}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
