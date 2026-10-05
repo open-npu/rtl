@@ -81,26 +81,6 @@ async def test_conv_trace(dut):
             dut._log.info(f"cyc={cyc:3d} STATE → {name} ({state})")
             prev_state = state
 
-        # Log weight loads
-        if int(dut.u_compute.sa_wgt_valid.value) == 1:
-            col = int(dut.u_compute.wgt_col_idx.value)
-            try:
-                w0 = int(dut.u_compute.sa_wgt_data[0].value)
-                w1 = int(dut.u_compute.sa_wgt_data[1].value)
-                w2 = int(dut.u_compute.sa_wgt_data[2].value)
-                w3 = int(dut.u_compute.sa_wgt_data[3].value)
-                dut._log.info(f"  WGT_EMIT col={col}: [{w0},{w1},{w2},{w3}]")
-            except ValueError:
-                dut._log.info(f"  WGT_EMIT col={col}: [X values]")
-
-        # Log activation emits
-        if int(dut.u_compute.sa_act_valid.value) == 1:
-            try:
-                a0 = int(dut.u_compute.sa_act_data[0].value)
-                dut._log.info(f"  ACT_EMIT: act_data[0]={a0}")
-            except ValueError:
-                dut._log.info(f"  ACT_EMIT: act_data[0]=X")
-
         # Log act SRAM read
         try:
             act_rd_en_val = int(dut.u_compute.act_rd_en.value)

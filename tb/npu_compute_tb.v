@@ -74,18 +74,6 @@ module npu_compute_tb #(
     wire [PARAM_ADDR_W-1:0] param_rd_addr;
     wire [31:0]             param_rd_data;
 
-    // ─── Systolic wires ───
-    wire [1:0]                          sa_cmd;
-    wire                                sa_cmd_valid;
-    wire [DATA_W*ARRAY_SIZE-1:0]       sa_wgt_data_flat;
-    wire                                sa_wgt_valid;
-    wire                                sa_swap_wgt;
-    wire [DATA_W*ARRAY_SIZE-1:0]       sa_act_data_flat;
-    wire                                sa_act_valid;
-    wire [ACC_W*ARRAY_SIZE-1:0]        sa_psum_out_flat;
-    wire                                sa_psum_out_valid;
-    wire                                sa_busy, sa_ready;
-
     // ─── DW Conv wires ───
     wire                                dw_wgt_load, dw_wgt_valid, dw_in_valid, dw_acc_clear;
     wire signed [DATA_W-1:0]           dw_wgt_data, dw_in_data;
@@ -203,13 +191,7 @@ module npu_compute_tb #(
         .act_wr_en(act_wr_en), .act_wr_addr(act_wr_addr), .act_wr_data(act_wr_data),
         .act_wr_mask(act_wr_mask), .act_wr_wide(act_wr_wide),
         .param_rd_en(param_rd_en), .param_rd_addr(param_rd_addr), .param_rd_data(param_rd_data),
-        // Systolic
-        .sa_cmd(sa_cmd), .sa_cmd_valid(sa_cmd_valid),
-        .sa_wgt_data_flat(sa_wgt_data_flat), .sa_wgt_valid(sa_wgt_valid),
-        .sa_swap_wgt(sa_swap_wgt),
-        .sa_act_data_flat(sa_act_data_flat), .sa_act_valid(sa_act_valid),
-        .sa_psum_out_flat(sa_psum_out_flat), .sa_psum_out_valid(sa_psum_out_valid),
-        .sa_busy(sa_busy), .sa_ready(sa_ready),
+        .mac_fire(), .mac_lanes(),
         // DW Conv
         .dw_wgt_load(dw_wgt_load), .dw_wgt_valid(dw_wgt_valid),
         .dw_wgt_data(dw_wgt_data), .dw_in_valid(dw_in_valid),
@@ -227,23 +209,6 @@ module npu_compute_tb #(
         .ppu_bias_w(ppu_bias_w), .ppu_mult_w(ppu_mult_w),
         .ppu_shift_w(ppu_shift_w), .ppu_zp_w(ppu_zp_w),
         .ppu_out_w(ppu_out_w), .ppu_vout_w(ppu_vout_w)
-    );
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Systolic Array
-    // ═══════════════════════════════════════════════════════════════════
-
-    npu_systolic #(
-        .ROWS(ARRAY_SIZE), .COLS(ARRAY_SIZE),
-        .DATA_W(DATA_W), .ACC_W(ACC_W)
-    ) u_systolic (
-        .clk(clk), .rst_n(rst_n),
-        .cmd(sa_cmd), .cmd_valid(sa_cmd_valid),
-        .wgt_data_flat(sa_wgt_data_flat), .wgt_valid(sa_wgt_valid),
-        .swap_wgt(sa_swap_wgt),
-        .act_data_flat(sa_act_data_flat), .act_valid(sa_act_valid),
-        .psum_out_flat(sa_psum_out_flat), .psum_out_valid(sa_psum_out_valid),
-        .busy(sa_busy), .ready(sa_ready)
     );
 
     // ═══════════════════════════════════════════════════════════════════

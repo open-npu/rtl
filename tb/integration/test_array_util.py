@@ -67,19 +67,6 @@ def wr_param(dut, addr, data):
     dut.u_sram_param.mem[addr].value = data
 
 
-def mesh_conv_useful(dut):
-    flat = int(dut.sa_act_data_flat.value)
-    nz = 0
-    for i in range(MESH_N):
-        lane = (flat >> (16 * i)) & 0xFFFF
-        if lane & 0x8000:
-            lane -= 0x10000
-        if lane != 0:
-            nz += 1
-    cols = int(dut.u_compute.col_last.value) + 1
-    return nz * cols
-
-
 def mesh_dw_useful(dut):
     valid = int(dut.u_compute.dw_in_valid_w.value)
     if valid == 0:
@@ -143,8 +130,7 @@ async def run_layer(dut, op, in_h, in_w, in_c, out_h, out_w, out_c,
     dut.cfg_act_base.value = 0
     dut.cfg_out_base.value = 0
     # The layout bit is what routes a layer to the 64-lane row, so a
-    # FORCE_MESH build must also present OC-major descriptors.
-    dut.cfg_wgt_layout.value = 0 if os.environ.get("FORCE_MESH") else 1
+    dut.cfg_wgt_layout.value = 1
     await RisingEdge(dut.clk)
 
     dut.start.value = 1
@@ -159,8 +145,6 @@ async def run_layer(dut, op, in_h, in_w, in_c, out_h, out_w, out_c,
         cycles += 1
         if int(dut.u_compute.mac1d_fire.value) == 1:
             useful += int(dut.u_compute.mac1d_lanes.value)
-        if int(dut.u_compute.sa_act_valid.value) == 1:
-            useful += mesh_conv_useful(dut)
         if int(dut.u_compute.dw_in_valid_w.value) != 0:
             useful += mesh_dw_useful(dut)
         if dut.done.value == 1:

@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Usage:
-#   make                          — run unit test on npu_pe (default)
-#   make DUT=npu_pe               — explicit DUT selection (auto-finds module)
+#   make                          — run unit test on npu_ppu (default)
+#   make DUT=npu_ppu              — explicit DUT selection (auto-finds module)
 #   make DUT=npu_top MODULE=e2e.test_npu_dma_e2e  — explicit module path
 #   make SIM=icarus               — use Icarus Verilog (default)
 #   make SIM=verilator            — use Verilator
@@ -13,7 +13,7 @@
 #   robustness/ for test_$(DUT).py and sets MODULE accordingly.
 
 # ─── Configuration ───
-DUT        ?= npu_pe
+DUT        ?= npu_ppu
 SIM        ?= icarus
 TOPLEVEL_LANG ?= verilog
 
@@ -50,9 +50,7 @@ endif
 # ─── Verilog sources ───
 # Hierarchical modules need their dependencies included.
 ifeq ($(DUT),npu_top)
-VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v \
-                  $(RTL_DIR)/npu_systolic.v \
-                  $(RTL_DIR)/npu_ppu.v \
+VERILOG_SOURCES = $(RTL_DIR)/npu_ppu.v \
                   $(RTL_DIR)/npu_ppu_bank.v \
                   $(RTL_DIR)/npu_dw_bank.v \
                   $(RTL_DIR)/npu_csr.v \
@@ -64,9 +62,7 @@ VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v \
                   $(RTL_DIR)/npu_compute.v \
                   $(RTL_DIR)/npu_top.v
 else ifeq ($(DUT),npu_compute_tb)
-VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v \
-                  $(RTL_DIR)/npu_systolic.v \
-                  $(RTL_DIR)/npu_ppu.v \
+VERILOG_SOURCES = $(RTL_DIR)/npu_ppu.v \
                   $(RTL_DIR)/npu_ppu_bank.v \
                   $(RTL_DIR)/npu_dw_bank.v \
                   $(RTL_DIR)/npu_sram.v \
@@ -75,17 +71,13 @@ VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v \
                   $(RTL_DIR)/npu_compute.v \
                   $(shell pwd)/npu_compute_tb.v
 else ifeq ($(DUT),npu_compute)
-VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v \
-                  $(RTL_DIR)/npu_systolic.v \
-                  $(RTL_DIR)/npu_ppu.v \
+VERILOG_SOURCES = $(RTL_DIR)/npu_ppu.v \
                   $(RTL_DIR)/npu_ppu_bank.v \
                   $(RTL_DIR)/npu_dw_bank.v \
                   $(RTL_DIR)/npu_sram.v \
                   $(RTL_DIR)/npu_sram_wide.v \
                   $(RTL_DIR)/npu_dw_conv.v \
                   $(RTL_DIR)/npu_compute.v
-else ifeq ($(DUT),npu_systolic)
-VERILOG_SOURCES = $(RTL_DIR)/npu_pe.v $(RTL_DIR)/npu_systolic.v
 else
 VERILOG_SOURCES = $(RTL_DIR)/$(DUT).v
 endif
@@ -105,9 +97,6 @@ COMPILE_ARGS += +define+SYNTHESIS
 endif
 else
 COMPILE_ARGS = -g2012 -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH)
-ifdef FORCE_MESH
-COMPILE_ARGS += -DFORCE_MESH
-endif
 ifdef DBG_ROW
 COMPILE_ARGS += -DDBG_ROW
 endif

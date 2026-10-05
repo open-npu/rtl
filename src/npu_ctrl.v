@@ -256,6 +256,16 @@ module npu_ctrl #(
     // oc_group_idx counts groups of 8, so the block number is idx/2.
     wire        mesh_half   = !cfg_wgt_layout && (cfg_dma_wgt_per_oc != 32'd0)
                            && !grp8_mode && (`ARRAY_SIZE == 8);
+    // The 8x8 mesh is gone. A dense conv runs only on the 64-lane row,
+    // which needs a K-major group and an input channel count that fits
+    // one activation strip. FC and deconv had no other engine.
+    wire        conv_on_row = cfg_wgt_layout
+                           && (cfg_layer_mode[3:0] == 4'd0)
+                           && ({16'd0, cfg_in_c} <= 16'd1024)
+                           && (kd_elems32 != 32'd0);
+    wire        no_engine   = (cfg_layer_mode[3:0] == 4'd2)
+                           || (cfg_layer_mode[3:0] == 4'd6)
+                           || ((cfg_layer_mode[3:0] == 4'd0) && !conv_on_row);
     // Guard helpers (evaluated at S_IDLE, see E4-E7 below)
     wire [31:0] kd_elems32  = {24'd0, cfg_kernel_h} * {24'd0, cfg_kernel_w}
                               * {16'd0, cfg_in_c};
@@ -632,6 +642,11 @@ module npu_ctrl #(
                             state <= S_ERROR;
                         end else if (initial_param_words > PARAM_DEPTH) begin
                             hw_error_code <= 4'd9;
+                            state <= S_ERROR;
+                        // E10: FC, deconv, and conv that cannot use the row.
+                        //      The 8x8 mesh that used to run them is gone.
+                        end else if (no_engine) begin
+                            hw_error_code <= 4'd10;
                             state <= S_ERROR;
                         end else begin
                             hw_busy  <= 1'b1;

@@ -194,24 +194,20 @@ async def test_weight_load_4x4(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    wgt_valid_count = 0
-    wgt_cmds = 0
+    row_groups = 0
+    prev_state = None
     for _ in range(5000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        if int(dut.u_compute.sa_wgt_valid.value) == 1:
-            wgt_valid_count += 1
-        cmd_v = int(dut.u_compute.sa_cmd_valid.value)
-        cmd = int(dut.u_compute.sa_cmd.value)
-        if cmd_v == 1 and cmd == 1:
-            wgt_cmds += 1
+        st = int(dut.u_compute.state.value)
+        if st == 68 and prev_state != 68:
+            row_groups += 1
+        prev_state = st
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert wgt_cmds == 1, f"Expected 1 WGT_LOAD, got {wgt_cmds}"
-    assert wgt_valid_count == 0, \
-        f"row conv drove sa_wgt_valid {wgt_valid_count} times"
+    assert row_groups == 1, f"Expected 1 row group, got {row_groups}"
 
 
 @cocotb.test()
@@ -235,19 +231,15 @@ async def test_act_vector_single_pulse(dut):
     dut.start.value = 0
 
     seen = []
-    mesh_pulses = 0
     for _ in range(5000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        if int(dut.u_compute.sa_act_valid.value) == 1:
-            mesh_pulses += 1
         if int(dut.u_compute.mac1d_fire.value) == 1:
             seen.append(int(dut.u_compute.mac1d_act.value) & 0xFFFF)
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert mesh_pulses == 0, f"row conv pulsed sa_act_valid {mesh_pulses} times"
     assert seen == list(acts), \
         f"Expected broadcast acts {list(acts)}, got {seen}"
 
@@ -280,21 +272,16 @@ async def test_psum_vector_per_pixel(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    psum_valid_count = 0
     ppu_feeds = 0
     for _cyc in range(20000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        if int(dut.sa_psum_out_valid.value) == 1:
-            psum_valid_count += 1
         if int(dut.u_compute.ppu_valid_w.value) != 0:
             ppu_feeds += 1
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert psum_valid_count == 0, \
-        f"row conv produced {psum_valid_count} mesh psum pulses"
     assert ppu_feeds == 1, \
         f"Expected 1 PPU feed for one pixel, got {ppu_feeds}"
 
@@ -401,20 +388,21 @@ async def test_oc_tiling_2groups(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    wgt_load_cmds = 0
+    row_groups = 0
+    prev_state = None
     for _ in range(20000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        cmd_v = int(dut.u_compute.sa_cmd_valid.value)
-        cmd = int(dut.u_compute.sa_cmd.value)
-        if cmd_v == 1 and cmd == 1:  # MODE_WGT_LOAD
-            wgt_load_cmds += 1
+        st = int(dut.u_compute.state.value)
+        if st == 68 and prev_state != 68:
+            row_groups += 1
+        prev_state = st
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert wgt_load_cmds == 2, \
-        f"Expected 2 WGT_LOAD commands, got {wgt_load_cmds}"
+    assert row_groups == 2, \
+        f"Expected 2 row groups, got {row_groups}"
 
 
 @cocotb.test()
@@ -448,20 +436,21 @@ async def test_spatial_tiling_2x2(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    wgt_load_cmds = 0
+    row_groups = 0
+    prev_state = None
     for _ in range(200000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        cmd_v = int(dut.u_compute.sa_cmd_valid.value)
-        cmd = int(dut.u_compute.sa_cmd.value)
-        if cmd_v == 1 and cmd == 1:
-            wgt_load_cmds += 1
+        st = int(dut.u_compute.state.value)
+        if st == 68 and prev_state != 68:
+            row_groups += 1
+        prev_state = st
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert wgt_load_cmds == 4, \
-        f"Expected 4 WGT_LOAD commands for 4 tiles, got {wgt_load_cmds}"
+    assert row_groups == 4, \
+        f"Expected 4 row groups for 4 tiles, got {row_groups}"
 
 
 @cocotb.test()
