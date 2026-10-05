@@ -1,11 +1,14 @@
 #!/bin/bash
-# Sweep the 64-lane row and the 8x8 mesh over the golden model set.
-# Usage: run_util_sweep.sh row|mesh
+# Sweep the 64-lane row over the golden model set.
+# Usage: run_util_sweep.sh row
 set -u
 cd "$(dirname "$0")"
 mode=$1
+if [ "$mode" != row ]; then
+    echo "only row mode remains; the 8x8 mesh is gone" >&2
+    exit 1
+fi
 build=sim_build_util_$mode
-[ "$mode" = mesh ] && export FORCE_MESH=1
 for m in a b c d e h i j k l; do
     meta=golden/golden_dma_e2e/model_${m}_int8/metadata.json
     [ -f "$meta" ] || { echo "SKIP $m"; continue; }

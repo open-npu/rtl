@@ -21,15 +21,10 @@ async def reset_dut(dut):
     """Apply reset for 5 cycles."""
     dut.rst_n.value = 0
     dut.start.value = 0
-    # Drive feedback inputs that would normally come from systolic/PPU
-    dut.sa_ready.value = 1
-    dut.sa_busy.value = 0
-    dut.sa_psum_out_valid.value = 0
     dut.ppu_out_valid.value = 0
     dut.ppu_out_data.value = 0
     dut.dw_out_valid.value = 0
     dut.dw_acc_out.value = 0
-    dut.sa_psum_out_flat.value = 0
     try:
         dut.ppu_vout_w.value = 0
         dut.ppu_out_w.value = 0
@@ -61,40 +56,13 @@ async def reset_dut(dut):
 
 
 async def systolic_ppu_stub(dut):
-    """Stub coroutine that mimics the systolic psum chain + PPU pipeline.
-
-    The array no longer has a drain phase. It consumes one ROWS-wide activation
-    vector per sa_act_valid cycle and emits the reduced result vector ROWS
-    cycles later, so this stub responds to sa_act_valid rather than to a
-    MODE_DRAIN command:
-    - On sa_act_valid: after ARRAY_SIZE cycles, pulse sa_psum_out_valid with
-      zero partial sums.
-    - On ppu_in_valid: after 4-cycle pipeline delay, pulse ppu_out_valid with
-      ppu_out_data=0.
-    """
-    ARRAY_SIZE = get_array_size(dut)
-    ppu_pipeline = []  # Queue of cycle_due for PPU outputs
-    psum_due = []      # one due-cycle per in-flight activation vector
+    """Answer the PPU 4 cycles after a wide or scalar feed."""
+    ppu_pipeline = []
 
     cycle = 0
     while True:
         await RisingEdge(dut.clk)
         cycle += 1
-
-        try:
-            act_valid = int(dut.sa_act_valid.value)
-        except Exception:
-            act_valid = 0
-
-        if act_valid == 1:
-            psum_due.append(cycle + ARRAY_SIZE)
-
-        if psum_due and psum_due[0] <= cycle:
-            psum_due.pop(0)
-            dut.sa_psum_out_valid.value = 1
-            dut.sa_psum_out_flat.value = 0
-        else:
-            dut.sa_psum_out_valid.value = 0
 
         # Check for PPU input (scalar or any wide lane)
         try:
@@ -159,9 +127,6 @@ async def test_idle_after_reset(dut):
 
     await ReadOnly()
     assert int(dut.done.value) == 0, "done should be 0 after reset"
-    assert int(dut.sa_cmd_valid.value) == 0, "sa_cmd_valid should be 0"
-    assert int(dut.sa_wgt_valid.value) == 0, "sa_wgt_valid should be 0"
-    assert int(dut.sa_act_valid.value) == 0, "sa_act_valid should be 0"
     assert int(dut.wgt_rd_en.value) == 0, "wgt_rd_en should be 0"
     assert int(dut.act_rd_en.value) == 0, "act_rd_en should be 0"
 
@@ -180,17 +145,17 @@ async def test_start_pulse(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    # Allow for the SRAM read pipeline before the first weight command.
-    found_wgt_cmd = False
+    # The row group state is the start of a 64-lane conv.
+    found_row = False
     for _ in range(512):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 1:  # MODE_WGT_LOAD
-            found_wgt_cmd = True
+        if int(dut.state.value) == 68:  # S_ROW_WGT
+            found_row = True
             break
 
     await Timer(1, unit="step")
-    assert found_wgt_cmd, "Should issue WGT_LOAD command after start"
+    assert found_row, "Should enter the 64-lane row after start"
 
 
 @cocotb.test()
@@ -212,24 +177,23 @@ async def test_weight_load_timing(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    wgt_cmds = 0
+    row_groups = 0
+    prev_state = None
     mac_fires = 0
-    wgt_valid_count = 0
     for _ in range(5000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 1:
-            wgt_cmds += 1
-        if int(dut.sa_wgt_valid.value) == 1:
-            wgt_valid_count += 1
+        st = int(dut.state.value)
+        if st == 68 and prev_state != 68:
+            row_groups += 1
+        prev_state = st
         if int(dut.mac1d_fire.value) == 1:
             mac_fires += 1
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert wgt_cmds == 1, f"Expected 1 WGT_LOAD for out_c={out_c}, got {wgt_cmds}"
-    assert wgt_valid_count == 0, "row conv must not drive the mesh weight port"
+    assert row_groups == 1, f"Expected 1 row group for out_c={out_c}, got {row_groups}"
     assert mac_fires == in_c, \
         f"Expected {in_c} MAC issues (one per K), got {mac_fires}"
 
@@ -254,19 +218,15 @@ async def test_act_vector_timing(dut):
     dut.start.value = 0
 
     mac_fires = 0
-    act_valid_count = 0
     for _ in range(5000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        if int(dut.sa_act_valid.value) == 1:
-            act_valid_count += 1
         if int(dut.mac1d_fire.value) == 1:
             mac_fires += 1
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert act_valid_count == 0, "row conv must not pulse sa_act_valid"
     assert mac_fires == k_depth, \
         f"Expected {k_depth} MAC issues for one pixel, got {mac_fires}"
 
@@ -285,26 +245,16 @@ async def test_no_drain_commands(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    drain_count = 0
-    act_vector_count = 0
     mac_fires = 0
     for _ in range(10000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 3:
-            drain_count += 1
-        if int(dut.sa_act_valid.value) == 1:
-            act_vector_count += 1
         if int(dut.mac1d_fire.value) == 1:
             mac_fires += 1
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert drain_count == 0, \
-        f"Compute issued {drain_count} MODE_DRAIN commands"
-    assert act_vector_count == 0, \
-        f"row conv pulsed sa_act_valid {act_vector_count} times"
     assert mac_fires == ARRAY_SIZE, \
         f"Expected {ARRAY_SIZE} MAC issues for one 1x1 pixel, got {mac_fires}"
 
@@ -354,19 +304,21 @@ async def test_oc_tiling(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    # Count how many WGT_LOAD commands are issued (should be 2: one per OC group)
-    wgt_load_cmds = 0
+    row_groups = 0
+    prev_state = None
     for _ in range(20000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 1:  # MODE_WGT_LOAD
-            wgt_load_cmds += 1
+        st = int(dut.state.value)
+        if st == 68 and prev_state != 68:
+            row_groups += 1
+        prev_state = st
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert wgt_load_cmds == 2, \
-        f"Expected 2 WGT_LOAD commands for 2 OC groups, got {wgt_load_cmds}"
+    assert row_groups == 2, \
+        f"Expected 2 row groups for 128 output channels, got {row_groups}"
 
 
 @cocotb.test()
@@ -388,16 +340,18 @@ async def test_spatial_tiling(dut):
     await RisingEdge(dut.clk)
     dut.start.value = 0
 
-    # Count WGT_LOAD commands: should be 4 tiles × 1 OC group = 4
-    wgt_load_cmds = 0
+    row_groups = 0
+    prev_state = None
     for _ in range(50000):
         await RisingEdge(dut.clk)
         await ReadOnly()
-        if int(dut.sa_cmd_valid.value) == 1 and int(dut.sa_cmd.value) == 1:
-            wgt_load_cmds += 1
+        st = int(dut.state.value)
+        if st == 68 and prev_state != 68:
+            row_groups += 1
+        prev_state = st
         if int(dut.done.value) == 1:
             break
         await Timer(1, unit="step")
 
-    assert wgt_load_cmds == 4, \
-        f"Expected 4 WGT_LOAD commands for 4 tiles, got {wgt_load_cmds}"
+    assert row_groups == 4, \
+        f"Expected 4 row groups for 4 tiles, got {row_groups}"

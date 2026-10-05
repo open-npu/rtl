@@ -131,6 +131,8 @@ module npu_top #(
     // --- Performance counters ---
     reg  [31:0] perf_cycle_cnt;
     reg  [31:0] mac_cnt;
+    wire        mac_fire;
+    wire [6:0]  mac_lanes;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -141,10 +143,10 @@ module npu_top #(
             mac_cnt        <= 32'd0;
         end else if (hw_busy) begin
             perf_cycle_cnt <= perf_cycle_cnt + 1;
-            // Conv2D: ARRAY_SIZE MACs per sa_act_valid pulse
+            // Row: mac_lanes products on a mac_fire cycle.
             // DW Conv: 1 MAC per dw_in_valid pulse
-            if (sa_act_valid)
-                mac_cnt <= mac_cnt + ARRAY_SIZE;
+            if (mac_fire)
+                mac_cnt <= mac_cnt + {25'd0, mac_lanes};
             else if (dw_in_valid)
                 mac_cnt <= mac_cnt + 1;
         end
@@ -562,43 +564,6 @@ module npu_top #(
                                                      ofm_dma_rdata;
 
     // ════════════════════════════════════════════════════════════════════
-    // Systolic Array
-    // ════════════════════════════════════════════════════════════════════
-
-    // Systolic array signals (driven by npu_compute)
-    wire [1:0]                    sa_cmd;
-    wire                          sa_cmd_valid;
-    wire [`DATA_WIDTH*ARRAY_SIZE-1:0] sa_wgt_data_flat;
-    wire                          sa_wgt_valid;
-    wire                          sa_swap_wgt;
-    wire [`DATA_WIDTH*ARRAY_SIZE-1:0] sa_act_data_flat;
-    wire                          sa_act_valid;
-    wire [`ACC_WIDTH*ARRAY_SIZE-1:0]  sa_psum_out_flat;
-    wire                          sa_psum_out_valid;
-    wire                          sa_busy, sa_ready;
-
-    npu_systolic #(
-        .ROWS   (ARRAY_SIZE),
-        .COLS   (ARRAY_SIZE),
-        .DATA_W (`DATA_WIDTH),
-        .ACC_W  (`ACC_WIDTH)
-    ) u_systolic (
-        .clk            (clk),
-        .rst_n          (engine_rst_n),
-        .cmd            (sa_cmd),
-        .cmd_valid      (sa_cmd_valid),
-        .wgt_data_flat  (sa_wgt_data_flat),
-        .wgt_valid      (sa_wgt_valid),
-        .swap_wgt       (sa_swap_wgt),
-        .act_data_flat  (sa_act_data_flat),
-        .act_valid      (sa_act_valid),
-        .psum_out_flat  (sa_psum_out_flat),
-        .psum_out_valid (sa_psum_out_valid),
-        .busy           (sa_busy),
-        .ready          (sa_ready)
-    );
-
-    // ════════════════════════════════════════════════════════════════════
     // DW Convolution Engine (single lane)
     // ════════════════════════════════════════════════════════════════════
 
@@ -777,18 +742,8 @@ module npu_top #(
         .param_rd_en    (param_b_en),
         .param_rd_addr  (param_b_addr),
         .param_rd_data  (param_b_rdata),
-        // Systolic
-        .sa_cmd         (sa_cmd),
-        .sa_cmd_valid   (sa_cmd_valid),
-        .sa_wgt_data_flat(sa_wgt_data_flat),
-        .sa_wgt_valid   (sa_wgt_valid),
-        .sa_swap_wgt    (sa_swap_wgt),
-        .sa_act_data_flat(sa_act_data_flat),
-        .sa_act_valid   (sa_act_valid),
-        .sa_psum_out_flat (sa_psum_out_flat),
-        .sa_psum_out_valid(sa_psum_out_valid),
-        .sa_busy        (sa_busy),
-        .sa_ready       (sa_ready),
+        .mac_fire       (mac_fire),
+        .mac_lanes      (mac_lanes),
         // DW Conv
         .dw_wgt_load    (dw_wgt_load),
         .dw_wgt_valid   (dw_wgt_valid),
