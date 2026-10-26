@@ -181,6 +181,7 @@ module npu_compute_tb #(
         .cfg_tile_num_h(cfg_tile_num_h), .cfg_tile_num_w(cfg_tile_num_w),
         .cfg_in_w(cfg_in_w), .cfg_in_h(cfg_in_h), .cfg_in_zp(cfg_in_zp),
         .cfg_act_base(cfg_act_base), .cfg_out_base(cfg_out_base),
+        .cfg_ofm_base(cfg_act_base + cfg_out_base),
         .cfg_pool_cfg(32'd0), .cfg_resize_cfg(32'd0),
         .cfg_deconv_cfg(32'd0), .cfg_concat_cfg(32'd0),
         .cfg_2d_load(1'b0),

@@ -682,8 +682,14 @@ module npu_top #(
     wire [ACT_ADDR_W-1:0] ifm_db_half = act_role_swap
         ? OFM_DEPTH[ACT_ADDR_W-1:0] >> 1
         : IFM_DEPTH[ACT_ADDR_W-1:0] >> 1;
+    wire [ACT_ADDR_W-1:0] ofm_db_half = act_role_swap
+        ? IFM_DEPTH[ACT_ADDR_W-1:0] >> 1
+        : OFM_DEPTH[ACT_ADDR_W-1:0] >> 1;
     wire [ACT_ADDR_W-1:0] effective_act_base = reg_sram_base[ACT_ADDR_W-1:0]
         + (db_en_is_active && ping_pong_flag ? ifm_db_half : {ACT_ADDR_W{1'b0}});
+    // Store DMA adds this same OFM half. The IFM half is a different size.
+    wire [ACT_ADDR_W-1:0] effective_ofm_base = reg_sram_base[ACT_ADDR_W+16-1:16]
+        + (db_en_is_active && ping_pong_flag ? ofm_db_half : {ACT_ADDR_W{1'b0}});
 
     npu_compute #(
         .ARRAY_SIZE   (ARRAY_SIZE),
@@ -719,6 +725,7 @@ module npu_top #(
         .cfg_in_zp      (reg_layer_mode[23:8]),
         .cfg_act_base   (effective_act_base),
         .cfg_out_base   (reg_sram_base[ACT_ADDR_W+16-1:16]),
+        .cfg_ofm_base   (effective_ofm_base),
         .cfg_pool_cfg   (reg_pool_cfg),
         .cfg_resize_cfg (reg_resize_cfg),
         .cfg_deconv_cfg (reg_deconv_cfg),
