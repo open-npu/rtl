@@ -1165,8 +1165,12 @@ module npu_ctrl #(
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;  // load
                         dma_sram_sel  <= 2'd0;  // weight bank
+                        // oc_group_idx is the next group number (0,1,2,…),
+                        // already incremented before this state. Each group
+                        // is ARRAY_SIZE channels of [C][KH][KW] weights.
                         dma_ext_addr  <= cfg_dma_wgt_addr
-                                         + ({16'd0, oc_group_idx} * {8'd0, cfg_kernel_h}
+                                         + ({16'd0, oc_group_idx} * `ARRAY_SIZE
+                                            * {8'd0, cfg_kernel_h}
                                             * {8'd0, cfg_kernel_w} * dws_esz);
                         dma_sram_addr <= 16'd0;
                         dma_xfer_len  <= dws_wgt_words;
@@ -1192,8 +1196,12 @@ module npu_ctrl #(
                         dma_start      <= 1'b1;
                         dma_dir        <= 1'b0;  // load
                         dma_sram_sel   <= 2'd1;  // activation
+                        // Pool reports the channel base. DW reports the
+                        // group number, so its slice starts ARRAY_SIZE later.
                         dma_ext_addr   <= cfg_dma_in_addr
-                                          + ({16'd0, oc_group_idx} * dws_esz);
+                                          + ((dw_stream
+                                              ? ({16'd0, oc_group_idx} * `ARRAY_SIZE)
+                                              : {16'd0, oc_group_idx}) * dws_esz);
                         dma_sram_addr  <= 16'd0;
                         dma_xfer_len   <= dws_act_words32[15:0];
                         dma_row_len    <= dws_row_len;

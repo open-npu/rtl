@@ -41,6 +41,7 @@ async def reset_dut(dut):
     dut.cfg_in_zp.value = 0
     dut.cfg_act_base.value = 0
     dut.cfg_out_base.value = 64
+    dut.cfg_ofm_base.value = 64
     dut.cfg_pool_cfg.value = 0
     dut.cfg_resize_cfg.value = 0
     dut.cfg_deconv_cfg.value = 0

@@ -69,7 +69,8 @@ module npu_compute #(
     input  wire [15:0]                  cfg_in_h,
     input  wire signed [15:0]           cfg_in_zp,      // Input zero-point for padding
     input  wire [ACT_ADDR_W-1:0]        cfg_act_base,   // Input activation base (word addr)
-    input  wire [ACT_ADDR_W-1:0]        cfg_out_base,   // Output base (word addr in act SRAM)
+    input  wire [ACT_ADDR_W-1:0]        cfg_out_base,   // CSR output offset inside the OFM bank
+    input  wire [ACT_ADDR_W-1:0]        cfg_ofm_base,   // OFM write base, including the DB half
     input  wire [31:0]                  cfg_pool_cfg,   // Pooling config register
     input  wire [31:0]                  cfg_resize_cfg, // Resize config register
     input  wire [31:0]                  cfg_deconv_cfg, // Deconv config: [7:0]=INSERT_H, [15:8]=INSERT_W
@@ -1702,17 +1703,19 @@ module npu_compute #(
                         tile_in_w <= cfg_tile_w * cfg_stride_w + kw_eff - cfg_stride_w;
                     end
                 end
-                // Output base: add bank offset so output doesn't overlap input
-                // For DB_EN: out_base = effective_act_base + cfg_out_base
-                // This ensures output is written after input within the same bank
-                // DW stream mode: act SRAM[0] holds the resident 16-ch slice;
+                // OFM is a separate bank from IFM. cfg_ofm_base already
+                // selects the double-buffer half the store DMA will read.
+                // Adding cfg_act_base here used the IFM half (3072) while
+                // the store reads the OFM half (6144), so every odd tile
+                // was stored as zeros.
+                // DW stream mode: act SRAM[0] holds the resident slice;
                 // the 1x1xC output accumulates in the fixed high region
                 // (npu_ctrl stores from DW_STREAM_OUT_BASE for these layers).
                 if (slice_stream) begin
                     out_base    <= `DW_STREAM_OUT_BASE;
                     dw_grp_base <= 16'd0;
                 end else begin
-                    out_base <= cfg_act_base + cfg_out_base;
+                    out_base <= cfg_ofm_base;
                 end
 
                 oc_group <= 0;
@@ -1854,15 +1857,17 @@ module npu_compute #(
                         row_klen <= klen;
                         row_ntap <= ntap;
                         // Pack P = 64/G output pixels into the lanes when the
-                        // group is narrower than the row. Conv is bounded by
-                        // what one abuf bank can hold. Depthwise packs only
-                        // when stride is 1 and this group is the whole channel
-                        // axis: one tap of those pixels is then a single
-                        // contiguous NHWC read, and the outputs are one run.
+                        // group is narrower than the row. The packed pixels
+                        // are one contiguous NHWC run, so this is only valid
+                        // when the group is the whole channel axis. Conv is
+                        // also bounded by what one abuf bank can hold.
+                        // Depthwise additionally needs stride 1, so one tap
+                        // of those pixels is a single contiguous read.
                         psh = 3'd0;
-                        if (cfg_op_type != 8'd1
-                                || (cfg_stride_w == 8'd1 && rem_oc == cfg_out_c
-                                    && cfg_in_c == cfg_out_c)) begin
+                        if (rem_oc == cfg_out_c
+                                && (cfg_op_type != 8'd1
+                                    || (cfg_stride_w == 8'd1
+                                        && cfg_in_c == cfg_out_c))) begin
                             for (ps = 1; ps <= ROW_PSH_MAX; ps = ps + 1)
                                 if ((({9'd0, nch} << ps) <= ROW_N)
                                         && (cfg_op_type == 8'd1
@@ -2503,33 +2508,29 @@ module npu_compute #(
                 dw_cnt <= 0;
                 param_word_idx <= 0;
                 param_read_issued <= 1'b0;
+                cache_issue <= 9'd0;
                 state <= S_DW_PARAM;
             end
 
             S_DW_PARAM: begin
-                // Load 4 PPU param words for current channel
-                // 3-phase per word: issue → wait → capture
+                // dw_nch channels × 4 words, from this group's first channel.
+                // The wide PPU multiplies by these. A scale left over from
+                // the previous layer (or a single channel at oc_group*4)
+                // requantizes the whole group to zeros.
                 if (!param_read_issued) begin
                     param_rd_en   <= 1'b1;
-                    param_rd_addr <= (oc_group * 4) + param_word_idx;
+                    param_rd_addr <= (dw_ch_base << 2) + cache_issue[8:0];
                     param_read_issued <= 1'b1;
-                    act_read_issued <= 1'b0;  // reuse as wait flag
+                    act_read_issued <= 1'b0;
                 end else if (!act_read_issued) begin
-                    // Wait for SRAM read latency
                     act_read_issued <= 1'b1;
                 end else begin
-                    param_buf[param_word_idx] <= param_rd_data;
-                    if (param_word_idx == 3'd3) begin
-                        // Extract params
-                        ppu_mult_m     <= param_buf[0][14:0];
-                        ppu_shift_s    <= param_buf[0][21:16];
-                        ppu_zero_point <= $signed(param_buf[1][15:0]);
-                        // Use param_rd_data for word 3 (param_buf[3] not yet updated this cycle)
-                        ppu_bias       <= $signed({param_rd_data[15:0], param_buf[2],
-                                                   param_buf[1][31:16]});
+                    param_cache[cache_issue[7:0]] <= param_rd_data;
+                    if (cache_issue + 9'd1 >= {2'd0, dw_nch, 2'b00}) begin
+                        cache_issue <= 9'd0;
                         state <= S_DW_COMPUTE;
                     end else begin
-                        param_word_idx <= param_word_idx + 1;
+                        cache_issue <= cache_issue + 9'd1;
                         param_read_issued <= 1'b0;
                     end
                 end
@@ -2681,6 +2682,16 @@ module npu_compute #(
                                 if (ci[4:0] < dw_nch) begin
                                     ppu_acc_w[ACC_W*ci +: ACC_W]
                                         <= dw_acc_w[ACC_W*ci +: ACC_W];
+                                    ppu_mult_w[15*ci +: 15]
+                                        <= param_cache[{ci[3:0], 2'b00}][14:0];
+                                    ppu_shift_w[6*ci +: 6]
+                                        <= param_cache[{ci[3:0], 2'b00}][21:16];
+                                    ppu_zp_w[16*ci +: 16]
+                                        <= param_cache[{ci[3:0], 2'b00} + 8'd1][15:0];
+                                    ppu_bias_w[ACC_W*ci +: ACC_W]
+                                        <= $signed({param_cache[{ci[3:0], 2'b00} + 8'd3][15:0],
+                                                    param_cache[{ci[3:0], 2'b00} + 8'd2],
+                                                    param_cache[{ci[3:0], 2'b00} + 8'd1][31:16]});
                                     ppu_valid_w[ci] <= 1'b1;
                                 end
                             end
@@ -2851,7 +2862,7 @@ module npu_compute #(
                     out_base      <= `DW_STREAM_OUT_BASE;
                     pool_grp_base <= 16'd0;
                 end else begin
-                    out_base <= cfg_act_base + cfg_out_base;
+                    out_base <= cfg_ofm_base;
                 end
                 pool_ch <= 0;
                 param_word_idx <= 0;
@@ -3910,9 +3921,9 @@ module npu_compute #(
                 reg [1023:0] bytes;
                 reg signed [DATA_W-1:0] lane;
                 reg [7:0] nb;
-                // Packed pixels are consecutive in raster order and packing
-                // only happens when the group spans the whole channel axis,
-                // so all P*G results are one contiguous NHWC run.
+                // Address this beat at its own NHWC offset. A 64-channel
+                // group of a wider layer is not contiguous with the next
+                // pixel: the other groups' channels sit in between.
                 nlane = ppu_nlane;
                 nbytes = cfg_int16 ? {nlane[7:0], 1'b0} : nlane;
                 elem = ({16'd0, ppu_oh} * {16'd0, out_tile_w} + {16'd0, ppu_ow})
@@ -3987,6 +3998,12 @@ module npu_compute #(
                     obuf <= bytes;
                     ob_n <= nb;
                     ob_i <= 8'd0;
+                    // Start this pixel at its own channel offset. Carrying
+                    // pk_addr across pixels packs the group tightly and
+                    // makes the next group overwrite channel 0.
+                    pk      <= 32'd0;
+                    pk_pos  <= 2'd0;
+                    pk_addr <= out_base + bbase[ACT_ADDR_W+1:2];
                     row_drain <= 1'b1;
                 end
             end else if (row_drain) begin : row_pack
