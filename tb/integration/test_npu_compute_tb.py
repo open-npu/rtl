@@ -96,7 +96,12 @@ def _wgt_commit(dut, out_c, k_depth, int16, dw, layout=1):
         src[addr * 4:addr * 4 + 4] = int(word).to_bytes(4, 'little')
     _WGT_STAGE.clear()
     elem = 2 if int16 else 1
-    lanes = 64
+    # Match the hardware/firmware policy: use the widest power-of-two output
+    # group whose complete K vector fits the 80KB weight SRAM.
+    lanes = next(
+        n for n in (64, 32, 16, 8, 4, 2, 1)
+        if n * k_depth * elem <= 80 * 1024
+    ) if not dw else 64
     dst = bytearray(src)
     if not layout:
         pass
@@ -114,7 +119,7 @@ def _wgt_commit(dut, out_c, k_depth, int16, dw, layout=1):
             for c in range(gw):
                 for k in range(k_depth):
                     s = ((g + c) * k_depth + k) * elem
-                    d = (g * lanes * k_depth + k * gw + c) * elem
+                    d = (g * k_depth + k * gw + c) * elem
                     dst[d:d + elem] = src[s:s + elem]
     for w in range(len(dst) // 4):
         write_sram_word(dut, 'wgt', w,
@@ -1581,3 +1586,147 @@ async def test_conv_spatial_2x2_int16(dut):
                 f"Pixel {px} ch {ch_pair*2+1}: got {v1}, expected {expected}"
 
     dut._log.info(f"PASS: INT16 spatial 2x2, all outputs = {expected}")
+
+
+def _passthrough_params(dut, nch):
+    for ch in range(nch):
+        base = ch * 4
+        write_sram_word(dut, 'param', base + 0, 0x00000001)
+        write_sram_word(dut, 'param', base + 1, 0)
+        write_sram_word(dut, 'param', base + 2, 0)
+        write_sram_word(dut, 'param', base + 3, 0)
+
+
+@cocotb.test()
+async def test_fc_dotproduct(dut):
+    """FC is a 1x1 conv on the row. w=[1,2,3,4], act=[1,2,3,4] -> 30."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+
+    array = get_array_size(dut)
+    wgt_put(dut, 0, pack_i8x4(1, 2, 3, 4))
+    for oc in range(1, array):
+        wgt_put(dut, oc, pack_i8x4(1, 1, 1, 1))
+    for i in range(16):
+        write_sram_word(dut, 'act', i, 0)
+    write_sram_word(dut, 'act', 0, pack_i8x4(1, 2, 3, 4))
+    _passthrough_params(dut, array)
+    dut.ppu_mode.value = 3
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    set_cfg(dut, in_c=4, out_c=array, kh=1, kw=1, out_h=1, out_w=1,
+            in_h=1, in_w=1, op_type=2)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=20000), "FC done never asserted"
+    out_word = read_sram_word(dut, 'act', 0)
+    assert (out_word & 0xFF) == 30, f"FC dot = {out_word & 0xFF}, expected 30"
+    for i in range(1, 4):
+        byte_val = (out_word >> (i * 8)) & 0xFF
+        assert byte_val == 10, f"FC byte {i} = {byte_val}, expected 10"
+
+
+@cocotb.test()
+async def test_fc_channel_slice(dut):
+    """1280-input FC does not fit one 1024-word bank. The two slices accumulate.
+
+    act[0]=1, act[1024]=1. Weight channel 0 is 3 at K=0 and 5 at K=1024.
+    A slice that replaced the accumulator instead of adding would return 3 or 5.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+
+    in_c = 1280
+    out_c = 4
+    acts = bytearray(in_c)
+    acts[0] = 1
+    acts[1024] = 1
+    for w in range((in_c + 3) // 4):
+        chunk = acts[w * 4:w * 4 + 4]
+        chunk = chunk + bytes(4 - len(chunk))
+        write_sram_word(dut, 'act', w, int.from_bytes(chunk, 'little'))
+
+    weights = bytearray(out_c * in_c)
+    weights[0] = 3
+    weights[1024] = 5
+    for w in range(len(weights) // 4):
+        wgt_put(dut, w, int.from_bytes(weights[w * 4:w * 4 + 4], 'little'))
+    write_sram_word(dut, 'ofm', 0, 0xDEADBEEF)
+    _passthrough_params(dut, out_c)
+    dut.ppu_mode.value = 3
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+
+    set_cfg(dut, in_c=in_c, out_c=out_c, kh=1, kw=1, out_h=1, out_w=1,
+            in_h=1, in_w=1, op_type=2)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=200000), "sliced FC done never asserted"
+    out_word = read_sram_word(dut, 'act', 0)
+    got = out_word & 0xFF
+    assert got == 8, f"sliced FC dot = {got} (word 0x{out_word:08X}), expected 8"
+    for i in range(1, 4):
+        byte_val = (out_word >> (i * 8)) & 0xFF
+        assert byte_val == 0, f"sliced FC byte {i} = {byte_val}, expected 0"
+
+
+@cocotb.test()
+async def test_row_narrow_group_packs_pixels(dut):
+    """A 64-OC group is 128KB, so use two 32-OC groups and P=2 pixels.
+
+    This exercises both activation channel slicing and the NHWC scatter that
+    writes each packed pixel around the other output-channel group.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset_dut(dut)
+
+    in_c = 1024
+    out_c = 64
+    out_w = 2
+    acts = [bytearray(in_c * 2) for _ in range(out_w)]
+    values = ((2, 3), (4, 5))
+    for px, (a, b) in enumerate(values):
+        raw = bytearray(in_c * 2)
+        raw[0:2] = int(a).to_bytes(2, 'little', signed=True)
+        raw[700 * 2:700 * 2 + 2] = int(b).to_bytes(2, 'little', signed=True)
+        for w in range(len(raw) // 4):
+            write_sram_word(
+                dut, 'act', px * (in_c // 2) + w,
+                int.from_bytes(raw[w * 4:w * 4 + 4], 'little'))
+
+    weights = bytearray(out_c * in_c * 2)
+    for oc in range(out_c):
+        base = oc * in_c * 2
+        weights[base:base + 2] = (1).to_bytes(2, 'little', signed=True)
+        weights[base + 700 * 2:base + 700 * 2 + 2] = \
+            (1).to_bytes(2, 'little', signed=True)
+    for w in range(len(weights) // 4):
+        wgt_put(dut, w, int.from_bytes(weights[w * 4:w * 4 + 4], 'little'))
+
+    _passthrough_params(dut, out_c)
+    dut.ppu_mode.value = 3
+    dut.ppu_bias_en.value = 0
+    dut.ppu_zp_en.value = 0
+    dut.cfg_int16.value = 1
+    set_cfg(dut, in_c=in_c, out_c=out_c, kh=1, kw=1,
+            out_h=1, out_w=out_w, in_h=1, in_w=out_w,
+            op_type=0, int16=True)
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    assert await wait_done(dut, timeout=200000), "narrow-group conv timed out"
+    for px, expected in enumerate((5, 9)):
+        for ch in range(out_c):
+            word = read_sram_word(dut, 'act', px * (out_c // 2) + ch // 2)
+            got = unpack_i16(word, ch & 1)
+            assert got == expected, \
+                f"pixel {px} channel {ch}: got {got}, expected {expected}"

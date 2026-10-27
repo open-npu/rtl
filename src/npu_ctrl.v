@@ -50,6 +50,7 @@ module npu_ctrl #(
     input  wire         compute_done,    // Compute done
     input  wire         oc_group_done,   // Compute finished an oc_group (request weight reload)
     input  wire [15:0]  oc_group_idx,    // Current oc_group index from compute
+    input  wire [15:0]  wgt_k_start,     // First K index for a sliced row-group reload
     output reg          wgt_reload_done, // Weight reload for next oc_group complete
 
     // ─── DMA Bank Select (explicit, replaces address compare in npu_top) ───
@@ -161,6 +162,24 @@ module npu_ctrl #(
 
     // Weight words = wgt_size / 4 (32-bit to handle large models)
     wire [31:0] wgt_words = cfg_dma_wgt_size >> 2;
+    wire        wgt_k_slice = cfg_wgt_layout && cfg_dma_wgt_per_oc[31]
+                            && (cfg_layer_mode[3:0] == 4'd0
+                                || cfg_layer_mode[3:0] == 4'd2);
+    wire [31:0] wgt_group_stride = {1'b0, cfg_dma_wgt_per_oc[30:0]};
+    wire [31:0] dense_k_elems = {24'd0, cfg_kernel_h}
+                               * {24'd0, cfg_kernel_w}
+                               * {16'd0, cfg_in_c};
+    wire [31:0] dense_k_bytes = dense_k_elems << (cfg_int16 ? 1 : 0);
+    wire [31:0] wgt_capacity_bytes = WGT_DEPTH << 2;
+    wire [6:0] row_dense_grp =
+        ((dense_k_bytes << 6) <= wgt_capacity_bytes) ? 7'd64 :
+        ((dense_k_bytes << 5) <= wgt_capacity_bytes) ? 7'd32 :
+        ((dense_k_bytes << 4) <= wgt_capacity_bytes) ? 7'd16 :
+        ((dense_k_bytes << 3) <= wgt_capacity_bytes) ? 7'd8  :
+        ((dense_k_bytes << 2) <= wgt_capacity_bytes) ? 7'd4  :
+        ((dense_k_bytes << 1) <= wgt_capacity_bytes) ? 7'd2  :
+        ( dense_k_bytes       <= wgt_capacity_bytes) ? 7'd1  : 7'd0;
+    wire [6:0] row_ctrl_group = wgt_k_slice ? 7'd64 : row_dense_grp;
 
     // Input words = in_size / 4
     wire [15:0] in_words = cfg_dma_in_size[17:2];
@@ -185,10 +204,49 @@ module npu_ctrl #(
                                 : (swap_next ? OFM_DEPTH : IFM_DEPTH);
     wire [31:0] ofm_cap = db_en ? {16'd0, ofm_half_chk}
                                 : (swap_next ? IFM_DEPTH : OFM_DEPTH);
+    wire [15:0] row_ks_cap = cfg_int16 ? (WGT_DEPTH / 32)
+                                        : (WGT_DEPTH / 16);
+    wire [31:0] row_k_rem = dense_k_elems - {16'd0, wgt_k_start};
+    wire [15:0] row_ks_len = (row_k_rem > {16'd0, row_ks_cap})
+                           ? row_ks_cap : row_k_rem[15:0];
+    wire [15:0] row_group_base_ch = oc_group_idx * {9'd0, row_ctrl_group};
+    wire [15:0] row_group_nch =
+        (cfg_out_c > row_group_base_ch + {9'd0, row_ctrl_group})
+                                                  ? {9'd0, row_ctrl_group}
+                                                  : (cfg_out_c - row_group_base_ch);
+    wire [31:0] row_slice_words = ({16'd0, row_ks_len}
+                                  * {16'd0, row_group_nch}
+                                  * (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
+    wire [31:0] row_group_words = (dense_k_elems
+                                  * {16'd0, row_group_nch}
+                                  * (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
     wire [31:0] initial_wgt_words = dw_stream ? {16'd0, dws_wgt_words}
+                                : wgt_k_slice
+                                  ? ((dense_k_elems > {16'd0, row_ks_cap})
+                                     ? ({16'd0, row_ks_cap} * 32'd64
+                                        * (cfg_int16 ? 32'd2 : 32'd1)) >> 2
+                                     : (dense_k_elems * 32'd64
+                                        * (cfg_int16 ? 32'd2 : 32'd1)) >> 2)
                                 : ((cfg_dma_wgt_per_oc != 0)
-                                   ? cfg_dma_wgt_per_oc : wgt_words);
-    wire [31:0] initial_param_words = param_needs_reload ? 32'd64
+                                   ? ((cfg_wgt_layout
+                                       && (cfg_layer_mode[3:0] == 4'd0
+                                           || cfg_layer_mode[3:0] == 4'd2))
+                                      ? ((dense_k_elems
+                                          * ((cfg_out_c < {9'd0, row_ctrl_group})
+                                             ? cfg_out_c
+                                             : {9'd0, row_ctrl_group})
+                                          * (cfg_int16 ? 32'd2 : 32'd1)) >> 2)
+                                      : wgt_group_stride)
+                                   : wgt_words);
+    // Dense row groups are 64/32/16/8/... channels depending on what fits
+    // WGT SRAM. The old fixed 16-channel block remains for non-row paths.
+    wire        row_param_grp = cfg_wgt_layout && !dw_stream
+                             && (cfg_layer_mode[3:0] == 4'd0
+                                 || cfg_layer_mode[3:0] == 4'd2);
+    wire [15:0] param_grp_words = row_param_grp
+                                ? ({9'd0, row_ctrl_group} << 2) : 16'd64;
+    wire [31:0] param_grp_bytes = {16'd0, param_grp_words} << 2;
+    wire [31:0] initial_param_words = param_needs_reload ? {16'd0, param_grp_words}
                                                          : {16'd0, param_words};
     wire [31:0] output_tile_words = (({16'd0, cfg_tile_h}
                                     * {16'd0, cfg_tile_w}
@@ -248,27 +306,31 @@ module npu_ctrl #(
                             && ((cfg_dma_in_size >> 2) > IFM_DEPTH);
     wire        slice_stream = dw_stream | pool_stream;
     // ctrl-side replica of compute's grp8_mode (16-ch per-oc block > WGT SRAM)
-    wire [31:0] kd_bytes    = ({24'd0, cfg_kernel_h} * {24'd0, cfg_kernel_w}
-                               * {16'd0, cfg_in_c}) << (cfg_int16 ? 1 : 0);
+    wire [31:0] kd_bytes    = dense_k_bytes;
     wire        grp8_mode   = !cfg_wgt_layout && (cfg_dma_wgt_per_oc != 32'd0)
                            && ((kd_bytes << 2) > WGT_DEPTH);
     // 16-channel reload, 8-wide mesh: two compute groups share one DMA.
     // oc_group_idx counts groups of 8, so the block number is idx/2.
     wire        mesh_half   = !cfg_wgt_layout && (cfg_dma_wgt_per_oc != 32'd0)
                            && !grp8_mode && (`ARRAY_SIZE == 8);
-    // The 8x8 mesh is gone. A dense conv runs only on the 64-lane row,
-    // which needs a K-major group and an input channel count that fits
-    // one activation strip. FC and deconv had no other engine.
+    // The 8x8 mesh is gone. Dense conv and FC run on the 64-lane row and
+    // need a K-major group. Conv still requires one spatial tap to fit an
+    // activation strip (in_c <= 1024). FC may be longer: the row slices it.
+    // Deconv had no other engine.
     wire        conv_on_row = cfg_wgt_layout
                            && (cfg_layer_mode[3:0] == 4'd0)
                            && ({16'd0, cfg_in_c} <= 16'd1024)
+                           && (row_dense_grp != 7'd0)
                            && (kd_elems32 != 32'd0);
-    wire        no_engine   = (cfg_layer_mode[3:0] == 4'd2)
-                           || (cfg_layer_mode[3:0] == 4'd6)
+    wire        fc_on_row   = cfg_wgt_layout
+                           && (cfg_layer_mode[3:0] == 4'd2)
+                           && (row_dense_grp != 7'd0)
+                           && (kd_elems32 != 32'd0);
+    wire        no_engine   = (cfg_layer_mode[3:0] == 4'd6)
+                           || ((cfg_layer_mode[3:0] == 4'd2) && !fc_on_row)
                            || ((cfg_layer_mode[3:0] == 4'd0) && !conv_on_row);
     // Guard helpers (evaluated at S_IDLE, see E4-E7 below)
-    wire [31:0] kd_elems32  = {24'd0, cfg_kernel_h} * {24'd0, cfg_kernel_w}
-                              * {16'd0, cfg_in_c};
+    wire [31:0] kd_elems32  = dense_k_elems;
     wire [31:0] pool_cnt32  = {16'd0, cfg_in_h} * {16'd0, cfg_in_w};
     wire        avg_gpool_bad_cnt = (cfg_layer_mode[3:0] == 4'd3)
                                  && cfg_pool_cfg[0] && cfg_pool_cfg[20]
@@ -643,8 +705,8 @@ module npu_ctrl #(
                         end else if (initial_param_words > PARAM_DEPTH) begin
                             hw_error_code <= 4'd9;
                             state <= S_ERROR;
-                        // E10: FC, deconv, and conv that cannot use the row.
-                        //      The 8x8 mesh that used to run them is gone.
+                        // E10: deconv, FC without a K-major group, and conv that
+                        //      cannot use the row. The 8x8 mesh is gone.
                         end else if (no_engine) begin
                             hw_error_code <= 4'd10;
                             state <= S_ERROR;
@@ -671,8 +733,11 @@ module npu_ctrl #(
                         // DW stream: load only group 0's 16-ch weight block
                         if (dw_stream)
                             dma_xfer_len <= dws_wgt_words;
+                        else if (wgt_k_slice)
+                            dma_xfer_len <= initial_wgt_words[15:0];
                         else
-                            dma_xfer_len <= (cfg_dma_wgt_per_oc != 0) ? cfg_dma_wgt_per_oc[15:0] : wgt_words;
+                            dma_xfer_len <= (cfg_dma_wgt_per_oc != 0)
+                                          ? wgt_group_stride[15:0] : wgt_words;
                         dma_sram_sel  <= 2'd0;  // weight bank
                         // Clear 2D mode — weight is contiguous 1D transfer
                         dma_row_len   <= 16'd0;
@@ -774,7 +839,7 @@ module npu_ctrl #(
                         // (ARRAY_SIZE*4 words); the rest reload per oc_group in
                         // S_RELOAD_PARAM (param SRAM holds only ~768 channels, so
                         // out_c>768 layers like model_e L30 FC must not load all).
-                        dma_xfer_len  <= param_needs_reload ? 16'd64 : param_words;
+                        dma_xfer_len  <= param_needs_reload ? param_grp_words : param_words;
                         // Clear 2D mode — param is contiguous 1D transfer
                         dma_row_len   <= 16'd0;
                         dma_row_count <= 16'd0;
@@ -927,6 +992,10 @@ module npu_ctrl #(
                             state <= S_DWS_RELOAD_ACT;
                         end else if (oc_group_done && cfg_dma_wgt_per_oc != 0) begin
                             state <= S_RELOAD_WGT;
+                        end else if (oc_group_done && param_needs_reload) begin
+                            // Weights already resident; this group still needs
+                            // its own parameter block.
+                            state <= S_RELOAD_PARAM;
                         end
 
                         // ─── Compute done (final tile) ───
@@ -1079,9 +1148,17 @@ module npu_ctrl #(
                         dma_sram_sel  <= 2'd0;  // weight bank
                         dma_ext_addr  <= cfg_dma_wgt_addr
                             + (mesh_half ? (oc_group_idx >> 1) : oc_group_idx)
-                              * cfg_dma_wgt_per_oc * 4;
+                              * wgt_group_stride * 4
+                            + (wgt_k_slice
+                               ? ({16'd0, wgt_k_start}
+                                  * {16'd0, row_group_nch}
+                                  * (cfg_int16 ? 32'd2 : 32'd1))
+                               : 32'd0);
                         dma_sram_addr <= 16'd0;  // always load to SRAM[0]
-                        dma_xfer_len  <= cfg_dma_wgt_per_oc[15:0];
+                        dma_xfer_len  <= wgt_k_slice ? row_slice_words[15:0]
+                                       : (cfg_wgt_layout && row_param_grp)
+                                         ? row_group_words[15:0]
+                                         : wgt_group_stride[15:0];
                         state         <= S_WAIT_RELOAD_WGT;
                     end
                 end
@@ -1094,7 +1171,8 @@ module npu_ctrl #(
                         // param SRAM (out_c > ~768). If params fit, skip straight to
                         // done (keeps per-OC weight-reload layers like model_d L13
                         // on the original single-load param path — no regression).
-                        if (param_needs_reload)
+                        if (param_needs_reload
+                                && (!wgt_k_slice || wgt_k_start == 16'd0))
                             state <= S_RELOAD_PARAM;
                         else begin
                             wgt_reload_done <= 1'b1;
@@ -1107,10 +1185,11 @@ module npu_ctrl #(
                 end
 
                 // ─── Per-oc_group param reload ───
-                // DDR layout: 4 words per channel, 16 channels per reload =
-                // 64 words (256 bytes). An 8-wide mesh shares that block
-                // across two groups, so the block number is oc_group_idx/2.
-                // Compute reads the upper half at param_base, not SRAM[0].
+                // 4 words per channel. The row reloads 64 channels (256 words,
+                // 1024 bytes). The depthwise stream keeps the 16-channel block.
+                // An 8-wide mesh shares that block across two groups, so the
+                // block number is oc_group_idx/2. Reloaded params land at
+                // SRAM[0]; compute reads them with param_base 0.
                 S_RELOAD_PARAM: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;
@@ -1119,9 +1198,10 @@ module npu_ctrl #(
                         dma_dir       <= 1'b0;  // load
                         dma_sram_sel  <= 2'd2;  // param bank
                         dma_ext_addr  <= cfg_dma_param_addr
-                            + (mesh_half ? (oc_group_idx >> 1) : oc_group_idx) * 32'd256;
+                            + (row_param_grp ? {16'd0, oc_group_idx} * param_grp_bytes
+                               : (mesh_half ? (oc_group_idx >> 1) : oc_group_idx) * 32'd256);
                         dma_sram_addr <= 16'd0;  // always load to param SRAM[0]
-                        dma_xfer_len  <= 16'd64;  // 16 channels * 4 words
+                        dma_xfer_len  <= param_grp_words;
                         dma_row_len   <= 16'd0;
                         dma_row_count <= 16'd0;
                         dma_out_stride<= 32'd0;

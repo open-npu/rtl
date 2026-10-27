@@ -120,6 +120,7 @@ module npu_top #(
     wire        compute_start, compute_done;
     wire        oc_group_done, wgt_reload_done;
     wire [15:0] oc_group_idx;
+    wire [15:0] wgt_k_start;
     wire [1:0]  dma_sram_sel;
     wire        act_role_swap;
 
@@ -269,6 +270,7 @@ module npu_top #(
         .compute_done   (compute_done),
         .oc_group_done  (oc_group_done),
         .oc_group_idx   (oc_group_idx),
+        .wgt_k_start    (wgt_k_start),
         .wgt_reload_done(wgt_reload_done),
         .dma_sram_sel   (dma_sram_sel),
         .act_role_swap  (act_role_swap),
@@ -787,6 +789,7 @@ module npu_top #(
         .tile_done          (tile_done),
         .oc_group_done      (oc_group_done),
         .oc_group_out       (oc_group_idx),
+        .wgt_k_start        (wgt_k_start),
         .wgt_reload_done    (wgt_reload_done),
         .cfg_wgt_per_oc     (reg_dma_wgt_per_oc),
         .cfg_wgt_layout     (reg_wgt_layout[0]),
