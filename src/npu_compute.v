@@ -269,10 +269,6 @@ module npu_compute #(
 
     // ─── PPU state ───
     reg [15:0]                  ppu_wait_cnt;   // PPU flush wait counter
-    reg signed [ACC_W-1:0]      last_ppu_acc /* verilator public */;  // Last PPU acc (debug)
-    reg [15:0]                  last_drain_col /* verilator public */; // Channel index in OC group
-    reg [15:0]                  last_tile_x /* verilator public */;
-    reg [15:0]                  last_tile_y /* verilator public */;
     // ─── Param read state ───
     reg [2:0]  param_word_idx;
     reg [31:0] param_buf [0:3];
@@ -315,16 +311,6 @@ module npu_compute #(
     reg [15:0] kw_eff;                         // Effective kernel width: (kw-1)*dw+1
 
     reg [15:0] px_remaining;                     // pixels left in this oc_group/tile
-`ifdef DBG_DOTBUF
-    integer dbg_fh;
-    integer dbg_trace_fh;
-    reg signed [ACC_W-1:0] dbg_prev_db9;
-    initial begin
-        dbg_fh = $fopen("/tmp/rtl_dotbuf.log", "w");
-        dbg_trace_fh = $fopen("/tmp/rtl_db9_trace.log", "w");
-        dbg_prev_db9 = 0;
-    end
-`endif
 
     // ─── Pooling state ───
     wire        pool_mode     = cfg_pool_cfg[0];      // 0=Max, 1=Avg
@@ -1329,10 +1315,6 @@ module npu_compute #(
                     wgt_base <= (oc_group * ARRAY_SIZE_16 * k_depth) >> 1;
                 else
                     wgt_base <= (oc_group * ARRAY_SIZE_16 * k_depth) >> 2;
-`ifdef DBG_DOTBUF
-                $fwrite(dbg_fh, "[OC_SETUP] oc_group=%0d k_depth=%0d wgt_base=%0d param_base=%0d\n",
-                        oc_group, k_depth, (oc_group * ARRAY_SIZE_16 * k_depth) >> 1, oc_group * ARRAY_SIZE_16 * 4);
-`endif
                 // Param base: 4 words per channel, ARRAY_SIZE channels per group.
                 // When per-oc PARAM reload is active (weights reload per oc_group
                 // AND out_c exceeds the param SRAM capacity of SPAD_KB*16/4
@@ -2414,12 +2396,6 @@ module npu_compute #(
                                  $time, pool_ch, pool_oh, pool_ow, pool_fh, pool_fw,
                                  ih_s, iw_s, is_oob, tile_in_w);
                     `endif
-`ifdef DBG_DOTBUF
-                    if (pool_ch == 33 && pool_oh == 0 && pool_ow == 0 && tile_y == 0 && tile_x == 0)
-                        $fwrite(dbg_fh, "[POOL_RD] t=%0d fh=%0d fw=%0d ih=%0d iw=%0d oob=%0d rd_ph=%0d\n",
-                                $time, pool_fh, pool_fw, ih_s, iw_s, is_oob, pool_rd_phase);
-`endif
-
                     if (is_oob) begin
                         // Out-of-bounds: skip, advance window position
                         if ({4'd0, pool_fw} + 1 >= pool_kw) begin
@@ -2497,12 +2473,6 @@ module npu_compute #(
                         pool_acc <= pool_val;
                 end
                 pool_count <= pool_count + 1;
-`ifdef DBG_DOTBUF
-                if (pool_ch == 33)
-                    $fwrite(dbg_fh, "[POOL_ACC] t=%0d fh=%0d fw=%0d pix_oh=%0d pix_ow=%0d val=%0d acc=%0d cnt=%0d kw=%0d kh=%0d\n",
-                            $time, pool_fh, pool_fw, pool_oh, pool_ow, pool_val, pool_acc, pool_count, pool_kw, pool_kh);
-`endif
-
                 // Advance window position
                 if ({4'd0, pool_fw} + 1 >= pool_kw) begin
                     pool_fw <= 0;
@@ -3611,20 +3581,5 @@ module npu_compute #(
 
         end
     end
-
-`ifdef DBG_DOTBUF
-// Independent tracker: log ALL dot_buf[9] changes
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        dbg_prev_db9 <= 0;
-    end else begin
-        if (dbg_prev_db9 != dot_buf[9]) begin
-            $fwrite(dbg_trace_fh, "[CHG9] t=%0d dot_buf[9]=%0d (0x%h) state=%0d tile(%0d,%0d) sp(%0d,%0d) drain=%0d pass=%0d\n",
-                    $time, dot_buf[9], dot_buf[9], state, tile_y, tile_x, sp_oh, sp_ow, drain_col, k_pass);
-            dbg_prev_db9 <= dot_buf[9];
-        end
-    end
-end
-`endif
 
 endmodule

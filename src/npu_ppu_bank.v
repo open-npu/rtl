@@ -26,7 +26,7 @@ module npu_ppu_bank #(
     input  wire                         int16_mode,
     input  wire signed [ZP_W-1:0]       clamp_max,
 
-    // Wide feed (Conv S_PPU_STREAM)
+    // Wide feed from the 64-lane row accumulator
     input  wire [ACC_W*N-1:0]           acc_wide,
     input  wire [N-1:0]                 valid_wide,
     input  wire [ACC_W*N-1:0]           bias_wide,

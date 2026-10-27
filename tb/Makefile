@@ -87,7 +87,7 @@ ifeq ($(SIM),verilator)
 COMPILE_ARGS = +incdir+$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH) \
                -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT
 ifdef DEBUG
-COMPILE_ARGS += +define+DBG_DOTBUF
+COMPILE_ARGS += +define+DBG_ROW
 endif
 ifdef VCD_TRACE
 COMPILE_ARGS += +define+VCD_TRACE
