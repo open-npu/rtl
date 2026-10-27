@@ -817,13 +817,13 @@ module npu_top #(
     assign act_rd_mux = act_rd_ofm ? ofm_b_rdata_log : ifm_b_rdata;
 
 `ifdef VCD_TRACE
-// Minimal VCD: 6 scalar signals only
+// Minimal VCD: selected row-engine signals only
 initial begin
     $dumpfile("/tmp/npu_nano.vcd");
     $dumpvars(0, npu_top.u_compute.act_wr_data);
     $dumpvars(0, npu_top.u_compute.ppu_acc_in);
     $dumpvars(0, npu_top.u_compute.ppu_out_data);
-    $dumpvars(0, npu_top.u_compute.drain_col);
+    $dumpvars(0, npu_top.u_compute.mac1d_fire);
     $dumpvars(0, npu_top.u_compute.sp_oh);
     $dumpvars(0, npu_top.u_compute.tile_x);
 end

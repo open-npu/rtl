@@ -61,19 +61,6 @@ async def test_model_b_l0_conv_int16(dut):
     dut._log.info(f"  DDR[0:4]:    {' '.join(f'{got[i]:08X}' for i in range(min(4, nw)))}")
     dut._log.info(f"  GOLDEN[0:4]: {' '.join(f'{ref[i]:08X}' for i in range(min(4, len(ref))))}")
 
-    # Debug: read last PPU accumulator (captured during compute)
-    try:
-        lpa = int(dut.u_compute.last_ppu_acc.value)
-        ldc = int(dut.u_compute.last_drain_col.value)
-        ltx = int(dut.u_compute.last_tile_x.value)
-        lty = int(dut.u_compute.last_tile_y.value)
-        lpa_s = lpa & 0xFFFFFFFFFF
-        if lpa_s & 0x8000000000: lpa_s = lpa_s | ~0xFFFFFFFFFF
-        ch = ldc + 16  # approximate - need oc_group too
-        dut._log.info(f"  LAST_PPU: tile({lty},{ltx}) ch~{ldc} acc={lpa_s} (0x{lpa_s & 0xFFFFFFFFFF:010x})")
-    except Exception as e:
-        dut._log.info(f"  Cannot read RTL internals: {e}")
-
     # Show non-zero words in DDR
     nz_ddr = np.where(got != 0)[0]
     nz_ref = np.where(ref != 0)[0] if len(ref) == nw else []

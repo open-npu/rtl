@@ -2200,7 +2200,11 @@ async def test_resize_bilinear_3x3to5x5(dut):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Deconv (Transposed Convolution) helpers and tests
+# Retired deconv coverage
+#
+# The row-only controller rejects op_type=6 with E10. Keep these vectors as
+# archived compatibility fixtures, but do not present them as supported RTL
+# regressions.
 # ═══════════════════════════════════════════════════════════════════════
 
 
@@ -2257,7 +2261,7 @@ async def program_deconv_layer(wb, meta, data):
 
 # FIXED (2026-08-18): deconv bit-rot root cause was stale conv_fh/fw/ch in
 # S_SPATIAL_SETUP precompute (spatial_setup_blk reassigns them later, NBA).
-@cocotb.test()
+@cocotb.test(skip=True)
 async def test_deconv_2x2_stride2(dut):
     """Deconv 2x2 stride-2: 3x3x4 -> 6x6x4, INT8."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
@@ -2304,7 +2308,7 @@ async def test_deconv_2x2_stride2(dut):
 
 # FIXED (2026-08-18): deconv bit-rot root cause was stale conv_fh/fw/ch in
 # S_SPATIAL_SETUP precompute (spatial_setup_blk reassigns them later, NBA).
-@cocotb.test()
+@cocotb.test(skip=True)
 async def test_deconv_3x3_stride2(dut):
     """Deconv 3x3 stride-2 with padding: 4x4x4 -> 7x7x4, INT8."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
@@ -2351,7 +2355,7 @@ async def test_deconv_3x3_stride2(dut):
 
 # FIXED (2026-08-18): deconv bit-rot root cause was stale conv_fh/fw/ch in
 # S_SPATIAL_SETUP precompute (spatial_setup_blk reassigns them later, NBA).
-@cocotb.test()
+@cocotb.test(skip=True)
 async def test_deconv_int16(dut):
     """Deconv 2x2 stride-2: 3x3x4 -> 6x6x4, INT16."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
@@ -2398,7 +2402,7 @@ async def test_deconv_int16(dut):
 
 # FIXED (2026-08-18): deconv bit-rot root cause was stale conv_fh/fw/ch in
 # S_SPATIAL_SETUP precompute (spatial_setup_blk reassigns them later, NBA).
-@cocotb.test()
+@cocotb.test(skip=True)
 async def test_deconv_multichannel(dut):
     """Deconv multichannel, including tails sharing a 32-bit output word."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
