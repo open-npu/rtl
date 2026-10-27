@@ -125,7 +125,7 @@ def gen_random_layer_config(rng):
 
     Returns dict with all parameters needed to program CSR.
     Constraints:
-      - out_c must be multiple of ARRAY_SIZE (16) for systolic
+      - out_c uses word-aligned channel counts
       - in_c must be ≥ 1
       - Spatial dims must be ≥ 1
       - wgt_size and in_size must fit in SRAM

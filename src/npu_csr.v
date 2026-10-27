@@ -198,8 +198,8 @@ module npu_csr #(
         HAS_INT16[0],                    // [24]
         SPAD_KB_P[7:0],                  // [23:16] SPAD_SIZE_4KB (units of 4KB)
         dw_ch_log2,                      // [15:12]
-        4'd1,                            // [11:8] NUM_ARRAYS = 1
-        ARRAY_SZ[7:0]                    // [7:0]
+        4'd1,                            // [11:8] one 64-lane MAC row
+        8'd64                            // [7:0] dense MAC lanes (legacy ARRAY_SIZE field)
     };
 
     // Serial and vendor (hardcoded for open-source)

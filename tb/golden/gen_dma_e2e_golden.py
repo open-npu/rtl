@@ -888,7 +888,7 @@ def gen_conv2d_test(in_h=8, in_w=8, in_c=8, out_c=4, kernel_h=3, kernel_w=3,
                     stride=1, pad=1, relu6=True, int16_mode=False, seed=500):
     """Generate one Conv2D test layer (weights + input + params + expected output).
 
-    Conv2D uses op_type=0, dispatched to systolic array with arbitrary spatial dims.
+    Conv2D uses op_type=0 and the 64-lane MAC row.
     Weight layout: [out_c][kh][kw][in_c] packed with pack_conv_weights_i8/i16.
 
     Returns (meta, raw_data) dict with packed uint32 word arrays.
@@ -989,7 +989,7 @@ def gen_fc_test(in_c=8, out_c=4, relu6=True, int16_mode=False, seed=400):
     """Generate one FC test layer (weights + input + params + expected output).
 
     FC is Conv1x1 with in_h=in_w=1, kernel_h=kernel_w=1, op_type=2.
-    RTL dispatches to the same systolic array path as Conv2D.
+    RTL dispatches to the same 64-lane row path as Conv2D.
     Weight layout: [out_c][1][1][in_c] packed with pack_conv_weights_i8/i16.
 
     Returns (meta, raw_data) dict with packed uint32 word arrays.
@@ -1044,14 +1044,13 @@ def gen_fc_test(in_c=8, out_c=4, relu6=True, int16_mode=False, seed=400):
     out = ref_postproc(acc, M_arr, S_arr, bias_arr, zp_arr,
                        relu6=relu6, clamp_min=clamp_min, clamp_max=clamp_max)
 
-    # Pack data — FC uses Conv2D weight packing (same systolic path), which
-    # is also why it stays OC-major: FC never reaches the 64-lane row.
+    # FC is a 1x1 dense convolution and uses the row's K-major layout.
     if int16_mode:
-        wgt_words = pack_conv_weights_i16(weight_ohwi, out_c, in_c, OC_MAJOR)
+        wgt_words = pack_conv_weights_i16(weight_ohwi, out_c, in_c, K_MAJOR)
         input_words = pack_i16_to_words(input_nhwc)
         output_words = pack_i16_to_words(out)
     else:
-        wgt_words = pack_conv_weights_i8(weight_ohwi, out_c, in_c, OC_MAJOR)
+        wgt_words = pack_conv_weights_i8(weight_ohwi, out_c, in_c, K_MAJOR)
         input_words = pack_i8_to_words(input_nhwc)
         output_words = pack_i8_to_words(out)
     param_words = pack_params_for_sram(M_arr, S_arr, bias_arr, zp_arr, out_c)
@@ -1455,7 +1454,7 @@ def gen_deconv_test(in_h=4, in_w=4, in_c=4, out_c=4,
     out = ref_postproc(acc, M_arr, S_arr, bias_arr, zp_arr,
                        relu6=False, clamp_min=clamp_min, clamp_max=clamp_max)
 
-    # Pack data — deconv runs on the systolic path only, so OC-major.
+    # Deconv remains OC-major but is rejected by the row-only RTL.
     if int16_mode:
         input_words = pack_i16_to_words(input_nhwc)
         wgt_words = pack_conv_weights_i16(weight_ohwi, out_c, k_depth, OC_MAJOR)

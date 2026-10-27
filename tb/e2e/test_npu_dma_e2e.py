@@ -175,10 +175,10 @@ def load_golden(mode='int8'):
 async def program_wgt_layout(wb, meta):
     """Tell the engine how the weight blob is laid out (CSR 0x14C).
 
-    The generators emit K-major for conv and depthwise — the ops the 64-lane
-    row runs — and OC-major for FC and deconv, which stay on the array.
+    The generators emit K-major for conv, depthwise, and FC—the operators
+    supported by the 64-lane row. Deconv remains legacy OC-major.
     """
-    default_layout = 1 if meta['op_type'] in (0, 1) else 0
+    default_layout = 1 if meta['op_type'] in (0, 1, 2) else 0
     await wb.write(0x14C, meta.get('wgt_layout', default_layout))
 
 
@@ -2409,7 +2409,7 @@ async def test_deconv_multichannel(dut):
     cocotb.start_soon(mem.run())
 
     cases = [
-        (16, False, 203),  # full mesh groups
+        (16, False, 203),  # full depthwise groups
         (9,  False, 204),  # INT8 tail uses one byte of the shared word
         (9,  True,  205),  # INT16 tail uses two bytes of the shared word
     ]

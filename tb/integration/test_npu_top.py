@@ -211,7 +211,7 @@ async def test_irq_generation(dut):
     await wb.write(0x000, 0x01)
 
     # Controller will go through states quickly with zero-length,
-    # but compute_done depends on systolic output valid (which won't fire).
+    # but compute_done depends on the configured datapath producing output.
     # For this V1 integration test, we verify the start was accepted.
     # Wait a few cycles for the start to propagate
     for _ in range(5):

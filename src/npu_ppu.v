@@ -36,7 +36,7 @@ module npu_ppu #(
     input  wire signed [ZP_W-1:0]       clamp_max,  // ReLU6 upper bound (from layer descriptor)
 
     // ─── Input ───
-    input  wire signed [ACC_W-1:0]      acc_in,     // From systolic array
+    input  wire signed [ACC_W-1:0]      acc_in,     // From compute accumulator
     input  wire                         in_valid,
 
     // ─── Per-channel parameters (provided by controller) ───

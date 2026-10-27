@@ -1,4 +1,4 @@
-"""MODEL_B utilization on the 64-MAC row or the 8x8 mesh.
+"""MODEL_B utilization on the 64-MAC row and 8-lane depthwise bank.
 
 Every conv and depthwise layer is included. The full feature map does not
 fit in SRAM, so each distinct tile geometry is simulated once and counted
@@ -6,12 +6,10 @@ once per spatial tile of that layer (the scheduler reloads each tile).
 The 12 Add layers are not MAC layers.
 
     useful = mac1d_lanes on the row
-           = nonzero K-lanes x live OC columns on mesh sa_act_valid
            = nonzero DW lanes on dw_in_valid_w
     peak   = cycles x 64
 
     make DUT=npu_compute_tb MODULE=integration.test_array_util SIM_BUILD=sim_build_row
-    make DUT=npu_compute_tb MODULE=integration.test_array_util SIM_BUILD=sim_build_mesh FORCE_MESH=1
 """
 
 import json
@@ -23,7 +21,7 @@ from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge
 
 MAC_N = 64
-MESH_N = 8
+DW_N = 8
 META = os.environ.get(
     "UTIL_META",
     "/data/sam/open-npu/rtl/tb/golden/golden_dma_e2e/model_b_int8/metadata.json",
@@ -67,13 +65,13 @@ def wr_param(dut, addr, data):
     dut.u_sram_param.mem[addr].value = data
 
 
-def mesh_dw_useful(dut):
+def dw_useful(dut):
     valid = int(dut.u_compute.dw_in_valid_w.value)
     if valid == 0:
         return 0
     data = int(dut.u_compute.dw_in_data_w.value)
     n = 0
-    for i in range(MESH_N):
+    for i in range(DW_N):
         if (valid >> i) & 1:
             lane = (data >> (16 * i)) & 0xFFFF
             if lane & 0x8000:
@@ -129,7 +127,7 @@ async def run_layer(dut, op, in_h, in_w, in_c, out_h, out_w, out_c,
     dut.cfg_tile_num_w.value = 1
     dut.cfg_act_base.value = 0
     dut.cfg_out_base.value = 0
-    # The layout bit is what routes a layer to the 64-lane row, so a
+    # K-major layout routes dense layers to the 64-lane row.
     dut.cfg_wgt_layout.value = 1
     await RisingEdge(dut.clk)
 
@@ -146,7 +144,7 @@ async def run_layer(dut, op, in_h, in_w, in_c, out_h, out_w, out_c,
         if int(dut.u_compute.mac1d_fire.value) == 1:
             useful += int(dut.u_compute.mac1d_lanes.value)
         if int(dut.u_compute.dw_in_valid_w.value) != 0:
-            useful += mesh_dw_useful(dut)
+            useful += dw_useful(dut)
         if dut.done.value == 1:
             break
     assert cycles < limit, "compute never asserted done"
@@ -159,14 +157,12 @@ async def test_array_utilization(dut):
     shapes = model_a_shapes()
     total_cyc = 0
     total_useful = 0
-    engine = None
+    engine = "row"
     dut._log.info(f"{os.path.basename(os.path.dirname(META))} tile x count   cyc_1tile  useful_1tile  util")
     for key, (nt, ids) in shapes.items():
         op, ih, iw, ic, oh, ow, oc, k, stride, pad = key
         cycles, useful = await run_layer(
             dut, op, ih, iw, ic, oh, ow, oc, k, stride, pad)
-        if engine is None and op == 0:
-            engine = "row" if int(dut.u_compute.use_row.value) else "mesh"
         peak = cycles * MAC_N
         kind = "dw" if op == 1 else "conv"
         dut._log.info(

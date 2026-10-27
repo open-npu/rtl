@@ -3,11 +3,12 @@
 # Pass B: logic mapping with SRAM modules blackboxed (measures true logic)
 
 read_verilog -sv -DSYNTHESIS -I../include -DACC_WIDTH=44 \
-    ../src/npu_pe.v \
-    ../src/npu_systolic.v \
     ../src/npu_sram.v \
+    ../src/npu_sram_wide.v \
     ../src/npu_ppu.v \
+    ../src/npu_ppu_bank.v \
     ../src/npu_dw_conv.v \
+    ../src/npu_dw_bank.v \
     ../src/npu_csr.v \
     ../src/npu_dma.v \
     ../src/npu_compute.v \

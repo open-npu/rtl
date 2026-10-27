@@ -6,9 +6,11 @@
 `ifndef NPU_DEFINES_VH
 `define NPU_DEFINES_VH
 
-// ─── Array configuration ───
+// ─── Compute-lane configuration ───
+// ARRAY_SIZE is retained as a build-option compatibility alias. It now sets
+// only the depthwise bank width; dense operators always use MAC_LANES.
 `ifndef ARRAY_SIZE
-`define ARRAY_SIZE     8      // Systolic array dimension (N×N); 16 via -DARRAY_SIZE=16
+`define ARRAY_SIZE     8
 `endif
 
 // Physical scratchpad is IFM+OFM+WGT+PARAM = 164KB, not one scaled SPAD_KB.
@@ -35,7 +37,6 @@
 `endif
 
 // ─── Derived parameters ───
-`define NUM_PES        (`ARRAY_SIZE * `ARRAY_SIZE)
 `define DW_CHANNELS    `ARRAY_SIZE
 
 // Depths are 32-bit words. 1KB = 256 words.
