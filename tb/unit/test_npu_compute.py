@@ -56,7 +56,7 @@ async def reset_dut(dut):
     await RisingEdge(dut.clk)
 
 
-async def systolic_ppu_stub(dut):
+async def ppu_stub(dut):
     """Answer the PPU 4 cycles after a wide or scalar feed."""
     ppu_pipeline = []
 
@@ -163,11 +163,11 @@ async def test_start_pulse(dut):
 async def test_weight_load_timing(dut):
     """Conv issues one WGT_LOAD per 64-channel group, then one MAC per K.
 
-    The 8x8 mesh is not on this path, so sa_wgt_valid stays low.
+    Dense convolution uses the 64-lane row path.
     """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
-    cocotb.start_soon(systolic_ppu_stub(dut))
+    cocotb.start_soon(ppu_stub(dut))
 
     ARRAY_SIZE = get_array_size(dut)
     in_c = ARRAY_SIZE
@@ -201,13 +201,13 @@ async def test_weight_load_timing(dut):
 
 @cocotb.test()
 async def test_act_vector_timing(dut):
-    """One pixel issues one MAC per K on the 64-lane row, not a mesh vector.
+    """One pixel issues one MAC per K on the 64-lane row.
 
     Bare npu_compute has no SRAM, so activation values are not checked here.
     """
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
-    cocotb.start_soon(systolic_ppu_stub(dut))
+    cocotb.start_soon(ppu_stub(dut))
 
     ARRAY_SIZE = get_array_size(dut)
     in_c = ARRAY_SIZE
@@ -234,10 +234,10 @@ async def test_act_vector_timing(dut):
 
 @cocotb.test()
 async def test_no_drain_commands(dut):
-    """The row path never issues MODE_DRAIN and does not feed the mesh."""
+    """The row path never issues the retired drain protocol."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
-    cocotb.start_soon(systolic_ppu_stub(dut))
+    cocotb.start_soon(ppu_stub(dut))
 
     ARRAY_SIZE = get_array_size(dut)
     set_cfg_conv2d(dut, in_c=ARRAY_SIZE, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
@@ -265,7 +265,7 @@ async def test_done_pulse(dut):
     """Verify done pulse is asserted at the end of computation."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
-    cocotb.start_soon(systolic_ppu_stub(dut))
+    cocotb.start_soon(ppu_stub(dut))
 
     ARRAY_SIZE = get_array_size(dut)
     set_cfg_conv2d(dut, in_c=ARRAY_SIZE, out_c=ARRAY_SIZE, kh=1, kw=1, out_h=1, out_w=1)
@@ -293,7 +293,7 @@ async def test_oc_tiling(dut):
     """128 output channels is two groups of 64, so two WGT_LOAD commands."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
-    cocotb.start_soon(systolic_ppu_stub(dut))
+    cocotb.start_soon(ppu_stub(dut))
 
     ARRAY_SIZE = get_array_size(dut)
     out_c = 128
@@ -327,7 +327,7 @@ async def test_spatial_tiling(dut):
     """With tile_num_h=2, tile_num_w=2, should process 4 tiles."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
-    cocotb.start_soon(systolic_ppu_stub(dut))
+    cocotb.start_soon(ppu_stub(dut))
 
     ARRAY_SIZE = get_array_size(dut)
 

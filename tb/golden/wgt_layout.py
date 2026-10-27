@@ -1,7 +1,7 @@
 """K-major weight blob helpers shared by the golden generators.
 
 The 64-lane row reads weights K-major so one K index's lane weights arrive in
-a single SRAM beat; the systolic array still reads OC-major. This mirrors
+a single SRAM beat. OC-major remains only for legacy compatibility. This mirrors
 conv_weights_to_blob / dw_weights_to_blob in tools/model_packer.py, but works
 on the flat arrays the generators already build.
 """

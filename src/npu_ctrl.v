@@ -6,7 +6,7 @@
 //   2. Load weights via DMA (ext → weight SRAM)
 //   3. Load input activations via DMA (ext → act SRAM) [skip if fused mid/end]
 //   4. Load per-channel params via DMA (ext → param SRAM)
-//   5. Trigger compute engine (handles systolic/DW + PPU + writeback internally)
+//   5. Trigger compute engine (handles MAC row/DW + PPU + writeback internally)
 //   6. Store output via DMA (act SRAM → ext) [skip if fused start/mid]
 //   7. Signal DONE
 //
@@ -65,7 +65,7 @@ module npu_ctrl #(
     input  wire [31:0]  cfg_dma_in_size,     // in bytes
     input  wire [31:0]  cfg_dma_wgt_size,    // in bytes
     input  wire [31:0]  cfg_dma_wgt_per_oc, // per-oc_group weight words (0=all at once)
-    input  wire         cfg_wgt_layout,     // 0=OC-major (systolic), 1=K-major (64-lane row)
+    input  wire         cfg_wgt_layout,     // 0=legacy OC-major, 1=K-major (64-lane row)
     input  wire [31:0]  cfg_dma_out_size,    // in bytes
     input  wire [31:0]  cfg_tile_in_size,    // per-tile input size (bytes), 0=use full in_size
     input  wire [15:0]  cfg_param_count,     // number of output channels
@@ -305,16 +305,8 @@ module npu_ctrl #(
                             && (cfg_tile_h == 16'd0)
                             && ((cfg_dma_in_size >> 2) > IFM_DEPTH);
     wire        slice_stream = dw_stream | pool_stream;
-    // ctrl-side replica of compute's grp8_mode (16-ch per-oc block > WGT SRAM)
-    wire [31:0] kd_bytes    = dense_k_bytes;
-    wire        grp8_mode   = !cfg_wgt_layout && (cfg_dma_wgt_per_oc != 32'd0)
-                           && ((kd_bytes << 2) > WGT_DEPTH);
-    // 16-channel reload, 8-wide mesh: two compute groups share one DMA.
-    // oc_group_idx counts groups of 8, so the block number is idx/2.
-    wire        mesh_half   = !cfg_wgt_layout && (cfg_dma_wgt_per_oc != 32'd0)
-                           && !grp8_mode && (`ARRAY_SIZE == 8);
-    // The 8x8 mesh is gone. Dense conv and FC run on the 64-lane row and
-    // need a K-major group. Conv still requires one spatial tap to fit an
+    // Dense conv and FC run on the 64-lane row and need a K-major group.
+    // Conv still requires one spatial tap to fit an
     // activation strip (in_c <= 1024). FC may be longer: the row slices it.
     // Deconv had no other engine.
     wire        conv_on_row = cfg_wgt_layout
@@ -654,11 +646,6 @@ module npu_ctrl #(
                         if (slice_stream && ({17'd0, cfg_out_c} * 4 > PARAM_DEPTH)) begin
                             hw_error_code <= 4'd1;
                             state <= S_ERROR;
-                        // E2: 8-ch per-oc sub-groups incompatible with per-oc
-                        //     param reload (reload granularity is 16 ch)
-                        end else if (grp8_mode && ({17'd0, cfg_out_c} * 4 > PARAM_DEPTH)) begin
-                            hw_error_code <= 4'd2;
-                            state <= S_ERROR;
                         // E3: channel slice must fit below the stream output
                         //     region (DW_STREAM_OUT_BASE)
                         end else if (slice_stream && (dws_act_words32 > ifm_cap)) begin
@@ -706,7 +693,7 @@ module npu_ctrl #(
                             hw_error_code <= 4'd9;
                             state <= S_ERROR;
                         // E10: deconv, FC without a K-major group, and conv that
-                        //      cannot use the row. The 8x8 mesh is gone.
+                        //      cannot use the row.
                         end else if (no_engine) begin
                             hw_error_code <= 4'd10;
                             state <= S_ERROR;
@@ -1147,8 +1134,7 @@ module npu_ctrl #(
                         dma_dir       <= 1'b0;  // load
                         dma_sram_sel  <= 2'd0;  // weight bank
                         dma_ext_addr  <= cfg_dma_wgt_addr
-                            + (mesh_half ? (oc_group_idx >> 1) : oc_group_idx)
-                              * wgt_group_stride * 4
+                            + oc_group_idx * wgt_group_stride * 4
                             + (wgt_k_slice
                                ? ({16'd0, wgt_k_start}
                                   * {16'd0, row_group_nch}
@@ -1187,9 +1173,8 @@ module npu_ctrl #(
                 // ─── Per-oc_group param reload ───
                 // 4 words per channel. The row reloads 64 channels (256 words,
                 // 1024 bytes). The depthwise stream keeps the 16-channel block.
-                // An 8-wide mesh shares that block across two groups, so the
-                // block number is oc_group_idx/2. Reloaded params land at
-                // SRAM[0]; compute reads them with param_base 0.
+                // Reloaded params land at SRAM[0]; compute reads them with
+                // param_base 0.
                 S_RELOAD_PARAM: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;
@@ -1199,7 +1184,7 @@ module npu_ctrl #(
                         dma_sram_sel  <= 2'd2;  // param bank
                         dma_ext_addr  <= cfg_dma_param_addr
                             + (row_param_grp ? {16'd0, oc_group_idx} * param_grp_bytes
-                               : (mesh_half ? (oc_group_idx >> 1) : oc_group_idx) * 32'd256);
+                               : {16'd0, oc_group_idx} * 32'd256);
                         dma_sram_addr <= 16'd0;  // always load to param SRAM[0]
                         dma_xfer_len  <= param_grp_words;
                         dma_row_len   <= 16'd0;

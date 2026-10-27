@@ -3,7 +3,7 @@
 #
 # P0.2: Verify clean abort/reset recovery in all controller phases:
 #   1. Abort during weight load (DMA in progress)
-#   2. Abort during compute (systolic/PPU running)
+#   2. Abort during compute (MAC row/PPU running)
 #   3. Abort during store (DMA output in progress)
 #   4. Soft reset during compute (must return to IDLE immediately)
 #   5. Resume after abort (verify next inference runs correctly)

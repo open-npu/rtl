@@ -1,4 +1,4 @@
-// Testbench wrapper for npu_compute — instantiates compute + systolic + PPU + SRAMs
+// Testbench wrapper for npu_compute — instantiates compute, PPU, DW bank, and SRAMs
 // Provides a self-contained datapath for functional testing.
 
 `include "npu_defines.vh"
@@ -7,7 +7,7 @@ module npu_compute_tb #(
     parameter ARRAY_SIZE   = `ARRAY_SIZE,
     parameter ACT_DEPTH    = 32768,  // 128KB: model A L61 DW is 14*14*512
     parameter WGT_DEPTH    = 589824, // model E 3x3 512->512 is 2304KB
-    parameter PARAM_DEPTH  = 8192    // mesh groups param by 16 ch; OC 512 needs ~4K words
+    parameter PARAM_DEPTH  = 8192
 )(
     input  wire clk,
     input  wire rst_n,
@@ -19,7 +19,7 @@ module npu_compute_tb #(
     input  wire        db_prefetch_done,
 
     // Configuration
-    input  wire        cfg_wgt_layout,  // 0=OC-major (systolic), 1=K-major (row)
+    input  wire        cfg_wgt_layout,  // 0=legacy OC-major, 1=K-major row
     input  wire [7:0]  cfg_op_type,
     input  wire [15:0] cfg_in_c,
     input  wire [15:0] cfg_out_h,

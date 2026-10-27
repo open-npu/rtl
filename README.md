@@ -6,9 +6,9 @@ Hardware implementation of the Open-NPU neural network accelerator in synthesiza
 
 ## Architecture
 
-- **16×16 INT8 Systolic Array** — configurable via `ARRAY_SIZE` parameter
-- **Depthwise Convolution Engine** — up to 7×7 kernel with hardware padding
-- **Post-Processing Unit (PPU)** — per-channel requantization (bias → multiply → shift → clamp)
+- **64-lane INT8/INT16 MAC Row** — dense convolution and fully connected layers
+- **8-lane Depthwise Engine** — up to 7×7 kernels, hardware padding, and streamed global kernels
+- **64-lane Post-Processing Bank** — per-channel requantization (bias → multiply → shift → clamp)
 - **Compute Micro-Sequencer** — handles tiling, OC grouping, weight/activation streaming
 - **Wishbone CSR Register File** — configuration and status interface
 - **DMA Controller** — burst transfers between external bus and internal SRAMs
@@ -18,12 +18,13 @@ Hardware implementation of the Open-NPU neural network accelerator in synthesiza
 ```
 src/            Verilog source modules
   npu_top.v         Top-level integration
-  npu_compute.v     Compute micro-sequencer (Conv2D + DW Conv)
-  npu_systolic.v    Systolic array
-  npu_pe.v          Processing element
+  npu_compute.v     Compute micro-sequencer
   npu_ppu.v         Post-processing unit
+  npu_ppu_bank.v    64-lane post-processing bank
   npu_dw_conv.v     Depthwise convolution engine
+  npu_dw_bank.v     8-lane depthwise bank
   npu_sram.v        Dual-port synchronous SRAM
+  npu_sram_wide.v   512-bit compute-port SRAM
   npu_csr.v         CSR register file (Wishbone)
   npu_dma.v         DMA controller
   npu_ctrl.v        Top-level controller FSM
@@ -38,16 +39,14 @@ Prerequisites: [Icarus Verilog](http://iverilog.icarus.com/) and [cocotb](https:
 ```bash
 cd tb
 
-# Run all tests for a specific module
-make DUT=npu_compute_tb ARRAY_SIZE=4 SIM=icarus
+# Run the compute integration suite
+make DUT=npu_compute_tb MODULE=integration.test_npu_compute_tb SIM=icarus
 
 # Run individual module tests
-make DUT=npu_pe SIM=icarus
-make DUT=npu_systolic SIM=icarus
 make DUT=npu_ppu SIM=icarus
 ```
 
-Current status: **81/81 tests passing** (ARRAY_SIZE=4).
+The compute integration suite currently contains 29 tests.
 
 ## Related Repositories
 

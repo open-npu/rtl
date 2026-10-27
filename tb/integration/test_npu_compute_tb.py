@@ -1,8 +1,7 @@
 """
 Cocotb testbench for npu_compute_tb — full datapath integration test.
 
-Uses the wrapper that instantiates: npu_compute + systolic + PPU + SRAMs.
-Tests use ARRAY_SIZE=4 for fast simulation.
+Uses the wrapper that instantiates compute, PPU, depthwise bank, and SRAMs.
 """
 
 import cocotb
@@ -184,7 +183,7 @@ async def test_idle_after_reset(dut):
 
 @cocotb.test()
 async def test_weight_load_4x4(dut):
-    """One 64-lane group issues a single WGT_LOAD and does not feed the mesh."""
+    """One 64-lane group issues a single grouped weight load."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
@@ -251,7 +250,7 @@ async def test_act_vector_single_pulse(dut):
 
 @cocotb.test()
 async def test_psum_vector_per_pixel(dut):
-    """The row keeps the mesh idle and feeds the 64-wide PPU once per pixel."""
+    """The row feeds the 64-wide PPU once per pixel."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
@@ -919,8 +918,8 @@ async def test_dw_conv_3x3_with_padding(dut):
 
 
 @cocotb.test()
-async def test_mesh_dw_padding_uses_input_zero_point(dut):
-    """OC-major mesh DW must pad with the quantized input zero-point."""
+async def test_ocmajor_dw_padding_uses_input_zero_point(dut):
+    """The legacy OC-major DW path pads with the quantized input zero-point."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset_dut(dut)
 
