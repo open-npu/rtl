@@ -8,7 +8,7 @@
 # in the target backend after those buffers are mapped to macros; this script is
 # intentionally a bounded source-list and top-level connectivity check.
 
-read_verilog -sv -nomem2reg -DSYNTHESIS -I../include -DACC_WIDTH=44 \
+read_verilog -sv -nomem2reg -DSYNTHESIS -I../include \
     ../src/npu_sram.v \
     ../src/npu_sram_wide.v \
     ../src/npu_ppu.v \
@@ -23,7 +23,7 @@ read_verilog -sv -nomem2reg -DSYNTHESIS -I../include -DACC_WIDTH=44 \
 # Read the exact production interface with its procedural body preprocessed
 # away, avoiding an independently maintained stub port list.
 read_verilog -sv -nomem2reg -DSYNTHESIS -DNPU_COMPUTE_BLACKBOX \
-    -I../include -DACC_WIDTH=44 \
+    -I../include \
     ../src/npu_compute.v
 
 blackbox npu_sram
