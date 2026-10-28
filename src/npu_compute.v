@@ -385,6 +385,7 @@ module npu_compute #(
     reg [6:0]  ppu_nch;
     reg        row_scatter;
     reg [4:0]  scatter_p;
+    reg [7:0]  scatter_bi;
 
     // ─── weight streamer ───
     // Issues one 64-byte beat per cycle and samples it two cycles later, so
@@ -722,6 +723,7 @@ module npu_compute #(
             ppu_nch <= 7'd1;
             row_scatter <= 1'b0;
             scatter_p <= 5'd0;
+            scatter_bi <= 8'd0;
             row_ks0 <= 16'd0;
             row_ksend <= 16'd0;
             row_ks_reload <= 1'b0;
@@ -1352,6 +1354,7 @@ module npu_compute #(
                         reg [2:0]  psh;
                         reg [3:0]  bsh;
                         reg [12:0] bsz;
+                        reg [31:0] group_byte;
                         integer ps;
                         rem_oc = cfg_out_c - oc_group * {9'd0, row_group_ch};
                         nch = (rem_oc >= {9'd0, row_group_ch})
@@ -1444,10 +1447,16 @@ module npu_compute #(
                         dwl_ph     <= 2'd0;
                         row_ppu    <= 1'b0;
                         row_drain  <= 1'b0;
+                        row_scatter <= 1'b0;
+                        scatter_bi <= 8'd0;
                         row_last   <= 1'b0;
                         pk         <= 0;
-                        pk_pos     <= 0;
-                        pk_addr    <= out_base;
+                        group_byte = oc_group * {25'd0, row_group_ch};
+                        if (cfg_int16)
+                            group_byte = group_byte << 1;
+                        pk_pos     <= group_byte[1:0];
+                        pk_addr    <= out_base
+                                   + group_byte[ACT_ADDR_W+1:2];
                     end
                     if (cfg_wgt_per_oc == 0) begin
                         // Depthwise is tap-major over all channels, so the
@@ -3386,7 +3395,7 @@ module npu_compute #(
                      * {16'd0, cfg_out_c}
                      + {16'd0, oc_group} * {25'd0, row_group_ch};
                 bbase = cfg_int16 ? (elem << 1) : elem;
-                if (ppu_npix > 5'd1) begin
+                if (ppu_npix > 5'd1 || cfg_out_c > {9'd0, row_group_ch}) begin
                     // Lanes are ordered [pixel][channel]. Preserve the NHWC
                     // gaps between OC groups by writing one pixel per cycle.
                     nb = 8'd0;
@@ -3411,6 +3420,7 @@ module npu_compute #(
                     obuf <= bytes;
                     ob_n <= nb;
                     scatter_p <= 5'd0;
+                    scatter_bi <= 8'd0;
                     row_scatter <= 1'b1;
                     row_drain <= 1'b1;
                 end else if (bbase[1:0] == 2'b00 && nbytes[1:0] == 2'b00
@@ -3482,18 +3492,16 @@ module npu_compute #(
                     obuf <= bytes;
                     ob_n <= nb;
                     ob_i <= 8'd0;
-                    // Start this pixel at its own channel offset. Carrying
-                    // pk_addr across pixels packs the group tightly and
-                    // makes the next group overwrite channel 0.
-                    pk      <= 32'd0;
-                    pk_pos  <= 2'd0;
-                    pk_addr <= out_base + bbase[ACT_ADDR_W+1:2];
+                    // pk/pk_pos carry the contiguous NHWC byte stream across
+                    // pixels. S_OC_SETUP initializes them once per group.
                     row_drain <= 1'b1;
                 end
             end else if (row_drain && row_scatter) begin : row_scatter_pack
                 integer sc;
-                reg [31:0] pixel, elem, bbase;
-                reg [8:0] nbytes;
+                reg [31:0] pixel, elem, bbase, byte_addr;
+                reg [8:0] nbytes, left, chunk, mask_n;
+                reg [7:0] byte_off;
+                reg [15:0] src_byte;
                 reg [511:0] wide;
                 pixel = ({16'd0, ppu_oh} * {16'd0, out_tile_w}
                          + {16'd0, ppu_ow}) + {27'd0, scatter_p};
@@ -3502,34 +3510,44 @@ module npu_compute #(
                 bbase = cfg_int16 ? (elem << 1) : elem;
                 nbytes = cfg_int16 ? ({2'd0, ppu_nch} << 1)
                                    : {2'd0, ppu_nch};
+                byte_addr = bbase + {24'd0, scatter_bi};
+                byte_off = {6'd0, byte_addr[1:0]};
+                left = nbytes - {1'b0, scatter_bi};
+                chunk = ((left + {1'b0, byte_off}) > 9'd64)
+                      ? (9'd64 - {1'b0, byte_off}) : left;
+                mask_n = chunk;
+                if (row_last
+                        && (oc_group + 1 >= oc_groups_total)
+                        && (scatter_p + 1 >= ppu_npix)
+                        && ({1'b0, scatter_bi} + chunk >= nbytes))
+                    // The DMA stores whole words. Clear unused bytes in the
+                    // final output word instead of exposing stale SRAM data.
+                    mask_n = chunk
+                           + ((9'd4 - (({1'b0, byte_off} + chunk) & 9'd3))
+                              & 9'd3);
+                src_byte = ({11'd0, scatter_p} * nbytes)
+                         + {8'd0, scatter_bi};
                 wide = 512'd0;
-                if (cfg_int16) begin
-                    for (sc = 0; sc < 32; sc = sc + 1)
-                        if (sc < ppu_nch)
-                            wide[16*sc +: 16]
-                                = obuf[({27'd0, scatter_p} * {25'd0, ppu_nch}
-                                        + sc) * 16 +: 16];
-                end else begin
-                    for (sc = 0; sc < ROW_N; sc = sc + 1)
-                        if (sc < ppu_nch)
-                            wide[8*sc +: 8]
-                                = obuf[({27'd0, scatter_p} * {25'd0, ppu_nch}
-                                        + sc) * 8 +: 8];
-                end
+                for (sc = 0; sc < 64; sc = sc + 1)
+                    if (sc < chunk)
+                        wide[8*(sc + byte_off) +: 8]
+                            = obuf[8*(src_byte + sc) +: 8];
                 act_wr_en   <= 1'b1;
-                act_wr_addr <= out_base + bbase[ACT_ADDR_W+1:2];
+                act_wr_addr <= out_base + byte_addr[ACT_ADDR_W+1:2];
                 act_wr_wide <= wide;
                 act_wr_data <= wide[31:0];
-                act_wr_mask <= (nbytes >= 9'd64)
-                            ? 64'hFFFF_FFFF_FFFF_FFFF
-                            : (64'h1 << nbytes) - 64'h1;
-                if (scatter_p + 1 >= ppu_npix) begin
-                    scatter_p <= 5'd0;
-                    row_scatter <= 1'b0;
-                    row_drain <= 1'b0;
-                    row_ppu <= 1'b0;
+                act_wr_mask <= ((64'h1 << mask_n) - 64'h1) << byte_off;
+                if ({1'b0, scatter_bi} + chunk >= nbytes) begin
+                    scatter_bi <= 8'd0;
+                    if (scatter_p + 1 >= ppu_npix) begin
+                        scatter_p <= 5'd0;
+                        row_scatter <= 1'b0;
+                        row_drain <= 1'b0;
+                        row_ppu <= 1'b0;
+                    end else
+                        scatter_p <= scatter_p + 1'b1;
                 end else
-                    scatter_p <= scatter_p + 1'b1;
+                    scatter_bi <= scatter_bi + chunk[7:0];
             end else if (row_drain) begin : row_pack
                 integer t;
                 reg [1:0] pos;

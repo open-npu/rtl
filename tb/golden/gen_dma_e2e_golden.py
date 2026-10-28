@@ -659,6 +659,8 @@ def save_golden(output_dir, int16_mode=False):
             'k_depth': cfg['k_depth'],
             'relu6': cfg['relu6'],
             'post_ctrl': cfg['post_ctrl'],
+            'wgt_layout': K_MAJOR if cfg['op_type'] in (0, 1, 2) else OC_MAJOR,
+            'wgt_per_oc_words': 0,
             'dma_wgt_size': cfg['dma_wgt_size'],
             'dma_in_size': cfg['dma_in_size'],
             'dma_out_size': cfg['dma_out_size'],

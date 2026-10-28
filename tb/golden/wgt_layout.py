@@ -11,6 +11,17 @@ import numpy as np
 OC_MAJOR = 0
 K_MAJOR = 1
 MAC_LANES = 64
+WGT_SRAM_BYTES = 80 * 1024
+
+
+def row_group_channels(k_depth, elem_bytes):
+    """Match the RTL/compiler 64/32/16/... resident OC-group selection."""
+    if k_depth * elem_bytes > WGT_SRAM_BYTES:
+        raise ValueError("one output-channel K vector exceeds weight SRAM")
+    lanes = MAC_LANES
+    while lanes > 1 and lanes * k_depth * elem_bytes > WGT_SRAM_BYTES:
+        lanes //= 2
+    return lanes
 
 
 def conv_blob(weight_ohwi, out_c, k_depth, layout=K_MAJOR):
@@ -18,8 +29,9 @@ def conv_blob(weight_ohwi, out_c, k_depth, layout=K_MAJOR):
     flat = np.asarray(weight_ohwi).reshape(out_c, k_depth)
     if layout != K_MAJOR:
         return flat.reshape(-1)
-    parts = [flat[g:g + MAC_LANES].T.reshape(-1)
-             for g in range(0, out_c, MAC_LANES)]
+    lanes = row_group_channels(k_depth, flat.dtype.itemsize)
+    parts = [flat[g:g + lanes].T.reshape(-1)
+             for g in range(0, out_c, lanes)]
     return np.concatenate(parts) if parts else flat.reshape(-1)
 
 
