@@ -30,7 +30,7 @@ IVERILOG   = iverilog
 VVP        = vvp
 IV_FLAGS   = -g2012 -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH)
 
-.PHONY: sim sim_verilator syn syn-full syn-area lint clean
+.PHONY: sim sim_verilator syn syn-full syn-area lint golden-check clean
 
 sim: $(SIM_DIR)/$(TOP).vvp
 	$(VVP) $< -lxt2
@@ -56,10 +56,12 @@ sim_verilator:
 
 syn:
 	mkdir -p $(SYN_DIR)
-	cd $(SYN_DIR) && yosys -s npu_synth.ys \
+	cd $(SYN_DIR) && yosys \
+		-DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH) \
+		-s npu_synth.ys \
 		> synth.log 2>&1 \
 		|| { tail -40 synth.log; exit 1; }
-	@echo "structural sanity passed ($(TOP), production interfaces)"
+	@echo "structural sanity passed (npu_top, ARRAY_SIZE=$(ARRAY_SIZE), SPAD_KB=$(SPAD_KB), ACC_WIDTH=$(ACC_WIDTH))"
 
 # Full technology synthesis needs a backend-specific mapping for the compute
 # row memories.  Fail immediately instead of appearing to hang in `proc`.
@@ -75,6 +77,9 @@ lint:
 	verilator --lint-only -Wall -Wno-fatal -I$(INC_DIR) \
 		-DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH) \
 		$(SRCS)
+
+golden-check:
+	python3 $(TB_DIR)/golden/check_weight_metadata.py
 
 # ─── Clean ───
 clean:
