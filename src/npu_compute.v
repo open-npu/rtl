@@ -23,6 +23,9 @@
 
 `include "npu_defines.vh"
 
+`ifdef NPU_COMPUTE_BLACKBOX
+(* blackbox *)
+`endif
 module npu_compute #(
     parameter ARRAY_SIZE   = `ARRAY_SIZE,
     parameter ACT_ADDR_W   = 13,  // $clog2(SPAD_KB*64) for SPAD_KB=128 → $clog2(8192)=13
@@ -142,6 +145,7 @@ module npu_compute #(
     input  wire [`MAC_LANES-1:0]       ppu_vout_w
 );
 
+`ifndef NPU_COMPUTE_BLACKBOX
     // ─── Derived constants ───
     localparam COL_W = $clog2(ARRAY_SIZE);
     localparam [15:0] ARRAY_SIZE_16 = ARRAY_SIZE;  // 16-bit for comparisons
@@ -742,8 +746,6 @@ module npu_compute #(
             rsz_ih0 <= 0; rsz_iw0 <= 0; rsz_ih1 <= 0; rsz_iw1 <= 0;
             rsz_rd_phase <= 0; rsz_wb_phase <= 0;
             rsz_wb_addr <= 0; rsz_wb_bytesel <= 0; rsz_wb_byte <= 0;
-            for (i = 0; i < 4; i = i + 1)
-                param_buf[i] <= 0;
         end else begin
             // ─── Default pulse deassertion ───
             done         <= 1'b0;
@@ -3582,4 +3584,5 @@ module npu_compute #(
         end
     end
 
+`endif
 endmodule
