@@ -8,7 +8,7 @@
 //   - Configurable source address, destination address, transfer length
 //   - Configurable external address stride (load/store)
 //   - Auto-increment SRAM addressing
-//   - Configurable burst length (4/8/16/32 words)
+//   - Held-cycle Wishbone loads (retain bus ownership across words)
 //   - Direction: MEM→SRAM (load) or SRAM→MEM (store)
 //   - Busy/done status signals
 //   - Abort capability
@@ -87,7 +87,7 @@ module npu_dma #(
     // ─── FSM States ───
     localparam S_IDLE    = 3'd0;
     localparam S_LOAD    = 3'd1;  // MEM→SRAM: issue WB read
-    localparam S_LOAD_WR = 3'd2;  // MEM→SRAM: write to SRAM
+    localparam S_LOAD_WR = 3'd2;  // MEM→SRAM: launch next held-cycle beat
     localparam S_STORE_RD= 3'd3;  // SRAM→MEM: read from SRAM
     localparam S_STORE   = 3'd4;  // SRAM→MEM: issue WB write
     localparam S_DONE    = 3'd5;
@@ -97,7 +97,6 @@ module npu_dma #(
     reg [SRAM_ADDR_W-1:0] r_sram_addr;
     reg [15:0]            r_xfer_len;
     reg                   r_dir;
-    reg [DATA_W-1:0]      r_data_buf;  // temporary data buffer
     reg [ADDR_W-1:0]      r_stride;    // latched stride value (row stride in 2D, per-word in 1D)
     // 2D mode: r_row_len = words per row, r_row_count = rows remaining
     // r_row_word_count = words transferred in current row
@@ -140,7 +139,6 @@ module npu_dma #(
             r_sram_addr<= {SRAM_ADDR_W{1'b0}};
             r_xfer_len <= 16'd0;
             r_dir      <= 1'b0;
-            r_data_buf <= {DATA_W{1'b0}};
             r_stride   <= {ADDR_W{1'b0}};
             r_row_len  <= 16'd0;
             r_row_count<= 16'd0;
@@ -201,7 +199,6 @@ module npu_dma #(
                             $display("[DMA_LD] t=%0t xfer=%0d addr=0x%08x sram=%0d", $time, xfer_count, r_ext_addr, r_sram_addr);
                         `endif
                         if (wb_ack_i) begin
-                            r_data_buf <= wb_dat_i;
                             `ifdef NPU_SIM_DEBUG
                             if ((xfer_count < 3 || (mode_2d && r_row_word_count == 16'd0)) && !wb_we_o) begin
                                 if (!dma_ld_opened) begin
@@ -213,46 +210,64 @@ module npu_dma #(
                                         r_row_word_count, r_row_len);
                             end
                             `endif
-                            wb_cyc_o   <= 1'b0;
-                            wb_stb_o   <= 1'b0;
-                            state      <= S_LOAD_WR;
+                            // Commit the accepted beat directly to SRAM. Keep CYC
+                            // asserted between words so the interconnect retains
+                            // ownership, but pulse STB low before the next classic
+                            // beat. This interface has no STALL/request tags, so
+                            // treating a level ACK as multiple outstanding
+                            // responses would duplicate data.
+                            sram_en     <= 1'b1;
+                            sram_we     <= 1'b1;
+                            sram_addr_o <= r_sram_addr;
+                            sram_wdata  <= wb_dat_i;
+                            r_sram_addr <= r_sram_addr + 1;
+                            xfer_count  <= xfer_count + 1;
+                            r_row_word_count <= r_row_word_count + 1;
+
+                            if (mode_2d && (r_row_word_count + 1 >= r_row_len)) begin
+                                if (effective_src_len > r_row_len)
+                                    r_sram_addr <= r_sram_addr + 1
+                                                 + (effective_src_len - r_row_len);
+                                r_ext_addr <= r_row_base + r_stride;
+                                r_row_base <= r_row_base + r_stride;
+                                r_row_count <= r_row_count - 1;
+                                r_row_word_count <= 16'd0;
+                                wb_adr_o <= r_row_base + r_stride;
+                            end else if (mode_2d) begin
+                                r_ext_addr <= r_ext_addr + 32'd4;
+                                wb_adr_o   <= r_ext_addr + 32'd4;
+                            end else begin
+                                r_ext_addr <= r_ext_addr
+                                    + ((r_stride != 0) ? r_stride : 32'd4);
+                                wb_adr_o <= r_ext_addr
+                                    + ((r_stride != 0) ? r_stride : 32'd4);
+                            end
+
+                            if (xfer_count + 1 >= r_xfer_len) begin
+                                wb_cyc_o <= 1'b0;
+                                wb_stb_o <= 1'b0;
+                                state    <= S_DONE;
+                            end else begin
+                                wb_cyc_o <= 1'b1;
+                                wb_stb_o <= 1'b0;
+                                state    <= S_LOAD_WR;
+                            end
                         end
                     end
                 end
 
                 S_LOAD_WR: begin
-                    // Write fetched data to SRAM
-                    sram_en     <= 1'b1;
-                    sram_we     <= 1'b1;
-                    sram_addr_o <= r_sram_addr;
-                    sram_wdata  <= r_data_buf;
-                    // Advance SRAM pointer (always contiguous)
-                    r_sram_addr <= r_sram_addr + 1;
-                    xfer_count  <= xfer_count + 1;
-                    r_row_word_count <= r_row_word_count + 1;
-                    // Advance external address
-                    if (mode_2d && (r_row_word_count + 1 >= r_row_len)) begin
-                        // End of 2D row: jump to next NHWC DDR row. Leave left-pad
-                        // holes in SRAM (src_row_len - row_len) so the buffer matches
-                        // packed-tile layout (pad zeros + in-bounds pixels).
-                        if (effective_src_len > r_row_len)
-                            r_sram_addr <= r_sram_addr + 1 + (effective_src_len - r_row_len);
-                        r_ext_addr <= r_row_base + r_stride;
-                        r_row_base <= r_row_base + r_stride;
-                        r_row_count <= r_row_count - 1;
-                        r_row_word_count <= 16'd0;
-                    end else if (mode_2d) begin
-                        // Within 2D row: contiguous (4 bytes per word)
-                        r_ext_addr  <= r_ext_addr + 32'd4;
+                    if (abort) begin
+                        wb_cyc_o <= 1'b0;
+                        wb_stb_o <= 1'b0;
+                        state    <= S_DONE;
                     end else begin
-                        // 1D mode: configured per-word stride, default 4 bytes.
-                        r_ext_addr <= r_ext_addr
-                                      + ((r_stride != 0) ? r_stride : 32'd4);
+                        wb_cyc_o <= 1'b1;
+                        wb_stb_o <= 1'b1;
+                        wb_we_o  <= 1'b0;
+                        wb_adr_o <= r_ext_addr;
+                        state    <= S_LOAD;
                     end
-                    if (xfer_count + 1 >= r_xfer_len)
-                        state <= S_DONE;
-                    else
-                        state <= S_LOAD;
                 end
 
                 // ─── STORE path: SRAM → MEM ───

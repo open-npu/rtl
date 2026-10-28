@@ -143,7 +143,52 @@ async def test_multi_load(dut):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test 3: Single word STORE (SRAM → MEM)
+# Test 3: Held-cycle LOAD throughput
+# ─────────────────────────────────────────────────────────────────────────────
+@cocotb.test()
+async def test_load_keeps_bus_ownership(dut):
+    """A multi-word load keeps CYC asserted and avoids per-word arbitration."""
+    wb_mem = await init_dut(dut)
+    n_words = 32
+    base_addr = 0x2800
+    for i in range(n_words):
+        wb_mem.mem[base_addr + i * 4] = 0x2800_0000 + i
+
+    dut.dir.value = 0
+    dut.ext_addr.value = base_addr
+    dut.sram_addr.value = 0
+    dut.xfer_len.value = n_words
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    cycles = 0
+    busy_seen = False
+    premature_cyc_drops = 0
+    while cycles < 100:
+        await RisingEdge(dut.clk)
+        cycles += 1
+        await ReadOnly()
+        if int(dut.busy.value):
+            if (busy_seen and int(dut.xfer_count.value) < n_words
+                    and not int(dut.wb_cyc_o.value)):
+                premature_cyc_drops += 1
+            busy_seen = True
+        if int(dut.done_pulse.value):
+            break
+        await Timer(1, unit="step")
+
+    assert int(dut.done_pulse.value), "held-cycle DMA load did not complete"
+    assert premature_cyc_drops == 0, \
+        f"CYC dropped {premature_cyc_drops} times before the final word"
+    # Classic transfers need a STB re-arm phase, but should remain below the
+    # old per-word request/ACK/write/re-arbitrate path.
+    assert cycles <= 3 * n_words + 8, \
+        f"load inserted bubbles: {cycles} cycles for {n_words} words"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 4: Single word STORE (SRAM → MEM)
 # ─────────────────────────────────────────────────────────────────────────────
 @cocotb.test()
 async def test_single_store(dut):
