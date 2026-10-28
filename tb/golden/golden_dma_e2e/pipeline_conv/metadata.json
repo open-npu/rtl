@@ -40,7 +40,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -83,6 +84,7 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   }
 ]

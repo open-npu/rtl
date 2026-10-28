@@ -2613,6 +2613,7 @@ async def program_conv1x1_layer(wb, meta):
     await wb.write(0x128, meta['dma_in_size'])
     await wb.write(0x12C, meta['dma_wgt_size'])
     await wb.write(0x130, meta['dma_out_size'])
+    await wb.write(0x148, meta.get('wgt_per_oc_words', 0))
     await wb.write(0x180, meta['post_ctrl'])
     await wb.write(0x18C, meta.get('clamp_max', 32767) if meta.get('clamp_max', 32767) >= 0 else 32767)  # POST_CLAMP_MAX
     await wb.write(0x188, meta['dma_param_count'])
@@ -2620,7 +2621,8 @@ async def program_conv1x1_layer(wb, meta):
 
 
 async def run_conv1x1_partial_oc_test(dut, in_h, in_w, in_c, out_c,
-                                       int16_mode, seed, test_name):
+                                       int16_mode, seed, test_name,
+                                       op_type=0, wgt_per_oc_words=0):
     """Run a Conv1x1 partial-OC test and verify output."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset(dut)
@@ -2632,6 +2634,9 @@ async def run_conv1x1_partial_oc_test(dut, in_h, in_w, in_c, out_c,
     meta, data = gen_conv1x1_partial_oc_test(
         in_h=in_h, in_w=in_w, in_c=in_c, out_c=out_c,
         int16_mode=int16_mode, seed=seed)
+    meta['op_type'] = op_type
+    meta['wgt_layout'] = 1
+    meta['wgt_per_oc_words'] = wgt_per_oc_words
 
     mem.populate(POOL_WGT_ADDR, data['wgt_words'])
     mem.populate(POOL_IN_ADDR, data['input_words'])
@@ -2725,6 +2730,28 @@ async def test_conv1x1_outc3_3x3(dut):
     await run_conv1x1_partial_oc_test(dut, in_h=3, in_w=3, in_c=4, out_c=3,
                                        int16_mode=False, seed=321,
                                        test_name="Conv1x1 OC=3 3x3 INT8")
+
+
+@cocotb.test()
+async def test_fc_int16_weight_reload_32ch_group(dut):
+    """FC/1x1 1280→33: 84KB total weights reload as 32+1 OC groups."""
+    await run_conv1x1_partial_oc_test(
+        dut, in_h=1, in_w=1, in_c=1280, out_c=33,
+        int16_mode=True, seed=322,
+        test_name="FC INT16 1280->33 grouped reload",
+        op_type=2, wgt_per_oc_words=20480,
+    )
+
+
+@cocotb.test()
+async def test_conv_int16_weight_reload_unaligned_pixels(dut):
+    """Two 41-channel pixels preserve NHWC gaps across 32+9 OC groups."""
+    await run_conv1x1_partial_oc_test(
+        dut, in_h=1, in_w=2, in_c=1024, out_c=41,
+        int16_mode=True, seed=323,
+        test_name="Conv INT16 grouped reload unaligned pixels",
+        op_type=0, wgt_per_oc_words=16384,
+    )
 
 
 @cocotb.test()

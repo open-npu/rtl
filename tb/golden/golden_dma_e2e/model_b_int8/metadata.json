@@ -45,7 +45,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 3,
@@ -93,7 +94,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -141,7 +143,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -189,7 +192,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -237,7 +241,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": 1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -290,7 +295,8 @@
     "add_S_A": 14,
     "add_M_B": 21890,
     "add_S_B": 14,
-    "ddr_add_b_addr": 806281216
+    "ddr_add_b_addr": 806281216,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -338,7 +344,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -386,7 +393,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -439,7 +447,8 @@
     "add_S_A": 14,
     "add_M_B": 31475,
     "add_S_B": 15,
-    "ddr_add_b_addr": 806559744
+    "ddr_add_b_addr": 806559744,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -487,7 +496,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -535,7 +545,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -583,7 +594,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": 8,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -636,7 +648,8 @@
     "add_S_A": 16,
     "add_M_B": 18676,
     "add_S_B": 14,
-    "ddr_add_b_addr": 806768640
+    "ddr_add_b_addr": 806768640,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -684,7 +697,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -732,7 +746,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -785,7 +800,8 @@
     "add_S_A": 15,
     "add_M_B": 18044,
     "add_S_B": 15,
-    "ddr_add_b_addr": 806858752
+    "ddr_add_b_addr": 806858752,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -833,7 +849,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -881,7 +898,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -929,7 +947,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": 15,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -982,7 +1001,8 @@
     "add_S_A": 15,
     "add_M_B": 21316,
     "add_S_B": 15,
-    "ddr_add_b_addr": 806985728
+    "ddr_add_b_addr": 806985728,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -1030,7 +1050,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -1078,7 +1099,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -1131,7 +1153,8 @@
     "add_S_A": 15,
     "add_M_B": 20509,
     "add_S_B": 15,
-    "ddr_add_b_addr": 807100416
+    "ddr_add_b_addr": 807100416,
+    "wgt_layout": 0
   },
   {
     "op_type": 3,
@@ -1179,7 +1202,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 0
   },
   {
     "op_type": 2,
@@ -1227,6 +1251,7 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   }
 ]

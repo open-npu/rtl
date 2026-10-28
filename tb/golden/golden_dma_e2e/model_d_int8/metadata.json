@@ -45,7 +45,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -93,7 +94,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -141,7 +143,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -189,7 +192,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -237,7 +241,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -285,7 +290,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -333,7 +339,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -381,7 +388,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -429,7 +437,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -477,7 +486,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -525,7 +535,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -573,7 +584,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -626,7 +638,8 @@
     "add_S_A": 15,
     "add_M_B": 25573,
     "add_S_B": 15,
-    "ddr_add_b_addr": 809340928
+    "ddr_add_b_addr": 809340928,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -674,7 +687,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -722,7 +736,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -770,7 +785,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -818,7 +834,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -866,7 +883,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -914,7 +932,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -967,7 +986,8 @@
     "add_S_A": 15,
     "add_M_B": 25511,
     "add_S_B": 16,
-    "ddr_add_b_addr": 810143744
+    "ddr_add_b_addr": 810143744,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -1015,7 +1035,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -1063,7 +1084,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -1111,7 +1133,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 2,
@@ -1137,7 +1160,7 @@
     "concat_cfg": 0,
     "dma_in_size": 512,
     "dma_wgt_size": 262144,
-    "wgt_per_oc_words": 2048,
+    "wgt_per_oc_words": 8192,
     "dma_out_size": 512,
     "dma_param_count": 512,
     "tile_in_size": 0,
@@ -1159,6 +1182,7 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   }
 ]

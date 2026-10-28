@@ -45,7 +45,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -93,7 +94,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -141,7 +143,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -189,7 +192,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -237,7 +241,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -285,7 +290,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -333,7 +339,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -381,7 +388,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -429,7 +437,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -482,7 +491,8 @@
     "add_S_A": 15,
     "add_M_B": 22088,
     "add_S_B": 15,
-    "ddr_add_b_addr": 817770496
+    "ddr_add_b_addr": 817770496,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -530,7 +540,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -578,7 +589,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -626,7 +638,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -679,7 +692,8 @@
     "add_S_A": 15,
     "add_M_B": 26636,
     "add_S_B": 15,
-    "ddr_add_b_addr": 820396032
+    "ddr_add_b_addr": 820396032,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -727,7 +741,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -775,7 +790,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -823,7 +839,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -876,7 +893,8 @@
     "add_S_A": 15,
     "add_M_B": 25892,
     "add_S_B": 15,
-    "ddr_add_b_addr": 823021568
+    "ddr_add_b_addr": 823021568,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -924,7 +942,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -972,7 +991,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -1020,7 +1040,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -1073,7 +1094,8 @@
     "add_S_A": 15,
     "add_M_B": 17467,
     "add_S_B": 15,
-    "ddr_add_b_addr": 825647104
+    "ddr_add_b_addr": 825647104,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -1121,7 +1143,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -1169,7 +1192,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -1217,7 +1241,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -1265,7 +1290,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -1313,7 +1339,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -1361,7 +1388,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -1414,7 +1442,8 @@
     "add_S_A": 15,
     "add_M_B": 27728,
     "add_S_B": 15,
-    "ddr_add_b_addr": 829472768
+    "ddr_add_b_addr": 829472768,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -1462,7 +1491,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -1510,7 +1540,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -1558,7 +1589,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -1611,7 +1643,8 @@
     "add_S_A": 15,
     "add_M_B": 18525,
     "add_S_B": 15,
-    "ddr_add_b_addr": 830681088
+    "ddr_add_b_addr": 830681088,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -1659,7 +1692,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -1707,7 +1741,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -1755,7 +1790,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -1808,7 +1844,8 @@
     "add_S_A": 15,
     "add_M_B": 22900,
     "add_S_B": 15,
-    "ddr_add_b_addr": 831889408
+    "ddr_add_b_addr": 831889408,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -1856,7 +1893,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -1904,7 +1942,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -1952,7 +1991,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -2005,7 +2045,8 @@
     "add_S_A": 15,
     "add_M_B": 25419,
     "add_S_B": 15,
-    "ddr_add_b_addr": 833097728
+    "ddr_add_b_addr": 833097728,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -2053,7 +2094,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -2101,7 +2143,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -2149,7 +2192,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -2202,7 +2246,8 @@
     "add_S_A": 15,
     "add_M_B": 25257,
     "add_S_B": 15,
-    "ddr_add_b_addr": 834306048
+    "ddr_add_b_addr": 834306048,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -2250,7 +2295,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -2298,7 +2344,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -2346,7 +2393,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -2399,7 +2447,8 @@
     "add_S_A": 15,
     "add_M_B": 23261,
     "add_S_B": 15,
-    "ddr_add_b_addr": 835514368
+    "ddr_add_b_addr": 835514368,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -2447,7 +2496,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -2495,7 +2545,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -2543,7 +2594,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -2591,7 +2643,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -2639,7 +2692,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -2687,7 +2741,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -2740,7 +2795,8 @@
     "add_S_A": 15,
     "add_M_B": 32717,
     "add_S_B": 15,
-    "ddr_add_b_addr": 837144576
+    "ddr_add_b_addr": 837144576,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -2788,7 +2844,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -2836,7 +2893,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -2884,7 +2942,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 4,
@@ -2937,7 +2996,8 @@
     "add_S_A": 15,
     "add_M_B": 24891,
     "add_S_B": 15,
-    "ddr_add_b_addr": 837525504
+    "ddr_add_b_addr": 837525504,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -2985,7 +3045,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 1,
@@ -3033,7 +3094,8 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -3059,7 +3121,7 @@
     "concat_cfg": 0,
     "dma_in_size": 512,
     "dma_wgt_size": 262144,
-    "wgt_per_oc_words": 2048,
+    "wgt_per_oc_words": 8192,
     "dma_out_size": 512,
     "dma_param_count": 512,
     "tile_in_size": 512,
@@ -3081,6 +3143,7 @@
     "clamp_max": 127,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   }
 ]

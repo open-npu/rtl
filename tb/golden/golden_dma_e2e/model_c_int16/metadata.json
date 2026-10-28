@@ -45,7 +45,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 3,
@@ -93,7 +94,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -141,7 +143,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 3,
@@ -189,7 +192,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -237,7 +241,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 3,
@@ -285,7 +290,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -311,7 +317,7 @@
     "concat_cfg": 0,
     "dma_in_size": 663552,
     "dma_wgt_size": 147456,
-    "wgt_per_oc_words": 4608,
+    "wgt_per_oc_words": 18432,
     "dma_out_size": 692224,
     "dma_param_count": 128,
     "tile_in_size": 9216,
@@ -333,7 +339,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 3,
@@ -381,7 +388,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -407,7 +415,7 @@
     "concat_cfg": 0,
     "dma_in_size": 414720,
     "dma_wgt_size": 294912,
-    "wgt_per_oc_words": 9216,
+    "wgt_per_oc_words": 18432,
     "dma_out_size": 173056,
     "dma_param_count": 128,
     "tile_in_size": 11520,
@@ -429,7 +437,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 3,
@@ -477,7 +486,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -503,7 +513,7 @@
     "concat_cfg": 0,
     "dma_in_size": 115200,
     "dma_wgt_size": 589824,
-    "wgt_per_oc_words": 9216,
+    "wgt_per_oc_words": 18432,
     "dma_out_size": 86528,
     "dma_param_count": 256,
     "tile_in_size": 11520,
@@ -525,7 +535,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -573,7 +584,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 5,
@@ -621,7 +633,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 0
   },
   {
     "op_type": 7,
@@ -673,7 +686,8 @@
     "add_M_A": 21857,
     "add_S_A": 15,
     "add_M_B": 0,
-    "add_S_B": 0
+    "add_S_B": 0,
+    "wgt_layout": 0
   },
   {
     "op_type": 7,
@@ -725,7 +739,8 @@
     "add_M_A": 16384,
     "add_S_A": 14,
     "add_M_B": 0,
-    "add_S_B": 0
+    "add_S_B": 0,
+    "wgt_layout": 0
   },
   {
     "op_type": 0,
@@ -773,7 +788,8 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   },
   {
     "op_type": 0,
@@ -821,6 +837,7 @@
     "clamp_max": 32767,
     "in_zp": 0,
     "input_src": -1,
-    "residual_src": -1
+    "residual_src": -1,
+    "wgt_layout": 1
   }
 ]

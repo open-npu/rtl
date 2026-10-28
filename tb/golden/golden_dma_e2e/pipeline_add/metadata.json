@@ -44,6 +44,7 @@
     "add_M_A": 16000,
     "add_S_A": 14,
     "add_M_B": 12000,
-    "add_S_B": 13
+    "add_S_B": 13,
+    "wgt_layout": 0
   }
 ]

@@ -29,7 +29,8 @@
     "n_wgt_words": 108,
     "n_param_words": 32,
     "n_input_words": 384,
-    "n_output_words": 256
+    "n_output_words": 256,
+    "wgt_layout": 1
   },
   {
     "index": 1,
@@ -61,7 +62,8 @@
     "n_wgt_words": 36,
     "n_param_words": 32,
     "n_input_words": 256,
-    "n_output_words": 256
+    "n_output_words": 256,
+    "wgt_layout": 1
   },
   {
     "index": 2,
@@ -93,7 +95,8 @@
     "n_wgt_words": 16,
     "n_param_words": 16,
     "n_input_words": 256,
-    "n_output_words": 128
+    "n_output_words": 128,
+    "wgt_layout": 1
   },
   {
     "index": 3,
@@ -125,7 +128,8 @@
     "n_wgt_words": 48,
     "n_param_words": 96,
     "n_input_words": 128,
-    "n_output_words": 768
+    "n_output_words": 768,
+    "wgt_layout": 1
   },
   {
     "index": 4,
@@ -157,7 +161,8 @@
     "n_wgt_words": 108,
     "n_param_words": 96,
     "n_input_words": 768,
-    "n_output_words": 192
+    "n_output_words": 192,
+    "wgt_layout": 1
   },
   {
     "index": 5,
@@ -189,7 +194,8 @@
     "n_wgt_words": 96,
     "n_param_words": 32,
     "n_input_words": 192,
-    "n_output_words": 64
+    "n_output_words": 64,
+    "wgt_layout": 1
   },
   {
     "index": 6,
@@ -221,7 +227,8 @@
     "n_wgt_words": 192,
     "n_param_words": 192,
     "n_input_words": 64,
-    "n_output_words": 384
+    "n_output_words": 384,
+    "wgt_layout": 1
   },
   {
     "index": 7,
@@ -253,7 +260,8 @@
     "n_wgt_words": 216,
     "n_param_words": 192,
     "n_input_words": 384,
-    "n_output_words": 384
+    "n_output_words": 384,
+    "wgt_layout": 1
   },
   {
     "index": 8,
@@ -285,7 +293,8 @@
     "n_wgt_words": 192,
     "n_param_words": 32,
     "n_input_words": 384,
-    "n_output_words": 64
+    "n_output_words": 64,
+    "wgt_layout": 1
   },
   {
     "index": 9,
@@ -317,6 +326,7 @@
     "n_wgt_words": 128,
     "n_param_words": 128,
     "n_input_words": 64,
-    "n_output_words": 256
+    "n_output_words": 256,
+    "wgt_layout": 1
   }
 ]
