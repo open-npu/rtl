@@ -52,6 +52,7 @@ module npu_ctrl #(
     input  wire [15:0]  oc_group_idx,    // Current oc_group index from compute
     input  wire [15:0]  wgt_k_start,     // First K index for a sliced row-group reload
     output reg          wgt_reload_done, // Weight reload for next oc_group complete
+    output wire         group_major_en,  // OC-group outer loop is safe and enabled
 
     // ─── DMA Bank Select (explicit, replaces address compare in npu_top) ───
     output reg  [1:0]   dma_sram_sel,    // 0=weight, 1=IFM, 2=param, 3=OFM
@@ -145,6 +146,8 @@ module npu_ctrl #(
     localparam S_DWS_RELOAD_ACT_WAIT= 6'd25;
     localparam S_DWS_RELOAD_ACK     = 6'd26; // DW stream: wait oc_group_done deassert
     localparam S_RELOAD_ACK         = 6'd27; // per-OC reload: wait oc_group_done deassert
+    localparam S_GROUP_LOAD_ACT     = 6'd28; // group-major: reload tile(0,0) activation
+    localparam S_GROUP_LOAD_ACT_WAIT= 6'd29;
 
     reg [5:0] state;
     reg       aborted;  // Latched abort flag — prevents auto-restart in S_DONE
@@ -180,6 +183,24 @@ module npu_ctrl #(
         ((dense_k_bytes << 1) <= wgt_capacity_bytes) ? 7'd2  :
         ( dense_k_bytes       <= wgt_capacity_bytes) ? 7'd1  : 7'd0;
     wire [6:0] row_ctrl_group = wgt_k_slice ? 7'd64 : row_dense_grp;
+    wire [31:0] row_group_bytes = {25'd0, row_ctrl_group}
+                                 * (cfg_int16 ? 32'd2 : 32'd1);
+    wire [31:0] output_pixel_bytes = {16'd0, cfg_out_c}
+                                    * (cfg_int16 ? 32'd2 : 32'd1);
+    // Bit 1 requests group-major traversal. Restrict it to the dense row path
+    // and word-aligned channel slices: the 32-bit DMA must never need a
+    // read-modify-write at a pixel boundary. K-sliced groups have an inner
+    // reload protocol and intentionally retain the normal tile-major order.
+    assign group_major_en = cfg_dma_store_mode[1]
+                          && cfg_dma_store_mode[0]
+                          && !db_en
+                          && (cfg_layer_mode[3:0] == 4'd0)
+                          && (cfg_tile_h != 16'd0)
+                          && (cfg_dma_wgt_per_oc != 0)
+                          && !wgt_k_slice
+                          && (row_ctrl_group != 0)
+                          && (row_group_bytes[1:0] == 2'd0)
+                          && (output_pixel_bytes[1:0] == 2'd0);
 
     // Input words = in_size / 4
     wire [15:0] in_words = cfg_dma_in_size[17:2];
@@ -359,6 +380,10 @@ module npu_ctrl #(
     reg [31:0] r_nhwc_row_stride;   // Precomputed NHWC row stride (registered)
     reg [15:0] r_tile_row_len;      // Precomputed tile row length (registered)
     reg [15:0] r_tile_row_count;    // Precomputed tile row count (registered)
+    reg [15:0] r_tile_pixel_w;      // Clipped tile width for group-channel scatter
+    reg [15:0] r_store_src_stride;  // SRAM words between adjacent NHWC pixels
+    reg [31:0] r_store_group_offset;// Byte offset of completed OC group in a pixel
+    reg [15:0] store_spatial_row;   // Spatial row currently being scattered
 
     // ─── Per-tile store tile sequencing ───
     // Track tile (y,x) position for NHWC DDR offset computation
@@ -576,6 +601,17 @@ module npu_ctrl #(
     wire [31:0] tile_ddr_offset = ({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {16'd0, cfg_out_w}
                                    + {16'd0, tile_x_seq} * {16'd0, cfg_tile_w})
                                   * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
+    // At a group boundary compute has already advanced oc_group_idx to the
+    // requested group. The tile being stored belongs to the preceding group.
+    wire [15:0] store_group_idx = (group_major_en && oc_group_done)
+                                ? (oc_group_idx - 16'd1) : oc_group_idx;
+    wire [15:0] store_group_base_ch = store_group_idx * {9'd0, row_ctrl_group};
+    wire [15:0] store_group_nch =
+        (cfg_out_c > store_group_base_ch + {9'd0, row_ctrl_group})
+            ? {9'd0, row_ctrl_group}
+            : (cfg_out_c - store_group_base_ch);
+    wire [31:0] store_group_bytes = {16'd0, store_group_nch}
+                                  * (cfg_int16 ? 32'd2 : 32'd1);
 
     // Shared by the async (!rst_n) and synchronous (ctrl_soft_rst) branches so
     // the two cannot drift apart.
@@ -607,6 +643,10 @@ module npu_ctrl #(
         tile_y_seq          <= 16'd0; \
         tile_x_seq          <= 16'd0; \
         last_tile_store     <= 1'b0; \
+        store_spatial_row   <= 16'd0; \
+        r_tile_pixel_w      <= 16'd0; \
+        r_store_src_stride  <= 16'd0; \
+        r_store_group_offset<= 32'd0; \
         dma_row_len         <= 16'd0; \
         dma_row_count       <= 16'd0; \
         dma_src_row_len     <= 16'd0; \
@@ -907,17 +947,33 @@ module npu_ctrl #(
                                 // Latch current tile's bank for store
                                 store_bank <= ping_pong_flag;
                                 last_tile_store <= 1'b0;  // non-final tile
+                                store_spatial_row <= 16'd0;
                                 db_prefetch_done <= 1'b0;  // Block compute during store+prefetch
                                 // Precompute tile_ddr_offset and row_stride (avoid 3-level multiply chain in S_TILE_STORE)
                                 r_tile_ddr_offset <= ({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {16'd0, cfg_out_w}
                                                        + {16'd0, tile_x_seq} * {16'd0, cfg_tile_w})
                                                       * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
-                                r_nhwc_row_stride <= {16'd0, cfg_out_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
                                 r_tile_row_count <= (tile_out_h_actual != 0) ? tile_out_h_actual : cfg_tile_h;
-                                if (tile_out_w_actual != 0)
-                                    r_tile_row_len <= (({16'd0, tile_out_w_actual} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1)) >> 2);
-                                else
-                                    r_tile_row_len <= tile_row_len * tile_row_count;
+                                r_tile_pixel_w <= (tile_out_w_actual != 0) ? tile_out_w_actual : cfg_tile_w;
+                                if (group_major_en) begin
+                                    // One 2D DMA per spatial row. Its inner
+                                    // rows are pixels, each carrying only this
+                                    // OC group's contiguous channel slice.
+                                    r_nhwc_row_stride <= output_pixel_bytes;
+                                    r_tile_row_len <= store_group_bytes[17:2];
+                                    r_store_src_stride <= output_pixel_bytes[17:2];
+                                    r_store_group_offset <= {16'd0, store_group_base_ch}
+                                                          * (cfg_int16 ? 32'd2 : 32'd1);
+                                end else begin
+                                    r_nhwc_row_stride <= {16'd0, cfg_out_w} * output_pixel_bytes;
+                                    r_store_src_stride <= 16'd0;
+                                    r_store_group_offset <= 32'd0;
+                                    if (tile_out_w_actual != 0)
+                                        r_tile_row_len <= (({16'd0, tile_out_w_actual}
+                                                           * output_pixel_bytes) >> 2);
+                                    else
+                                        r_tile_row_len <= tile_row_len * tile_row_count;
+                                end
                                 `ifndef SYNTHESIS
                                 $display("[PTS_TILEDONE] t=%0t tile_done fired, ping_pong=%0d → S_TILE_STORE", $time, ping_pong_flag);
                                 `endif
@@ -983,9 +1039,11 @@ module npu_ctrl #(
                         end else if (oc_group_done && pool_stream) begin
                             // Pool stream: no weights — act slice only
                             state <= S_DWS_RELOAD_ACT;
-                        end else if (oc_group_done && cfg_dma_wgt_per_oc != 0) begin
+                        end else if (oc_group_done && cfg_dma_wgt_per_oc != 0
+                                     && !group_major_en) begin
                             state <= S_RELOAD_WGT;
-                        end else if (oc_group_done && param_needs_reload) begin
+                        end else if (oc_group_done && param_needs_reload
+                                     && !group_major_en) begin
                             // Weights already resident; this group still needs
                             // its own parameter block.
                             state <= S_RELOAD_PARAM;
@@ -1007,16 +1065,29 @@ module npu_ctrl #(
                                     // for final tile). Go to S_TILE_STORE to store it,
                                     // then S_TILE_STORE_WAIT → S_DONE (skip prefetch).
                                     last_tile_store <= 1'b1;
+                                    store_spatial_row <= 16'd0;
                                     // Precompute tile_ddr_offset and row_stride
                                     r_tile_ddr_offset <= ({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {16'd0, cfg_out_w}
                                                            + {16'd0, tile_x_seq} * {16'd0, cfg_tile_w})
                                                           * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
-                                    r_nhwc_row_stride <= {16'd0, cfg_out_w} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
                                     r_tile_row_count <= (tile_out_h_actual != 0) ? tile_out_h_actual : cfg_tile_h;
-                                    if (tile_out_w_actual != 0)
-                                        r_tile_row_len <= (({16'd0, tile_out_w_actual} * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1)) >> 2);
-                                    else
-                                        r_tile_row_len <= tile_row_len * tile_row_count;
+                                    r_tile_pixel_w <= (tile_out_w_actual != 0) ? tile_out_w_actual : cfg_tile_w;
+                                    if (group_major_en) begin
+                                        r_nhwc_row_stride <= output_pixel_bytes;
+                                        r_tile_row_len <= store_group_bytes[17:2];
+                                        r_store_src_stride <= output_pixel_bytes[17:2];
+                                        r_store_group_offset <= {16'd0, store_group_base_ch}
+                                                              * (cfg_int16 ? 32'd2 : 32'd1);
+                                    end else begin
+                                        r_nhwc_row_stride <= {16'd0, cfg_out_w} * output_pixel_bytes;
+                                        r_store_src_stride <= 16'd0;
+                                        r_store_group_offset <= 32'd0;
+                                        if (tile_out_w_actual != 0)
+                                            r_tile_row_len <= (({16'd0, tile_out_w_actual}
+                                                               * output_pixel_bytes) >> 2);
+                                        else
+                                            r_tile_row_len <= tile_row_len * tile_row_count;
+                                    end
                                     state <= S_TILE_STORE;
                                 end
                                 else
@@ -1035,7 +1106,13 @@ module npu_ctrl #(
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b1;  // store
                         dma_sram_sel  <= 2'd3;  // OFM
-                        dma_ext_addr  <= cfg_dma_out_addr + r_tile_ddr_offset;
+                        dma_ext_addr  <= cfg_dma_out_addr + r_tile_ddr_offset
+                                       + (group_major_en
+                                          ? (r_store_group_offset
+                                             + {16'd0, store_spatial_row}
+                                               * ({16'd0, cfg_out_w}
+                                                  * output_pixel_bytes))
+                                          : 32'd0);
                         // Source SRAM: output region in current bank.
                         // Add (op 4) computes in-place in the input region;
                         // everything else (incl. Concat, which also has
@@ -1043,15 +1120,26 @@ module npu_ctrl #(
                         if (is_add_op)
                             dma_sram_addr <= (db_en && store_bank ? ifm_half_now : 16'd0);
                         else
-                            dma_sram_addr <= cfg_out_base + (db_en && store_bank ? ofm_half_now : 16'd0);
-                        dma_xfer_len  <= r_tile_row_len * r_tile_row_count;
+                            dma_sram_addr <= cfg_out_base
+                                + (db_en && store_bank ? ofm_half_now : 16'd0)
+                                + (group_major_en
+                                   ? (r_store_group_offset[17:2]
+                                      + store_spatial_row * r_tile_pixel_w
+                                        * r_store_src_stride)
+                                   : 16'd0);
+                        dma_xfer_len  <= group_major_en
+                                      ? (r_tile_row_len * r_tile_pixel_w)
+                                      : (r_tile_row_len * r_tile_row_count);
                         // 2D parameters: all layers use clipped tile dims for DDR row_len.
                         // Add/Concat layers: SRAM uses padded tile_w, so src_row_len = padded.
                         // Conv: src_row_len = 0 (same as row_len, no padding).
                         dma_row_len    <= r_tile_row_len;
-                        dma_row_count  <= r_tile_row_count;
+                        dma_row_count  <= group_major_en ? r_tile_pixel_w
+                                                        : r_tile_row_count;
                         dma_out_stride <= r_nhwc_row_stride;
-                        if ((is_add_op || is_concat_op) && cfg_tile_w != 0)
+                        if (group_major_en)
+                            dma_src_row_len <= r_store_src_stride;
+                        else if ((is_add_op || is_concat_op) && cfg_tile_w != 0)
                             dma_src_row_len <= ({16'd0, cfg_tile_w} * {16'd0, cfg_out_c} *
                                                  (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
                         else
@@ -1059,9 +1147,14 @@ module npu_ctrl #(
                         `ifndef SYNTHESIS
                         $display("[PTS_STORE] t=%0t ty=%0d tx=%0d ddr=0x%08x sram=%0d len=%0d row_len=%0d row_cnt=%0d stride=%0d bank=%0d",
                                  $time, tile_y_seq, tile_x_seq,
-                                 cfg_dma_out_addr + r_tile_ddr_offset,
+                                 cfg_dma_out_addr + r_tile_ddr_offset
+                                     + (group_major_en ? r_store_group_offset : 0),
                                  cfg_out_base + (db_en && store_bank ? ofm_half_now : 16'd0),
-                                 r_tile_row_len * r_tile_row_count, r_tile_row_len, r_tile_row_count, r_nhwc_row_stride, store_bank);
+                                 group_major_en ? r_tile_row_len * r_tile_pixel_w
+                                                : r_tile_row_len * r_tile_row_count,
+                                 r_tile_row_len,
+                                 group_major_en ? r_tile_pixel_w : r_tile_row_count,
+                                 r_nhwc_row_stride, store_bank);
                         `endif
                         state          <= S_TILE_STORE_WAIT;
                     end
@@ -1074,9 +1167,32 @@ module npu_ctrl #(
                         // Clear 2D mode (revert to 1D for prefetch)
                         dma_row_len   <= 16'd0;
                         dma_row_count <= 16'd0;
-                        if (last_tile_store) begin
+                        if (group_major_en
+                            && store_spatial_row + 1 < r_tile_row_count) begin
+                            // A 2D DMA handles all pixels in one spatial row.
+                            // Re-enter for the next row so column-tiled output
+                            // skips the gap to the next global NHWC row.
+                            store_spatial_row <= store_spatial_row + 1'b1;
+                            state <= S_TILE_STORE;
+                        end else if (last_tile_store) begin
                             // Final tile stored — done (no prefetch needed)
                             state <= S_DONE;
+                        end else if (group_major_en && oc_group_done) begin
+                            // Last spatial tile of this OC group is now safe
+                            // in DDR. Reset the tile walk, load the next
+                            // group's weights/params, then reload tile(0,0).
+                            tile_y_seq <= 16'd0;
+                            tile_x_seq <= 16'd0;
+                            ping_pong_flag <= 1'b0;
+                            prefetch_active <= 1'b0;
+                            prefetch_pending <= 1'b0;
+                            db_prefetch_done <= 1'b0;
+                            cur_tile_ddr_offset <= 32'd0;
+                            next_tile_ddr_addr <= cfg_dma_in_addr
+                                + (cfg_tile_in_size != 0
+                                   ? cfg_tile_in_size : cfg_dma_in_size);
+                            next_sram_offset <= db_en ? ifm_half_now : 16'd0;
+                            state <= S_RELOAD_WGT;
                         end else begin
                             // Non-final tile: advance tile indices and prefetch next
                             if (tile_x_seq + 1 >= cfg_tile_num_w) begin
@@ -1170,6 +1286,8 @@ module npu_ctrl #(
                         if (param_needs_reload
                                 && (!wgt_k_slice || wgt_k_start == 16'd0))
                             state <= S_RELOAD_PARAM;
+                        else if (group_major_en)
+                            state <= S_GROUP_LOAD_ACT;
                         else begin
                             wgt_reload_done <= 1'b1;
                             // Wait for compute to drop oc_group_done before
@@ -1208,7 +1326,52 @@ module npu_ctrl #(
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else if (dma_done) begin
-                        wgt_reload_done <= 1'b1;  // both weights + params reloaded
+                        if (group_major_en)
+                            state <= S_GROUP_LOAD_ACT;
+                        else begin
+                            wgt_reload_done <= 1'b1;  // both weights + params reloaded
+                            state <= S_RELOAD_ACK;
+                        end
+                    end
+                end
+
+                // Group-major revisits tile(0,0) after changing OC groups.
+                // The previous group's final tile occupied the activation
+                // SRAM, so reload the first input tile before releasing
+                // compute. Subsequent tiles use the normal PTS prefetch path.
+                S_GROUP_LOAD_ACT: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else begin
+                        act_role_swap <= 1'b0;
+                        dma_start     <= 1'b1;
+                        dma_dir       <= 1'b0;
+                        dma_sram_sel  <= 2'd1;
+                        dma_ext_addr  <= cfg_dma_in_addr;
+                        dma_sram_addr <= use_2d_load ? cur_2d_sram_pad : 16'd0;
+                        dma_xfer_len  <= use_2d_load ? cur_2d_xfer
+                                                    : load_xfer_words;
+                        if (use_2d_load) begin
+                            dma_row_len     <= cur_2d_row_len;
+                            dma_row_count   <= cur_2d_row_cnt;
+                            dma_out_stride <= load_in_stride;
+                            dma_src_row_len <= load_row_len[15:0];
+                        end else begin
+                            dma_row_len     <= 16'd0;
+                            dma_row_count   <= 16'd0;
+                            dma_src_row_len <= 16'd0;
+                            dma_out_stride <= 32'd0;
+                        end
+                        state <= S_GROUP_LOAD_ACT_WAIT;
+                    end
+                end
+
+                S_GROUP_LOAD_ACT_WAIT: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else if (dma_done) begin
+                        wgt_reload_done  <= 1'b1;
+                        db_prefetch_done <= 1'b1;
                         state <= S_RELOAD_ACK;
                     end
                 end

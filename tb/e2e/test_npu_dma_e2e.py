@@ -2764,6 +2764,53 @@ async def test_conv_int16_weight_reload_unaligned_pixels(dut):
 
 
 @cocotb.test()
+async def test_conv_group_major_reuses_weights_across_tiles(dut):
+    """Four spatial tiles reuse each 64-channel weight group exactly once."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await reset(dut)
+
+    wb = WbSlave(dut, dut.clk)
+    mem = WbMasterMem(dut, dut.clk)
+    cocotb.start_soon(mem.run())
+
+    meta, data = gen_conv1x1_partial_oc_test(
+        in_h=4, in_w=4, in_c=128, out_c=772,
+        int16_mode=False, seed=324)
+    meta.update({
+        'wgt_layout': 1,
+        'wgt_per_oc_words': 2048,   # 64 * 128 INT8 / 4
+        'tile_h': 2, 'tile_w': 2,
+        'tile_num_h': 2, 'tile_num_w': 2,
+        'tile_in_size': 2 * 2 * 128,
+        'tile_out_size': 2 * 2 * 772,
+        'sched_ctrl': 0x10,
+        'store_mode': 0x3,          # PTS + group-major
+        'row_cfg': (2 << 16) | (2 * 772 // 4),
+        'ddr_in_addr': POOL_IN_ADDR,
+        'ddr_out_addr': POOL_OUT_ADDR,
+        'ddr_wgt_addr': POOL_WGT_ADDR,
+        'ddr_param_addr': POOL_PARAM_ADDR,
+    })
+
+    mem.populate(POOL_WGT_ADDR, data['wgt_words'])
+    mem.populate(POOL_IN_ADDR, data['input_words'])
+    mem.populate(POOL_PARAM_ADDR, data['param_words'])
+
+    await program_layer(wb, meta)
+    await wb.write(0x110, 4 * 128)  # 2D input row stride in bytes
+    done = await run_layer_and_wait(wb, dut, timeout=300000)
+    assert done, "group-major tiled Conv did not complete"
+
+    mismatches = []
+    for i, exp in enumerate(data['output_words']):
+        got = mem.mem.get(POOL_OUT_ADDR + i * 4)
+        if got != int(exp):
+            mismatches.append((i, int(exp), got))
+    assert not mismatches, \
+        f"group-major tiled Conv: {len(mismatches)}/{len(data['output_words'])} mismatches"
+
+
+@cocotb.test()
 async def test_concat_3branch(dut):
     """Concat 3 branches (4ch + 4ch + 4ch), INT8, with relu."""
     await run_concat_test(dut,
