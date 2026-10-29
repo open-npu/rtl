@@ -91,18 +91,22 @@ class WbMasterMem:
         """Background task: respond to WB master transactions."""
         while True:
             await RisingEdge(self.clk)
+            await ReadOnly()
             try:
                 cyc = int(self.dut.wb_mst_cyc_o.value)
                 stb = int(self.dut.wb_mst_stb_o.value)
             except ValueError:
+                await Timer(1, unit="step")
                 self.dut.wb_mst_ack_i.value = 0
                 continue
             if cyc and stb:
                 try:
                     addr = int(self.dut.wb_mst_adr_o.value)
                 except ValueError:
+                    await Timer(1, unit="step")
                     self.dut.wb_mst_ack_i.value = 0
                     continue
+                await Timer(1, unit="step")
                 if self.dut.wb_mst_we_o.value:
                     try:
                         wdata = int(self.dut.wb_mst_dat_o.value)
@@ -116,6 +120,7 @@ class WbMasterMem:
                     self.dut.wb_mst_dat_i.value = self.mem.get(addr, 0)
                 self.dut.wb_mst_ack_i.value = 1
             else:
+                await Timer(1, unit="step")
                 self.dut.wb_mst_ack_i.value = 0
 
 
