@@ -766,7 +766,7 @@ async def test_dma_e2e_tiling_int8(dut):
 
 @cocotb.test()
 async def test_dma_e2e_tiling_int8_tiled(dut):
-    """32x32 medium-scale 6-layer INT8 with spatial tiling (validates tiling FSM)."""
+    """32x32 INT8 spatial tiling with single-buffer per-tile store."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset(dut)
 
@@ -792,7 +792,11 @@ async def test_dma_e2e_tiling_int8_tiled(dut):
                       f"[{meta['out_h']}x{meta['out_w']}x{meta['out_c']}]"
                       f"{tile_info}")
 
-        await program_layer_db_en(wb, meta)
+        # Force the new SB+PTS schedule: retain per-tile store while clearing
+        # DB_EN so every tile reuses bank 0.
+        meta_sb = dict(meta)
+        meta_sb['sched_ctrl'] = (meta.get('sched_ctrl', 0) & ~0x01) | 0x10
+        await program_layer(wb, meta_sb)
         done = await run_layer_and_wait(wb, dut, timeout=2000000)
         assert done, f"Layer {idx} did not complete within timeout"
 
