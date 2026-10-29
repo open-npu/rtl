@@ -120,6 +120,7 @@ module npu_top #(
     // --- Controller ↔ Compute ---
     wire        compute_start, compute_done;
     wire        oc_group_done, wgt_reload_done;
+    wire        group_major_en;
     wire [15:0] oc_group_idx;
     wire [15:0] wgt_k_start;
     wire [1:0]  dma_sram_sel;
@@ -273,6 +274,7 @@ module npu_top #(
         .oc_group_idx   (oc_group_idx),
         .wgt_k_start    (wgt_k_start),
         .wgt_reload_done(wgt_reload_done),
+        .group_major_en (group_major_en),
         .dma_sram_sel   (dma_sram_sel),
         .act_role_swap  (act_role_swap),
         // Layer configuration from CSR
@@ -795,6 +797,7 @@ module npu_top #(
         .wgt_reload_done    (wgt_reload_done),
         .cfg_wgt_per_oc     (reg_dma_wgt_per_oc),
         .cfg_wgt_layout     (reg_wgt_layout[0]),
+        .cfg_group_major    (group_major_en),
         .db_prefetch_done   (db_prefetch_done),
         .tile_out_h_actual  (tile_out_h_actual),
         .tile_out_w_actual  (tile_out_w_actual)

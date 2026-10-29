@@ -10,7 +10,8 @@
 //   6. Loops over OC groups and spatial tiles
 //
 // Tiling loops (outer → inner):
-//   tile_y → tile_x → oc_group
+//   default:     tile_y → tile_x → oc_group
+//   group-major: oc_group → tile_y → tile_x
 //
 // Key simplification for V2 first-pass:
 //   - k_depth > ARRAY_SIZE supported via multi-pass partial sum accumulation
@@ -47,6 +48,7 @@ module npu_compute #(
     input  wire                         wgt_reload_done, // Controller loaded next oc_group's weights
     input  wire [31:0]                  cfg_wgt_per_oc,  // Per-oc weight words (0=all weights fit, skip reload)
     input  wire                         cfg_wgt_layout,  // 0=legacy OC-major, 1=K-major (64-lane row)
+    input  wire                         cfg_group_major, // Reuse one resident OC group across all spatial tiles
     input  wire                         db_prefetch_done,  // DB_EN: prefetch complete, safe to start next tile
     // Per-tile store support: actual (clipped) tile output dimensions
     output wire [15:0]                  tile_out_h_actual, // Current tile's actual output height (clipped at border)
@@ -1189,6 +1191,7 @@ module npu_compute #(
 
                     tile_y <= 0;
                     tile_x <= 0;
+                    oc_group <= 0;
                     // A layer with no output channels has nothing to compute;
                     // the OC loop would otherwise still run one group and
                     // stall waiting for a drain that never arrives.
@@ -1282,7 +1285,10 @@ module npu_compute #(
                     out_base <= cfg_ofm_base;
                 end
 
-                oc_group <= 0;
+                // The normal schedule starts each spatial tile at OC group 0.
+                // Group-major keeps the resident group while walking all tiles.
+                if (!cfg_group_major)
+                    oc_group <= 0;
                 row_ks0 <= 16'd0;
                 row_ks_reload <= 1'b0;
 
@@ -1299,9 +1305,11 @@ module npu_compute #(
                 end else if (cfg_op_type == 8'd5) begin
                     state <= S_RESIZE_SETUP;
                 end else begin
-                    // Conv2D/FC: if per-oc reload, need to reload oc_group 0 weights
-                    // (SRAM still has last oc_group's weights from previous tile)
-                    if (cfg_wgt_per_oc != 0) begin
+                    // In the normal tile-major schedule, SRAM still contains
+                    // the previous tile's final group and group 0 must be
+                    // restored. Group-major keeps one group resident across
+                    // tiles; group 0 was loaded before compute_start.
+                    if (cfg_wgt_per_oc != 0 && !cfg_group_major) begin
                         oc_group_done <= 1'b1;  // Request reload of oc_group 0
                         state <= S_WAIT_WGT_RELOAD;
                     end else begin
@@ -1806,7 +1814,36 @@ module npu_compute #(
 
 
             S_OC_NEXT: begin
-                if (oc_group + 1 >= oc_groups_total) begin
+                if (cfg_group_major) begin
+                    // One OC group has completed for this tile. Keep its
+                    // weights resident and advance spatially. At the last
+                    // tile, request the next group only after the controller
+                    // has written this group's channel slice to DDR.
+                    if (cfg_tile_h == 17'd0) begin
+                        state <= S_DONE;
+                    end else if (tile_x + 1 < cfg_tile_num_w) begin
+                        tile_x <= tile_x + 1'b1;
+                        tile_done_r <= 1'b1;
+                        state <= S_TILE_WAIT_DB;
+                    end else if (tile_y + 1 < cfg_tile_num_h) begin
+                        tile_x <= 0;
+                        tile_y <= tile_y + 1'b1;
+                        tile_done_r <= 1'b1;
+                        state <= S_TILE_WAIT_DB;
+                    end else if (oc_group + 1 >= oc_groups_total) begin
+                        state <= S_DONE;
+                    end else begin
+                        // oc_group_out changes to the requested group. The
+                        // controller derives the just-completed store group as
+                        // oc_group_out-1 while oc_group_done is asserted.
+                        tile_x <= 0;
+                        tile_y <= 0;
+                        oc_group <= oc_group + 1'b1;
+                        tile_done_r <= 1'b1;
+                        oc_group_done <= 1'b1;
+                        state <= S_WAIT_WGT_RELOAD;
+                    end
+                end else if (oc_group + 1 >= oc_groups_total) begin
                     state <= S_TILE_NEXT;
                 end else begin
                     oc_group <= oc_group + 1;
@@ -1880,6 +1917,11 @@ module npu_compute #(
                         param_word_idx <= 0;
                         param_read_issued <= 1'b0;
                         state <= S_POOL_CH_SETUP;
+                    end else if (cfg_group_major) begin
+                        // Weight, params, and tile(0,0) activation are all
+                        // resident when the controller acknowledges a
+                        // group-major reload.
+                        state <= S_TILE_SETUP;
                     end else begin
                         state <= S_OC_SETUP;
                     end

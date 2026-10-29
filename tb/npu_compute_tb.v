@@ -169,6 +169,7 @@ module npu_compute_tb #(
         .oc_group_done(), .oc_group_out(),
         .wgt_reload_done(1'b1), .cfg_wgt_per_oc(32'd0),
         .cfg_wgt_layout(cfg_wgt_layout),
+        .cfg_group_major(1'b0),
         .db_prefetch_done(db_prefetch_done),
         .tile_out_h_actual(), .tile_out_w_actual(),
         .cfg_op_type(cfg_op_type),
