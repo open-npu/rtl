@@ -184,8 +184,9 @@ module npu_ctrl #(
     // Input words = in_size / 4
     wire [15:0] in_words = cfg_dma_in_size[17:2];
 
-    // Per-tile input words (for DB_EN): use tile_in_size when non-zero, else full in_words
-    wire [15:0] tile_in_words = (db_en && cfg_tile_in_size[17:2] != 0)
+    // Both ping/pong and single-buffer PTS reload one spatial tile at a time.
+    wire [15:0] tile_in_words = ((cfg_tile_h != 16'd0)
+                                 && (cfg_tile_in_size[17:2] != 0))
                                 ? cfg_tile_in_size[17:2]
                                 : in_words;
 
@@ -853,21 +854,22 @@ module npu_ctrl #(
                         compute_start <= 1'b1;
                         state         <= S_WAIT_COMP;
                         // Reset oc_group counter for this compute run
-                        // DB_EN: initialize for first tile (no prefetch for tile 0)
+                        // Initialize tiled scheduling for the first tile. PTS
+                        // also needs this state in single-buffer mode.
                         // For fused MID/END layers, skip_act_load is asserted:
                         // input is already in SRAM, no DDR load or prefetch needed.
-                        if (db_en) begin
+                        if (db_en || per_tile_store_en) begin
                             if (!skip_act_load) begin
                                 ping_pong_flag     <= 1'b0;  // Tile 0: reads Bank[0]
                                 prefetch_active    <= 1'b0;
                                 prefetch_pending   <= 1'b0;
                                 cur_tile_ddr_offset <= 32'd0;  // Tile 0: offset 0
-                                // Advance by tile_in_size when DB_EN active (per-tile), else full in_size
+                                // Advance by one packed input tile.
                                 next_tile_ddr_addr <= cfg_dma_in_addr
-                                    + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                                    + (cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
                                 // Prefetch tile 1 to Bank[1] at offset 0
                                 // No intra-bank word offset: compute always reads from offset 0
-                                next_sram_offset   <= ifm_half_now;
+                                next_sram_offset   <= db_en ? ifm_half_now : 16'd0;
                             end else begin
                                 // Fused: input is contiguous in SRAM, no prefetch
                                 ping_pong_flag     <= 1'b0;
@@ -899,7 +901,8 @@ module npu_ctrl #(
                                 tile_x_seq <= tile_x_seq + 16'd1;
                             end
                             db_prefetch_done <= 1'b1;
-                        end else if (db_en && tile_done && !prefetch_active && !skip_act_load) begin
+                        end else if ((db_en || per_tile_store_en) && tile_done
+                                     && !prefetch_active && !skip_act_load) begin
                             if (per_tile_store_en) begin
                                 // Latch current tile's bank for store
                                 store_bank <= ping_pong_flag;
@@ -925,7 +928,8 @@ module npu_ctrl #(
                                 dma_dir        <= 1'b0;  // load
                                 dma_sram_sel   <= 2'd1;  // activation
                                 dma_ext_addr   <= use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr;
-                                dma_sram_addr  <= next_sram_offset + (use_2d_load ? nxt_2d_sram_pad : 16'd0);
+                                dma_sram_addr  <= (db_en ? next_sram_offset : 16'd0)
+                                                + (use_2d_load ? nxt_2d_sram_pad : 16'd0);
                                 dma_xfer_len   <= use_2d_load ? nxt_2d_xfer : next_xfer_words;
                                 // 2D load when in_stride != 0 (NHWC chain mode)
                                 if (use_2d_load) begin
@@ -939,12 +943,14 @@ module npu_ctrl #(
                                     dma_out_stride<= 32'd0;
                                 end
                                 prefetch_active  <= 1'b1;
-                                prefetch_pending <= 1'b1;
+                                // SB+PTS reloads bank 0 and must not flip the
+                                // compute bank after DMA completion.
+                                prefetch_pending <= db_en;
                                 db_prefetch_done <= 1'b0;
                                 cur_tile_ddr_offset <= (use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr) - cfg_dma_in_addr;
                                 if (!use_2d_load)
                                     next_tile_ddr_addr <= next_tile_ddr_addr
-                                        + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                                        + (cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
                                 next_sram_offset <= (next_sram_offset >= ifm_half_now) ?
                                                     16'd0 : ifm_half_now;
                             end
@@ -994,9 +1000,9 @@ module npu_ctrl #(
                                 if (skip_store)
                                     state <= S_DONE;
                                 else if (per_tile_store_en && !slice_stream) begin
-                                    // (PTS is only meaningful for tiled DB_EN
-                                    // layers; slice_stream stores via S_STORE_OUT
-                                    // from DW_STREAM_OUT_BASE)
+                                    // PTS supports both ping/pong and
+                                    // single-buffer tiled layers. Slice-stream
+                                    // stores via S_STORE_OUT instead.
                                     // Last tile NOT yet stored (tile_done doesn't fire
                                     // for final tile). Go to S_TILE_STORE to store it,
                                     // then S_TILE_STORE_WAIT → S_DONE (skip prefetch).
@@ -1086,7 +1092,8 @@ module npu_ctrl #(
                                 dma_sram_sel   <= 2'd1;  // activation
                                 // 2D mode: use computed next tile address
                                 dma_ext_addr   <= use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr;
-                                dma_sram_addr  <= next_sram_offset + (use_2d_load ? nxt_2d_sram_pad : 16'd0);
+                                dma_sram_addr  <= (db_en ? next_sram_offset : 16'd0)
+                                                + (use_2d_load ? nxt_2d_sram_pad : 16'd0);
                                 dma_xfer_len   <= use_2d_load ? nxt_2d_xfer : next_xfer_words;
                                 // 2D load when in_stride != 0 (NHWC chain mode)
                                 if (use_2d_load) begin
@@ -1099,7 +1106,7 @@ module npu_ctrl #(
                                     dma_row_count <= 16'd0;
                                 end
                                 prefetch_active  <= 1'b1;
-                                prefetch_pending <= 1'b1;
+                                prefetch_pending <= db_en;
                                 db_prefetch_done <= 1'b0;
                                 cur_tile_ddr_offset <= (use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr) - cfg_dma_in_addr;
                                 `ifndef SYNTHESIS
@@ -1112,10 +1119,13 @@ module npu_ctrl #(
                                 // In 2D mode, next_tile_ddr_addr is computed from tile coords
                                 if (!use_2d_load)
                                     next_tile_ddr_addr <= next_tile_ddr_addr
-                                        + (db_en && cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
-                                // Toggle target bank for next prefetch
-                                next_sram_offset <= (next_sram_offset >= ifm_half_now) ?
-                                                    16'd0 : ifm_half_now;
+                                        + (cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                                // Toggle only when physical ping/pong is active.
+                                if (db_en)
+                                    next_sram_offset <= (next_sram_offset >= ifm_half_now) ?
+                                                        16'd0 : ifm_half_now;
+                                else
+                                    next_sram_offset <= 16'd0;
                             end else begin
                                 db_prefetch_done <= 1'b1;
                             end

@@ -548,9 +548,8 @@ def save_golden(output_dir, int16_mode=False, force_tiling=False, db_en=False):
         if db_en:
             sched_ctrl = 0x01  # DB_EN
         elif has_tiling:
-            # Non-DB_EN tiled: need both DB_EN and PTS for per-tile store
-            # (PTS path requires DB_EN to get tile_done signal)
-            sched_ctrl = 0x11  # DB_EN | PTS
+            # Single-buffer tiling stores each tile before bank-0 reuse.
+            sched_ctrl = 0x10  # PTS
         else:
             sched_ctrl = 0x00  # no tiling
 
