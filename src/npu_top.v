@@ -48,6 +48,7 @@ module npu_top #(
     output wire [31:0]  wb_mst_adr_o,
     output wire [31:0]  wb_mst_dat_o,
     output wire [3:0]   wb_mst_sel_o,
+    output wire [2:0]   wb_mst_cti_o,
     input  wire         wb_mst_ack_i,
     input  wire [31:0]  wb_mst_dat_i,
 
@@ -366,6 +367,7 @@ module npu_top #(
         .wb_adr_o       (wb_mst_adr_o),
         .wb_dat_o       (wb_mst_dat_o),
         .wb_sel_o       (wb_mst_sel_o),
+        .wb_cti_o       (wb_mst_cti_o),
         .wb_ack_i       (wb_mst_ack_i),
         .wb_dat_i       (wb_mst_dat_i),
         // SRAM interface (muxed by controller phase)

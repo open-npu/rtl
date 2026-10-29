@@ -8,7 +8,7 @@
 //   - Configurable source address, destination address, transfer length
 //   - Configurable external address stride (load/store)
 //   - Auto-increment SRAM addressing
-//   - Held-cycle Wishbone loads (retain bus ownership across words)
+//   - Incrementing-burst Wishbone loads (one accepted word per cycle)
 //   - Direction: MEM→SRAM (load) or SRAM→MEM (store)
 //   - Busy/done status signals
 //   - Abort capability
@@ -65,6 +65,7 @@ module npu_dma #(
     output reg  [ADDR_W-1:0]   wb_adr_o,
     output reg  [DATA_W-1:0]   wb_dat_o,
     output wire [3:0]          wb_sel_o,
+    output wire [2:0]          wb_cti_o,
     input  wire                 wb_ack_i,
     input  wire [DATA_W-1:0]   wb_dat_i,
 
@@ -87,10 +88,11 @@ module npu_dma #(
     // ─── FSM States ───
     localparam S_IDLE    = 3'd0;
     localparam S_LOAD    = 3'd1;  // MEM→SRAM: issue WB read
-    localparam S_LOAD_WR = 3'd2;  // MEM→SRAM: launch next held-cycle beat
+    localparam S_STORE_LATCH = 3'd2;  // Capture synchronous SRAM read data
     localparam S_STORE_RD= 3'd3;  // SRAM→MEM: read from SRAM
     localparam S_STORE   = 3'd4;  // SRAM→MEM: issue WB write
     localparam S_DONE    = 3'd5;
+    localparam S_STORE_REQ = 3'd6; // Present captured SRAM data to Wishbone
 
     reg [2:0] state;
     reg [ADDR_W-1:0]      r_ext_addr;
@@ -114,6 +116,14 @@ module npu_dma #(
     // In 2D store: words [0..r_row_len-1] written to DDR, words [r_row_len..r_src_row_len-1]
     //   read from SRAM but skipped (padding). SRAM always r_sram_addr++.
     wire [15:0]           effective_src_len = (r_src_row_len != 16'd0) ? r_src_row_len : r_row_len;
+    // Loads use Wishbone B4 incrementing bursts. End each 2D row explicitly
+    // because the following row can jump by an arbitrary external stride.
+    assign wb_cti_o = (wb_cyc_o && wb_stb_o && !wb_we_o)
+                    ? (((xfer_count + 16'd1 >= r_xfer_len)
+                        || (mode_2d
+                            && (r_row_word_count + 16'd1 >= r_row_len)))
+                       ? 3'b111 : 3'b010)
+                    : 3'b000;
 
     // Burst length decode (not used for now — single-beat transfers)
     // wire [5:0] burst_len = (burst_cfg == 2'd0) ? 6'd4 :
@@ -210,12 +220,9 @@ module npu_dma #(
                                         r_row_word_count, r_row_len);
                             end
                             `endif
-                            // Commit the accepted beat directly to SRAM. Keep CYC
-                            // asserted between words so the interconnect retains
-                            // ownership, but pulse STB low before the next classic
-                            // beat. This interface has no STALL/request tags, so
-                            // treating a level ACK as multiple outstanding
-                            // responses would duplicate data.
+                            // Commit the accepted beat directly to SRAM. CTI marks
+                            // an incrementing burst, so LiteX acknowledges each
+                            // successive address without the classic-cycle bubble.
                             sram_en     <= 1'b1;
                             sram_we     <= 1'b1;
                             sram_addr_o <= r_sram_addr;
@@ -249,14 +256,27 @@ module npu_dma #(
                                 state    <= S_DONE;
                             end else begin
                                 wb_cyc_o <= 1'b1;
-                                wb_stb_o <= 1'b0;
-                                state    <= S_LOAD_WR;
+                                wb_stb_o <= 1'b1;
+                                state    <= S_LOAD;
                             end
                         end
                     end
                 end
 
-                S_LOAD_WR: begin
+                S_STORE_LATCH: begin
+                    if (abort) begin
+                        wb_cyc_o <= 1'b0;
+                        wb_stb_o <= 1'b0;
+                        state    <= S_DONE;
+                    end else begin
+                        // The SRAM sees registered sram_en at this edge and
+                        // updates rdata after it; wait one more cycle before
+                        // sampling the read result.
+                        state <= S_STORE_REQ;
+                    end
+                end
+
+                S_STORE_REQ: begin
                     if (abort) begin
                         wb_cyc_o <= 1'b0;
                         wb_stb_o <= 1'b0;
@@ -264,9 +284,10 @@ module npu_dma #(
                     end else begin
                         wb_cyc_o <= 1'b1;
                         wb_stb_o <= 1'b1;
-                        wb_we_o  <= 1'b0;
+                        wb_we_o  <= 1'b1;
                         wb_adr_o <= r_ext_addr;
-                        state    <= S_LOAD;
+                        wb_dat_o <= sram_rdata;
+                        state    <= S_STORE;
                     end
                 end
 
@@ -279,7 +300,7 @@ module npu_dma #(
                         sram_en     <= 1'b1;
                         sram_we     <= 1'b0;
                         sram_addr_o <= r_sram_addr;
-                        state       <= S_STORE;
+                        state       <= S_STORE_LATCH;
                     end
                 end
 
@@ -300,7 +321,6 @@ module npu_dma #(
                                      $time, xfer_count, r_ext_addr, r_sram_addr, sram_rdata,
                                      r_row_word_count, r_row_len, r_row_count);
                         `endif
-                        wb_dat_o <= sram_rdata;
                         if (wb_ack_i) begin
                             `ifdef NPU_SIM_DEBUG
                             if (wb_we_o && xfer_count < 20) begin

@@ -18,21 +18,31 @@ class WbSlaveMemory:
         self.dut = dut
         self.mem = {}
         self.size_words = size_words
+        self.read_addrs = []
+        self.write_log = []
 
     async def run(self):
         """Background task: respond to Wishbone transactions."""
         while True:
             await RisingEdge(self.dut.clk)
+            # Sample registered master outputs after NBA updates, then drive
+            # the synchronous response before the following clock edge.
+            await ReadOnly()
             if int(self.dut.wb_cyc_o.value) and int(self.dut.wb_stb_o.value):
                 addr = int(self.dut.wb_adr_o.value)
+                await Timer(1, unit="step")
                 if int(self.dut.wb_we_o.value):
                     # Write
-                    self.mem[addr] = int(self.dut.wb_dat_o.value)
+                    data = int(self.dut.wb_dat_o.value)
+                    self.mem[addr] = data
+                    self.write_log.append((addr, data))
                 else:
                     # Read
+                    self.read_addrs.append(addr)
                     self.dut.wb_dat_i.value = self.mem.get(addr, 0)
                 self.dut.wb_ack_i.value = 1
             else:
+                await Timer(1, unit="step")
                 self.dut.wb_ack_i.value = 0
 
 
@@ -165,6 +175,7 @@ async def test_load_keeps_bus_ownership(dut):
     cycles = 0
     busy_seen = False
     premature_cyc_drops = 0
+    burst_beats = 0
     while cycles < 100:
         await RisingEdge(dut.clk)
         cycles += 1
@@ -174,6 +185,10 @@ async def test_load_keeps_bus_ownership(dut):
                     and not int(dut.wb_cyc_o.value)):
                 premature_cyc_drops += 1
             busy_seen = True
+        if int(dut.wb_cyc_o.value) and int(dut.wb_stb_o.value):
+            cti = int(dut.wb_cti_o.value)
+            assert cti in (0b010, 0b111), f"invalid load CTI {cti:03b}"
+            burst_beats += 1
         if int(dut.done_pulse.value):
             break
         await Timer(1, unit="step")
@@ -181,9 +196,8 @@ async def test_load_keeps_bus_ownership(dut):
     assert int(dut.done_pulse.value), "held-cycle DMA load did not complete"
     assert premature_cyc_drops == 0, \
         f"CYC dropped {premature_cyc_drops} times before the final word"
-    # Classic transfers need a STB re-arm phase, but should remain below the
-    # old per-word request/ACK/write/re-arbitrate path.
-    assert cycles <= 3 * n_words + 8, \
+    assert burst_beats >= n_words, "incrementing burst was not held active"
+    assert cycles <= n_words + 8, \
         f"load inserted bubbles: {cycles} cycles for {n_words} words"
 
 
@@ -462,19 +476,6 @@ async def test_load_stride(dut):
     for i in range(N):
         wb_mem.mem[base + i * 8] = 0xF000 + i  # stride=8: data at +0, +8, +16, +24
 
-    # Monitor WB addresses
-    wb_addrs = []
-
-    async def wb_addr_monitor():
-        while True:
-            await RisingEdge(dut.clk)
-            await ReadOnly()
-            if int(dut.wb_cyc_o.value) and int(dut.wb_stb_o.value) and int(dut.wb_ack_i.value):
-                wb_addrs.append(int(dut.wb_adr_o.value))
-            await Timer(1, unit="step")
-
-    cocotb.start_soon(wb_addr_monitor())
-
     dut.dir.value = 0
     dut.ext_addr.value = base
     dut.sram_addr.value = 0
@@ -497,8 +498,8 @@ async def test_load_stride(dut):
     await Timer(1, unit="step")
     # Verify addresses: should be base, base+8, base+16, base+24
     expected_addrs = [base + i * 8 for i in range(N)]
-    assert wb_addrs == expected_addrs, \
-        f"WB addrs with stride=8: {[hex(a) for a in wb_addrs]}, expected {[hex(a) for a in expected_addrs]}"
+    assert wb_mem.read_addrs == expected_addrs, \
+        f"WB addrs with stride=8: {[hex(a) for a in wb_mem.read_addrs]}, expected {[hex(a) for a in expected_addrs]}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -526,19 +527,6 @@ async def test_store_stride(dut):
 
     cocotb.start_soon(sram_responder())
 
-    # Monitor WB addresses + data
-    wb_writes = []
-
-    async def wb_write_monitor():
-        while True:
-            await RisingEdge(dut.clk)
-            await ReadOnly()
-            if int(dut.wb_cyc_o.value) and int(dut.wb_stb_o.value) and int(dut.wb_we_o.value) and int(dut.wb_ack_i.value):
-                wb_writes.append((int(dut.wb_adr_o.value), int(dut.wb_dat_o.value)))
-            await Timer(1, unit="step")
-
-    cocotb.start_soon(wb_write_monitor())
-
     dut.dir.value = 1
     dut.ext_addr.value = 0xB000
     dut.sram_addr.value = 0
@@ -561,5 +549,5 @@ async def test_store_stride(dut):
     await Timer(1, unit="step")
     # Verify addresses: B000, B010, B020
     expected = [(0xB000 + i * 16, sram_data + i) for i in range(N)]
-    assert wb_writes == expected, \
-        f"WB writes with stride=16: {wb_writes}, expected {expected}"
+    assert wb_mem.write_log == expected, \
+        f"WB writes with stride=16: {wb_mem.write_log}, expected {expected}"
