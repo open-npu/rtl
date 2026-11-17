@@ -104,6 +104,8 @@ module npu_top #(
     wire [31:0] reg_dma_wgt_per_oc;
     wire [31:0] reg_wgt_layout;
     wire [31:0] reg_tile_in_hw;
+    wire [31:0] reg_next_param_addr, reg_next_param_cfg;
+    wire [31:0] reg_param_bank_ctrl;
 
     // --- CSR Post-Processing Config outputs ---
     wire [31:0] reg_post_ctrl, reg_post_param_addr;
@@ -125,33 +127,215 @@ module npu_top #(
     wire [15:0] wgt_k_start;
     wire [1:0]  dma_sram_sel;
     wire        act_role_swap;
+    wire        next_param_ready;
+    wire [PARAM_ADDR_W-1:0] compute_param_base;
 
     // --- DMA ↔ SRAM MUX ---
     wire        dma_sram_en, dma_sram_we;
     wire [15:0] dma_sram_addr_o;
     wire [31:0] dma_sram_wdata, dma_sram_rdata;
+    wire        dma_sram_wide_en;
+    wire [15:0] dma_sram_wide_addr;
+    wire [`SRAM_B_WIDTH-1:0] dma_sram_rdata_wide;
+    wire        compute_uses_ofm_b;
 
     // --- Performance counters ---
     reg  [31:0] perf_cycle_cnt;
     reg  [31:0] mac_cnt;
+    reg  [31:0] perf_dma_cnt;
+    reg  [31:0] perf_compute_cnt;
+    reg  [31:0] perf_overlap_cnt;
+    reg         compute_active;
     wire        mac_fire;
     wire [6:0]  mac_lanes;
+    wire [6:0]  compute_state;
+
+    // Compute FSM cycle histogram. The five original counters say how much
+    // of a layer is DMA and how much overlaps; these say what the engine is
+    // doing in the cycles it is not issuing MACs, which is what decides
+    // whether a layer is limited by data supply, writeback or setup.
+    reg  [31:0] perf_st_mac_cnt;   // row / depthwise MAC issue
+    reg  [31:0] perf_st_wait_cnt;  // gather, weight stream, DB wait
+    reg  [31:0] perf_st_wb_cnt;    // PPU and SRAM stores
+    reg  [31:0] perf_st_pool_cnt;  // pool read / accumulate / divide
+    reg  [31:0] perf_st_add_cnt;   // elementwise add
+    reg  [31:0] perf_st_rsz_cnt;   // resize
+    reg  [31:0] perf_st_cfg_cnt;   // layer, tile and oc-group setup
+    reg  [31:0] perf_st_oth_cnt;   // anything not classified above
+
+    // Second-level split of the wait bucket. The three sources need
+    // completely different fixes: activation supply wants deeper
+    // pipelining, weight streaming wants residency, tile switching is a
+    // scheduling problem.
+    reg  [31:0] perf_wait_act_cnt; // row gather filling, pool/add act reads
+    reg  [31:0] perf_wait_wgt_cnt; // weight stream and oc-group reload
+    reg  [31:0] perf_wait_db_cnt;  // tile ping-pong handshake
+    reg  [31:0] perf_wait_store_cnt; // ... of which waiting for the DDR writeback
+    // Cycles inside the MAC state that did not issue a MAC. Non-zero here
+    // means the gather is not running ahead of the array.
+    reg  [31:0] perf_mac_idle_cnt;
+    wire        ctrl_store_phase;
+
+    // State groups mirror the npu_compute localparams. Keeping the numbers
+    // here avoids threading the FSM enum through the hierarchy.
+    wire st_is_mac  = (compute_state == 7'd70)   // S_ROW_MAC
+                   || (compute_state == 7'd20);  // S_DW_COMPUTE
+    wire st_is_wait = (compute_state == 7'd74)   // S_ROW_FILL
+                   || (compute_state == 7'd68)   // S_ROW_WGT
+                   || (compute_state == 7'd62)   // S_TILE_WAIT_DB
+                   || (compute_state == 7'd63);  // S_WAIT_WGT_RELOAD
+    wire st_is_wb   = (compute_state == 7'd71)   // S_ROW_PUSH
+                   || (compute_state == 7'd72)   // S_ROW_TAIL
+                   || (compute_state == 7'd21)   // S_DW_DRAIN
+                   || (compute_state == 7'd25)   // S_DW_PPU_WAIT
+                   || (compute_state == 7'd35)   // S_POOL_PPU
+                   || (compute_state == 7'd36)   // S_POOL_PPU_WAIT
+                   || (compute_state == 7'd37)   // S_POOL_WB
+                   || (compute_state == 7'd45)   // S_ADD_PPU
+                   || (compute_state == 7'd46)   // S_ADD_PPU_WAIT
+                   || (compute_state == 7'd47)   // S_ADD_WB
+                   || (compute_state == 7'd57)   // S_RESIZE_PPU
+                   || (compute_state == 7'd58)   // S_RESIZE_PPU_WAIT
+                   || (compute_state == 7'd59)   // S_RESIZE_WB
+                   || (compute_state == 7'd78)   // S_ADD_VEC_WAIT
+                   || (compute_state == 7'd79)   // S_ADD_VEC_WB
+                   || (compute_state == 7'd84)   // S_POOL_VEC_WAIT
+                   || (compute_state == 7'd85);  // S_POOL_VEC_WB
+    wire st_is_pool = (compute_state == 7'd81)   // S_POOL_VEC_READ
+                   || (compute_state == 7'd82)   // S_POOL_VEC_ACC
+                   || (compute_state == 7'd87)   // S_POOL_VEC_DIV
+                   || (compute_state == 7'd32)   // S_POOL_READ
+                   || (compute_state == 7'd33)   // S_POOL_ACC
+                   || (compute_state == 7'd34);  // S_POOL_DIV
+    wire st_is_add  = (compute_state == 7'd75)   // S_ADD_VEC_READ_A
+                   || (compute_state == 7'd76)   // S_ADD_VEC_READ_B
+                   || (compute_state == 7'd77)   // S_ADD_VEC_COMPUTE
+                   || (compute_state == 7'd42)   // S_ADD_READ_A
+                   || (compute_state == 7'd43)   // S_ADD_READ_B
+                   || (compute_state == 7'd44);  // S_ADD_COMPUTE
+    wire st_is_rsz  = (compute_state >= 7'd49 && compute_state <= 7'd61)
+                   || (compute_state == 7'd64)
+                   || (compute_state == 7'd65);
+    wire st_is_cfg  = (compute_state == 7'd1)    // S_TILE_SETUP
+                   || (compute_state == 7'd2)    // S_OC_SETUP
+                   || (compute_state == 7'd16)   // S_OC_NEXT
+                   || (compute_state == 7'd17)   // S_TILE_NEXT
+                   || (compute_state == 7'd18)   // S_DONE
+                   || (compute_state == 7'd19)   // S_DW_WGT_LOAD
+                   || (compute_state == 7'd22)   // S_DW_PARAM
+                   || (compute_state == 7'd30)   // S_POOL_SETUP
+                   || (compute_state == 7'd31)   // S_POOL_CH_SETUP
+                   || (compute_state == 7'd39)   // S_POOL_CH_NEXT
+                   || (compute_state == 7'd40)   // S_ADD_SETUP
+                   || (compute_state == 7'd41)   // S_ADD_PARAM
+                   || (compute_state == 7'd48)   // S_ADD_NEXT
+                   || (compute_state == 7'd73)   // S_ROW_GRP
+                   || (compute_state == 7'd80)   // S_POOL_VEC_PARAM
+                   || (compute_state == 7'd86);  // S_POOL_VEC_NEXT
+    wire st_active  = compute_active;
+    wire st_cls     = st_is_mac | st_is_wait | st_is_wb | st_is_pool
+                    | st_is_add | st_is_rsz | st_is_cfg;
+
+    // Split of the wait bucket by what the engine is blocked on.
+    wire wt_wgt = (compute_state == 7'd68)   // S_ROW_WGT
+               || (compute_state == 7'd63);  // S_WAIT_WGT_RELOAD
+    wire wt_db  = (compute_state == 7'd62);  // S_TILE_WAIT_DB
+    wire wt_act = st_is_wait & ~wt_wgt & ~wt_db;
+    wire wt_store = wt_db & ctrl_store_phase;
+    // A MAC-state cycle with no MAC issue: the array is starved.
+    wire mac_idle = st_is_mac & ~mac_fire & ~dw_in_valid;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             perf_cycle_cnt <= 32'd0;
             mac_cnt        <= 32'd0;
+            perf_dma_cnt   <= 32'd0;
+            perf_compute_cnt <= 32'd0;
+            perf_overlap_cnt <= 32'd0;
+            compute_active <= 1'b0;
+            perf_st_mac_cnt  <= 32'd0;
+            perf_st_wait_cnt <= 32'd0;
+            perf_st_wb_cnt   <= 32'd0;
+            perf_st_pool_cnt <= 32'd0;
+            perf_st_add_cnt  <= 32'd0;
+            perf_st_rsz_cnt  <= 32'd0;
+            perf_st_cfg_cnt  <= 32'd0;
+            perf_st_oth_cnt  <= 32'd0;
+            perf_wait_act_cnt <= 32'd0;
+            perf_wait_wgt_cnt <= 32'd0;
+            perf_wait_db_cnt  <= 32'd0;
+            perf_mac_idle_cnt <= 32'd0;
+            perf_wait_store_cnt <= 32'd0;
         end else if (ctrl_soft_rst) begin
             perf_cycle_cnt <= 32'd0;
             mac_cnt        <= 32'd0;
-        end else if (hw_busy) begin
-            perf_cycle_cnt <= perf_cycle_cnt + 1;
-            // Row: mac_lanes products on a mac_fire cycle.
-            // DW Conv: 1 MAC per dw_in_valid pulse
-            if (mac_fire)
-                mac_cnt <= mac_cnt + {25'd0, mac_lanes};
-            else if (dw_in_valid)
-                mac_cnt <= mac_cnt + 1;
+            perf_dma_cnt   <= 32'd0;
+            perf_compute_cnt <= 32'd0;
+            perf_overlap_cnt <= 32'd0;
+            compute_active <= 1'b0;
+            perf_st_mac_cnt  <= 32'd0;
+            perf_st_wait_cnt <= 32'd0;
+            perf_st_wb_cnt   <= 32'd0;
+            perf_st_pool_cnt <= 32'd0;
+            perf_st_add_cnt  <= 32'd0;
+            perf_st_rsz_cnt  <= 32'd0;
+            perf_st_cfg_cnt  <= 32'd0;
+            perf_st_oth_cnt  <= 32'd0;
+            perf_wait_act_cnt <= 32'd0;
+            perf_wait_wgt_cnt <= 32'd0;
+            perf_wait_db_cnt  <= 32'd0;
+            perf_mac_idle_cnt <= 32'd0;
+            perf_wait_store_cnt <= 32'd0;
+        end else begin
+            if (compute_start)
+                compute_active <= 1'b1;
+            if (compute_done)
+                compute_active <= 1'b0;
+            if (hw_busy) begin
+                perf_cycle_cnt <= perf_cycle_cnt + 1;
+                if (dma_busy)
+                    perf_dma_cnt <= perf_dma_cnt + 1;
+                if (compute_active || compute_start)
+                    perf_compute_cnt <= perf_compute_cnt + 1;
+                if (dma_busy && (compute_active || compute_start))
+                    perf_overlap_cnt <= perf_overlap_cnt + 1;
+                // Row: mac_lanes products on a mac_fire cycle.
+                // DW Conv: 1 MAC per dw_in_valid pulse
+                if (mac_fire)
+                    mac_cnt <= mac_cnt + {25'd0, mac_lanes};
+                else if (dw_in_valid)
+                    mac_cnt <= mac_cnt + 1;
+            end
+            // Histogram runs while the engine is active, so the buckets sum
+            // to the compute-active span even when the DMA is the limiter.
+            if (st_active) begin
+                if (st_is_mac)
+                    perf_st_mac_cnt  <= perf_st_mac_cnt + 1;
+                else if (st_is_wait)
+                    perf_st_wait_cnt <= perf_st_wait_cnt + 1;
+                else if (st_is_wb)
+                    perf_st_wb_cnt   <= perf_st_wb_cnt + 1;
+                else if (st_is_pool)
+                    perf_st_pool_cnt <= perf_st_pool_cnt + 1;
+                else if (st_is_add)
+                    perf_st_add_cnt  <= perf_st_add_cnt + 1;
+                else if (st_is_rsz)
+                    perf_st_rsz_cnt  <= perf_st_rsz_cnt + 1;
+                else if (st_is_cfg)
+                    perf_st_cfg_cnt  <= perf_st_cfg_cnt + 1;
+                else
+                    perf_st_oth_cnt  <= perf_st_oth_cnt + 1;
+            end
+            if (wt_act)
+                perf_wait_act_cnt <= perf_wait_act_cnt + 1;
+            if (wt_wgt)
+                perf_wait_wgt_cnt <= perf_wait_wgt_cnt + 1;
+            if (wt_db)
+                perf_wait_db_cnt  <= perf_wait_db_cnt + 1;
+            if (wt_store)
+                perf_wait_store_cnt <= perf_wait_store_cnt + 1;
+            if (mac_idle)
+                perf_mac_idle_cnt <= perf_mac_idle_cnt + 1;
         end
     end
 
@@ -161,7 +345,8 @@ module npu_top #(
 
     npu_csr #(
         .ARRAY_SZ   (ARRAY_SIZE),
-        .SPAD_KB_P  (SPAD_KB)
+        .SPAD_KB_P  (SPAD_KB),
+        .PARAM_DEPTH_P(PARAM_DEPTH)
     ) u_csr (
         .clk            (clk),
         .rst_n          (rst_n),
@@ -184,6 +369,23 @@ module npu_top #(
         .hw_curr_layer  (hw_curr_layer),
         .hw_perf_cnt    (perf_cycle_cnt),
         .hw_mac_cnt     (mac_cnt),
+        .hw_perf_dma_cnt(perf_dma_cnt),
+        .hw_perf_compute_cnt(perf_compute_cnt),
+        .hw_perf_overlap_cnt(perf_overlap_cnt),
+        .hw_perf_st_mac_cnt (perf_st_mac_cnt),
+        .hw_perf_st_wait_cnt(perf_st_wait_cnt),
+        .hw_perf_st_wb_cnt  (perf_st_wb_cnt),
+        .hw_perf_st_pool_cnt(perf_st_pool_cnt),
+        .hw_perf_st_add_cnt (perf_st_add_cnt),
+        .hw_perf_st_rsz_cnt (perf_st_rsz_cnt),
+        .hw_perf_st_cfg_cnt (perf_st_cfg_cnt),
+        .hw_perf_st_oth_cnt (perf_st_oth_cnt),
+        .hw_perf_wait_act_cnt(perf_wait_act_cnt),
+        .hw_perf_wait_wgt_cnt(perf_wait_wgt_cnt),
+        .hw_perf_wait_db_cnt (perf_wait_db_cnt),
+        .hw_perf_mac_idle_cnt(perf_mac_idle_cnt),
+        .hw_perf_wait_store_cnt(perf_wait_store_cnt),
+        .hw_next_param_ready(next_param_ready),
         // Control outputs
         .ctrl_start     (ctrl_start),
         .ctrl_abort     (ctrl_abort),
@@ -227,6 +429,9 @@ module npu_top #(
         .reg_dma_wgt_per_oc (reg_dma_wgt_per_oc),
         .reg_wgt_layout     (reg_wgt_layout),
         .reg_tile_in_hw      (reg_tile_in_hw),
+        .reg_next_param_addr (reg_next_param_addr),
+        .reg_next_param_cfg  (reg_next_param_cfg),
+        .reg_param_bank_ctrl (reg_param_bank_ctrl),
         // Post-processing config
         .reg_post_ctrl          (reg_post_ctrl),
         .reg_post_param_addr    (reg_post_param_addr),
@@ -296,6 +501,14 @@ module npu_top #(
         .cfg_out_base       ({{(16-ACT_ADDR_W){1'b0}},
                               reg_sram_base[ACT_ADDR_W+16-1:16]}),
         .cfg_dma_add_b_addr (reg_dma_add_b_addr),
+        .cfg_param_preloaded(reg_param_bank_ctrl[1]),
+        .cfg_param_bank     (reg_param_bank_ctrl[0]),
+        .cfg_next_param_en  (reg_next_param_cfg[31]),
+        .cfg_next_param_addr(reg_next_param_addr),
+        .cfg_next_param_words(reg_next_param_cfg[15:0]),
+        .cfg_next_param_bank(reg_param_bank_ctrl[2]),
+        .next_param_ready   (next_param_ready),
+        .compute_param_base (compute_param_base),
         // Per-tile store (2D DMA for NHWC)
         .cfg_dma_store_mode    (reg_dma_store_mode),
         .cfg_dma_tile_out_size (reg_dma_tile_out_size),
@@ -326,6 +539,7 @@ module npu_top #(
         // Double-Buffer
         .ping_pong_flag     (ping_pong_flag),
         .db_prefetch_done   (db_prefetch_done),
+        .ctrl_store_phase   (ctrl_store_phase),
         .tile_done          (tile_done),
         .cfg_act_bank_offset({1'b0, IFM_DEPTH[15:1]}),
         .cfg_ofm_bank_offset({1'b0, OFM_DEPTH[15:1]}),
@@ -377,7 +591,11 @@ module npu_top #(
         .sram_we        (dma_sram_we),
         .sram_addr_o    (dma_sram_addr_o),
         .sram_wdata     (dma_sram_wdata),
-        .sram_rdata     (dma_sram_rdata)
+        .sram_rdata     (dma_sram_rdata),
+        .sram_wide_en   (dma_sram_wide_en),
+        .sram_wide_addr (dma_sram_wide_addr),
+        .sram_rdata_wide(dma_sram_rdata_wide),
+        .sram_wide_wait (compute_uses_ofm_b)
     );
 
     // ════════════════════════════════════════════════════════════════════
@@ -736,6 +954,7 @@ module npu_top #(
         .cfg_resize_cfg (reg_resize_cfg),
         .cfg_deconv_cfg (reg_deconv_cfg),
         .cfg_concat_cfg (reg_concat_cfg),
+        .cfg_param_base (compute_param_base),
         .cfg_2d_load    (npu_2d_load),  // 2D load when in_stride set
         // Weight SRAM Port B
         .wgt_rd_en      (wgt_b_en),
@@ -800,14 +1019,21 @@ module npu_top #(
         .cfg_group_major    (group_major_en),
         .db_prefetch_done   (db_prefetch_done),
         .tile_out_h_actual  (tile_out_h_actual),
-        .tile_out_w_actual  (tile_out_w_actual)
+        .tile_out_w_actual  (tile_out_w_actual),
+        .dbg_state          (compute_state)
     );
 
     // ─── SRAM Port B: IFM read ∥ OFM write (and OFM RMW read) ───
     // Logical IFM = phys0 when !swap, phys1 when swap.
+    // Compute always owns OFM Port B when it writes or RMW-reads; a concurrent
+    // background store wide read yields for one cycle via sram_wide_wait.
     wire ifm_b_en = act_b_rd_en && !act_rd_ofm;
-    wire ofm_b_en_log = (act_b_rd_en && act_rd_ofm) || act_b_wr_en;
-    wire [ACT_ADDR_W-1:0] ofm_b_addr_log = act_b_wr_en ? act_b_wr_addr : act_b_rd_addr;
+    assign compute_uses_ofm_b = (act_b_rd_en && act_rd_ofm) || act_b_wr_en;
+    wire ofm_b_en_log = compute_uses_ofm_b || dma_sram_wide_en;
+    wire [ACT_ADDR_W-1:0] ofm_b_addr_log
+        = act_b_wr_en ? act_b_wr_addr
+        : (act_b_rd_en && act_rd_ofm) ? act_b_rd_addr
+        : dma_sram_wide_addr[ACT_ADDR_W-1:0];
 
     assign act_b_en        = act_role_swap ? ofm_b_en_log : ifm_b_en;
     assign act_phys0_b_we  = act_role_swap ? act_b_wr_en : 1'b0;
@@ -820,6 +1046,7 @@ module npu_top #(
     wire [`SRAM_B_WIDTH-1:0] ifm_b_rdata = act_role_swap ? ofm_b_rdata : act_b_rdata;
     wire [`SRAM_B_WIDTH-1:0] ofm_b_rdata_log = act_role_swap ? act_b_rdata : ofm_b_rdata;
     assign act_rd_mux = act_rd_ofm ? ofm_b_rdata_log : ifm_b_rdata;
+    assign dma_sram_rdata_wide = ofm_b_rdata_log;
 
 `ifdef VCD_TRACE
 // Minimal VCD: selected row-engine signals only

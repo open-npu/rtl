@@ -1697,7 +1697,7 @@ async def program_resize_layer(wb, meta, data):
 
 @cocotb.test()
 async def test_pool_max_2x2_s2(dut):
-    """MaxPool 2x2 stride 2, 4x4x8 -> 2x2x8, INT8."""
+    """Wide MaxPool 2x2 stride 2, 4x4x64 -> 2x2x64, INT8."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset(dut)
 
@@ -1707,7 +1707,7 @@ async def test_pool_max_2x2_s2(dut):
 
     meta, data = gen_pooling_test(mode='max', pool_h=2, pool_w=2,
                                   pool_sh=2, pool_sw=2,
-                                  in_h=4, in_w=4, in_c=8, seed=42)
+                                  in_h=4, in_w=4, in_c=64, seed=42)
 
     # Populate DDR
     mem.populate(POOL_IN_ADDR, data['input_words'])
@@ -1744,7 +1744,7 @@ async def test_pool_max_2x2_s2(dut):
 
 @cocotb.test()
 async def test_pool_avg_2x2_s2(dut):
-    """AvgPool 2x2 stride 2, 4x4x8 -> 2x2x8, INT8."""
+    """Wide AvgPool 2x2 stride 2, 4x4x64 -> 2x2x64, INT8."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset(dut)
 
@@ -1754,7 +1754,7 @@ async def test_pool_avg_2x2_s2(dut):
 
     meta, data = gen_pooling_test(mode='avg', pool_h=2, pool_w=2,
                                   pool_sh=2, pool_sw=2,
-                                  in_h=4, in_w=4, in_c=8, seed=43)
+                                  in_h=4, in_w=4, in_c=64, seed=43)
 
     mem.populate(POOL_IN_ADDR, data['input_words'])
     mem.populate(POOL_PARAM_ADDR, data['param_words'])
@@ -1788,7 +1788,7 @@ async def test_pool_avg_2x2_s2(dut):
 
 @cocotb.test()
 async def test_pool_avg_global(dut):
-    """Global AvgPool 4x4x4 -> 1x1x4, INT8."""
+    """Wide global AvgPool 4x4x64 -> 1x1x64, INT8."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset(dut)
 
@@ -1798,7 +1798,7 @@ async def test_pool_avg_global(dut):
 
     meta, data = gen_pooling_test(mode='avg', pool_h=4, pool_w=4,
                                   pool_sh=4, pool_sw=4,
-                                  in_h=4, in_w=4, in_c=4,
+                                  in_h=4, in_w=4, in_c=64,
                                   global_pool=True, seed=44)
 
     mem.populate(POOL_IN_ADDR, data['input_words'])
@@ -1864,7 +1864,7 @@ async def test_pool_avg_global_8x8(dut):
 
 @cocotb.test()
 async def test_pool_max_int16(dut):
-    """MaxPool 2x2 stride 2, 4x4x8 -> 2x2x8, INT16."""
+    """Wide MaxPool 2x2 stride 2, 4x4x32 -> 2x2x32, INT16."""
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     await reset(dut)
 
@@ -1874,7 +1874,7 @@ async def test_pool_max_int16(dut):
 
     meta, data = gen_pooling_test(mode='max', pool_h=2, pool_w=2,
                                   pool_sh=2, pool_sw=2,
-                                  in_h=4, in_w=4, in_c=8,
+                                  in_h=4, in_w=4, in_c=32,
                                   int16_mode=True, seed=45)
 
     mem.populate(POOL_IN_ADDR, data['input_words'])

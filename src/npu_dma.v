@@ -74,7 +74,13 @@ module npu_dma #(
     output reg                  sram_we,
     output reg  [SRAM_ADDR_W-1:0] sram_addr_o,
     output reg  [DATA_W-1:0]   sram_wdata,
-    input  wire [DATA_W-1:0]   sram_rdata
+    input  wire [DATA_W-1:0]   sram_rdata,
+
+    // Wide activation-OFM read port used by stores.
+    output reg                  sram_wide_en,
+    output reg  [SRAM_ADDR_W-1:0] sram_wide_addr,
+    input  wire [`SRAM_B_WIDTH-1:0] sram_rdata_wide,
+    input  wire                 sram_wide_wait
 );
 
     // Always select all bytes
@@ -112,13 +118,15 @@ module npu_dma #(
     reg [15:0]            r_row_word_count;
     reg [15:0]            r_src_row_len;  // SRAM words per row (>= r_row_len; extra = padding skip)
     reg [ADDR_W-1:0]      r_row_base;
+    reg [`SRAM_B_WIDTH-1:0] store_wide_buf;
+    reg [4:0]                store_wide_idx;
     wire                  mode_2d = (r_row_len != 16'd0) && (r_row_count != 16'd0);
     // In 2D store: words [0..r_row_len-1] written to DDR, words [r_row_len..r_src_row_len-1]
     //   read from SRAM but skipped (padding). SRAM always r_sram_addr++.
     wire [15:0]           effective_src_len = (r_src_row_len != 16'd0) ? r_src_row_len : r_row_len;
     // Loads use Wishbone B4 incrementing bursts. End each 2D row explicitly
     // because the following row can jump by an arbitrary external stride.
-    assign wb_cti_o = (wb_cyc_o && wb_stb_o && !wb_we_o)
+    assign wb_cti_o = (wb_cyc_o && wb_stb_o)
                     ? (((xfer_count + 16'd1 >= r_xfer_len)
                         || (mode_2d
                             && (r_row_word_count + 16'd1 >= r_row_len)))
@@ -145,6 +153,8 @@ module npu_dma #(
             sram_we    <= 1'b0;
             sram_addr_o<= {SRAM_ADDR_W{1'b0}};
             sram_wdata <= {DATA_W{1'b0}};
+            sram_wide_en <= 1'b0;
+            sram_wide_addr <= {SRAM_ADDR_W{1'b0}};
             r_ext_addr <= {ADDR_W{1'b0}};
             r_sram_addr<= {SRAM_ADDR_W{1'b0}};
             r_xfer_len <= 16'd0;
@@ -155,10 +165,13 @@ module npu_dma #(
             r_row_word_count <= 16'd0;
             r_src_row_len <= 16'd0;
             r_row_base <= {ADDR_W{1'b0}};
+            store_wide_buf <= {`SRAM_B_WIDTH{1'b0}};
+            store_wide_idx <= 5'd0;
         end else begin
             done_pulse <= 1'b0;  // default: clear pulse
             sram_en    <= 1'b0;  // default: SRAM idle
             sram_we    <= 1'b0;
+            sram_wide_en <= 1'b0;
 
             case (state)
                 S_IDLE: begin
@@ -268,6 +281,11 @@ module npu_dma #(
                         wb_cyc_o <= 1'b0;
                         wb_stb_o <= 1'b0;
                         state    <= S_DONE;
+                    end else if (sram_wide_wait) begin
+                        // Compute used OFM Port B on this cycle; hold the wide
+                        // read enable for one more cycle so the beat is read
+                        // cleanly on the next clock edge.
+                        sram_wide_en <= 1'b1;
                     end else begin
                         // The SRAM sees registered sram_en at this edge and
                         // updates rdata after it; wait one more cycle before
@@ -282,11 +300,13 @@ module npu_dma #(
                         wb_stb_o <= 1'b0;
                         state    <= S_DONE;
                     end else begin
+                        store_wide_buf <= sram_rdata_wide;
+                        store_wide_idx <= 5'd0;
                         wb_cyc_o <= 1'b1;
                         wb_stb_o <= 1'b1;
                         wb_we_o  <= 1'b1;
                         wb_adr_o <= r_ext_addr;
-                        wb_dat_o <= sram_rdata;
+                        wb_dat_o <= sram_rdata_wide[31:0];
                         state    <= S_STORE;
                     end
                 end
@@ -296,10 +316,10 @@ module npu_dma #(
                     if (abort) begin
                         state <= S_DONE;
                     end else begin
-                        // Read from SRAM (address presented this cycle, data next)
-                        sram_en     <= 1'b1;
-                        sram_we     <= 1'b0;
-                        sram_addr_o <= r_sram_addr;
+                        // One wide read supplies up to sixteen consecutive
+                        // 32-bit Wishbone writes.
+                        sram_wide_en   <= 1'b1;
+                        sram_wide_addr <= r_sram_addr;
                         state       <= S_STORE_LATCH;
                     end
                 end
@@ -333,8 +353,6 @@ module npu_dma #(
                                         r_row_word_count, r_row_len);
                             end
                             `endif
-                            wb_cyc_o    <= 1'b0;
-                            wb_stb_o    <= 1'b0;
                             // Advance SRAM pointer (always contiguous)
                             r_sram_addr <= r_sram_addr + 1;
                             xfer_count  <= xfer_count + 1;
@@ -357,10 +375,34 @@ module npu_dma #(
                                 // 1D mode: advance by stride (or 4 if stride==0)
                                 r_ext_addr  <= r_ext_addr + (r_stride != 0 ? r_stride : 32'd4);
                             end
-                            if (xfer_count + 1 >= r_xfer_len)
+                            if (xfer_count + 1 >= r_xfer_len) begin
+                                wb_cyc_o <= 1'b0;
+                                wb_stb_o <= 1'b0;
                                 state <= S_DONE;
-                            else
+                            end else if ((mode_2d
+                                          && (r_row_word_count + 1 >= r_row_len))
+                                         || store_wide_idx == 5'd15) begin
+                                // Refill at a beat or row boundary.  A row
+                                // boundary may also skip padded SRAM words.
+                                wb_cyc_o <= 1'b0;
+                                wb_stb_o <= 1'b0;
                                 state <= S_STORE_RD;
+                            end else begin
+                                // Keep the incrementing Wishbone burst active.
+                                store_wide_idx <= store_wide_idx + 1;
+                                wb_cyc_o <= 1'b1;
+                                wb_stb_o <= 1'b1;
+                                wb_adr_o <= mode_2d
+                                          ? (r_ext_addr + 32'd4)
+                                          : (r_ext_addr
+                                             + (r_stride != 0
+                                                ? r_stride : 32'd4));
+                                wb_dat_o
+                                    <= store_wide_buf[
+                                           DATA_W*(store_wide_idx + 1)
+                                           +: DATA_W];
+                                state <= S_STORE;
+                            end
                         end
                     end
                 end
