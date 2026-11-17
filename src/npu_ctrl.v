@@ -76,6 +76,14 @@ module npu_ctrl #(
     input  wire [31:0]  cfg_layer_mode,      // OP type + data type
     input  wire [15:0]  cfg_out_base,        // Output base address in SRAM (word addr)
     input  wire [31:0]  cfg_dma_add_b_addr,  // DDR address of Add Branch B data
+    input  wire         cfg_param_preloaded, // current params already in selected bank
+    input  wire         cfg_param_bank,      // current parameter ping/pong bank
+    input  wire         cfg_next_param_en,
+    input  wire [31:0]  cfg_next_param_addr,
+    input  wire [15:0]  cfg_next_param_words,
+    input  wire         cfg_next_param_bank,
+    output reg          next_param_ready,
+    output wire [15:0]  compute_param_base,
 
     // ─── Per-tile Store Configuration (2D DMA for NHWC layout) ───
     input  wire [31:0]  cfg_dma_store_mode,    // 0x140: bit[0]=PER_TILE_STORE_EN
@@ -108,6 +116,7 @@ module npu_ctrl #(
     // ─── Double-Buffer Interface ───
     output reg          ping_pong_flag,      // 0=compute reads lower half, 1=upper half
     output reg          db_prefetch_done,    // Prefetch complete; compute may start next tile
+    output wire         ctrl_store_phase,    // 1 = controller is storing the finished tile
     input  wire         tile_done,           // Compute finished a non-final tile
     input  wire [15:0]  cfg_act_bank_offset, // IFM half, words
     input  wire [15:0]  cfg_ofm_bank_offset, // OFM half, words
@@ -148,6 +157,7 @@ module npu_ctrl #(
     localparam S_RELOAD_ACK         = 6'd27; // per-OC reload: wait oc_group_done deassert
     localparam S_GROUP_LOAD_ACT     = 6'd28; // group-major: reload tile(0,0) activation
     localparam S_GROUP_LOAD_ACT_WAIT= 6'd29;
+    localparam S_WAIT_NEXT_PARAM    = 6'd30;
 
     reg [5:0] state;
     reg       aborted;  // Latched abort flag — prevents auto-restart in S_DONE
@@ -162,6 +172,15 @@ module npu_ctrl #(
     // layer's channel count exceeds this (e.g. model_e L30 FC out_c=1000 > 768),
     // the params must be reloaded per oc_group (like per-OC weight reload).
     wire param_needs_reload = ({17'd0, param_words} > PARAM_DEPTH);
+    localparam [15:0] PARAM_HALF = PARAM_DEPTH / 2;
+    assign compute_param_base = cfg_param_bank ? PARAM_HALF : 16'd0;
+    wire next_param_eligible = cfg_next_param_en
+                             && (cfg_next_param_words != 0)
+                             && (cfg_next_param_words <= PARAM_HALF)
+                             && (param_words <= PARAM_HALF)
+                             && (cfg_next_param_bank != cfg_param_bank)
+                             && (cfg_tile_h == 0)
+                             && (cfg_tile_w == 0);
 
     // Weight words = wgt_size / 4 (32-bit to handle large models)
     wire [31:0] wgt_words = cfg_dma_wgt_size >> 2;
@@ -288,11 +307,8 @@ module npu_ctrl #(
     wire fuse_start = cfg_dma_ctrl[1];
     wire fuse_mid   = cfg_dma_ctrl[2];
     wire fuse_end   = cfg_dma_ctrl[3];
-    // SRAM reuse is only valid for a non-tiled full tensor. The converter
-    // now stamps one large tile grid on each IR, but compute still finishes
-    // all START tiles before MID runs — skip_act_load on a tiled block
-    // would leave only the last tile in SRAM. Keep the tile_h==0 gate until
-    // tile-major (one IR tile through START/MID/END before the next).
+    // SRAM reuse is only valid for a non-tiled full tensor. Tiled fusion
+    // needs a controller-owned tile-major START/MID/END pipeline.
     wire skip_act_load = (fuse_mid | fuse_end) & (cfg_tile_h == 16'd0);
     wire skip_store    = (fuse_start | fuse_mid) & (cfg_tile_h == 16'd0);
 
@@ -368,14 +384,32 @@ module npu_ctrl #(
     wire db_en = cfg_dma_ctrl[0];
     wire per_tile_store_en = cfg_dma_store_mode[0];  // Per-tile store to NHWC DDR layout
 
+    // Add and Concat park branch B in the IFM region alongside branch A, so
+    // under DB_EN both tensors have to fit the same half. Counting only the
+    // A transfer let a 19x20x32 Add tile (3040 words A + 3040 words B) pass
+    // the 3072-word half check and overwrite the other half, which is where
+    // the next tile's prefetch had just landed.
+    wire [31:0] add_b_words = is_concat_op ? {16'd0, concat_b_xfer_words}
+                                           : {16'd0, tile_in_words};
+    wire [31:0] ifm_need_words = active_input_words
+                               + ((is_add_op
+                                   || (is_concat_op && cfg_dma_add_b_addr != 0))
+                                  ? add_b_words : 32'd0);
+
     reg        prefetch_active;     // Prefetch DMA is in flight
     reg        prefetch_pending;    // Flag flip pending after prefetch completes
+    reg        prefetch_ready;      // Next tile is already resident in ~ping_pong_flag
+    reg        prefetch_b_step;     // Add branch-B half of background prefetch in flight
+    reg        tile_done_latched;   // Compute finished tile while bg DMA still in flight
+    reg        comp_done_latched;   // Final tile finished while previous bg store in flight
+    reg        bg_store_active;     // Current tile store overlaps next-tile compute
     reg [31:0] next_tile_ddr_addr;  // Running DDR address for next tile's input
     reg [31:0] cur_tile_ddr_offset; // Current tile's DDR offset from base
     reg [15:0] next_sram_offset;    // SRAM offset for prefetch target bank
     reg        add_b_reload;        // 1=Add B reload after compute_done (→ S_STORE_OUT)
     reg        store_bank;          // Bank to store from (final tile's ping_pong)
     reg        last_tile_store;     // 1=S_TILE_STORE is for final tile (→ S_DONE, no prefetch)
+    reg        next_param_active;
     reg [31:0] r_tile_ddr_offset;   // Precomputed tile DDR offset (registered)
     reg [31:0] r_nhwc_row_stride;   // Precomputed NHWC row stride (registered)
     reg [15:0] r_tile_row_len;      // Precomputed tile row length (registered)
@@ -613,6 +647,19 @@ module npu_ctrl #(
     wire [31:0] store_group_bytes = {16'd0, store_group_nch}
                                   * (cfg_int16 ? 32'd2 : 32'd1);
 
+    // True double-buffered background prefetch: while compute works on
+    // tile k in ping_pong_flag, DMA loads tile k+1 into ~ping_pong_flag
+    // via IFM Port A (orthogonal to compute's IFM Port B reads and OFM
+    // Port B writes). Exclude mid-tile OC-group reload layers so the
+    // background DMA never collides with an S_RELOAD_WGT/PARAM request.
+    wire has_next_tile = (cfg_tile_h != 16'd0)
+                      && ((tile_x_seq + 16'd1 < cfg_tile_num_w)
+                          || (tile_y_seq + 16'd1 < cfg_tile_num_h));
+    wire bg_prefetch_en = db_en && per_tile_store_en && !skip_act_load
+                       && !group_major_en && !slice_stream && !is_concat_op
+                       && (cfg_dma_wgt_per_oc == 32'd0)
+                       && !param_needs_reload;
+
     // Shared by the async (!rst_n) and synchronous (ctrl_soft_rst) branches so
     // the two cannot drift apart.
     `define NPU_CTRL_RESET_STATE \
@@ -635,6 +682,13 @@ module npu_ctrl #(
         ping_pong_flag      <= 1'b0; \
         prefetch_active     <= 1'b0; \
         prefetch_pending    <= 1'b0; \
+        prefetch_ready      <= 1'b0; \
+        prefetch_b_step     <= 1'b0; \
+        tile_done_latched   <= 1'b0; \
+        comp_done_latched   <= 1'b0; \
+        bg_store_active     <= 1'b0; \
+        next_param_active   <= 1'b0; \
+        next_param_ready    <= 1'b0; \
         db_prefetch_done    <= 1'b1; \
         next_tile_ddr_addr  <= 32'd0; \
         cur_tile_ddr_offset <= 32'd0; \
@@ -699,7 +753,7 @@ module npu_ctrl #(
                         //     full dma_in_size is what overflowed SRAM and is
                         //     why the layer is streamed (A L61 DW, E L29 GAP).
                         end else if (!slice_stream
-                                     && active_input_words > ifm_cap) begin
+                                     && ifm_need_words > ifm_cap) begin
                             hw_error_code <= 4'd4;
                             state <= S_ERROR;
                         // E5: output range must fit without address truncation.
@@ -741,6 +795,8 @@ module npu_ctrl #(
                         end else begin
                             hw_busy  <= 1'b1;
                             state    <= S_LOAD_WGT;
+                            next_param_active <= 1'b0;
+                            next_param_ready  <= 1'b0;
                             // Reset per-tile store sequencing
                             tile_y_seq <= 16'd0;
                             tile_x_seq <= 16'd0;
@@ -857,12 +913,12 @@ module npu_ctrl #(
                 S_LOAD_PARAM: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;
-                    end else if (param_words != 0) begin
+                    end else if (param_words != 0 && !cfg_param_preloaded) begin
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b0;
                         dma_sram_sel  <= 2'd2;  // param
                         dma_ext_addr  <= cfg_dma_param_addr;
-                        dma_sram_addr <= 16'd0;
+                        dma_sram_addr <= compute_param_base;
                         // Per-oc reload: load only the FIRST oc_group's params
                         // (ARRAY_SIZE*4 words); the rest reload per oc_group in
                         // S_RELOAD_PARAM (param SRAM holds only ~768 channels, so
@@ -893,12 +949,30 @@ module npu_ctrl #(
                     end else begin
                         compute_start <= 1'b1;
                         state         <= S_WAIT_COMP;
+                        if (next_param_eligible) begin
+                            dma_start        <= 1'b1;
+                            dma_dir          <= 1'b0;
+                            dma_sram_sel     <= 2'd2;
+                            dma_ext_addr     <= cfg_next_param_addr;
+                            dma_sram_addr    <= cfg_next_param_bank
+                                              ? PARAM_HALF : 16'd0;
+                            dma_xfer_len     <= cfg_next_param_words;
+                            dma_row_len      <= 16'd0;
+                            dma_row_count    <= 16'd0;
+                            dma_out_stride   <= 32'd0;
+                            next_param_active<= 1'b1;
+                        end
                         // Reset oc_group counter for this compute run
                         // Initialize tiled scheduling for the first tile. PTS
                         // also needs this state in single-buffer mode.
                         // For fused MID/END layers, skip_act_load is asserted:
                         // input is already in SRAM, no DDR load or prefetch needed.
                         if (db_en || per_tile_store_en) begin
+                            prefetch_ready    <= 1'b0;
+                            prefetch_b_step   <= 1'b0;
+                            tile_done_latched <= 1'b0;
+                            comp_done_latched <= 1'b0;
+                            bg_store_active   <= 1'b0;
                             if (!skip_act_load) begin
                                 ping_pong_flag     <= 1'b0;  // Tile 0: reads Bank[0]
                                 prefetch_active    <= 1'b0;
@@ -924,9 +998,14 @@ module npu_ctrl #(
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else begin
+                        if (dma_done && next_param_active) begin
+                            next_param_active <= 1'b0;
+                            next_param_ready  <= 1'b1;
+                        end
                         // ─── tile_done: non-final tile boundary ───
                         // Per-tile store path: store current tile output to DDR (NHWC) first,
-                        // then prefetch next tile input.
+                        // then prefetch next tile input (or switch immediately when background
+                        // prefetch already landed tile k+1 into ~ping_pong_flag).
                         // Non-per-tile path (last-tile-only store): prefetch directly.
                         if (db_en && tile_done && !prefetch_active && skip_act_load) begin
                             // Fused mid/end with SRAM-resident input: do not
@@ -941,6 +1020,48 @@ module npu_ctrl #(
                                 tile_x_seq <= tile_x_seq + 16'd1;
                             end
                             db_prefetch_done <= 1'b1;
+                        end else if (bg_prefetch_en
+                                     && (tile_done || tile_done_latched)
+                                     && !prefetch_active && prefetch_ready) begin
+                            // Next tile is already resident in ~ping_pong_flag.
+                            // Latch finished tile k for background DDR writeback,
+                            // flip ping_pong_flag and advance tile_x/y_seq to k+1,
+                            // and release compute immediately so tile k+1 compute
+                            // overlaps with tile k's DDR store.
+                            tile_done_latched <= 1'b0;
+                            store_bank <= ping_pong_flag;
+                            last_tile_store <= 1'b0;
+                            store_spatial_row <= 16'd0;
+                            r_tile_ddr_offset <= ({16'd0, tile_y_seq} * {16'd0, cfg_tile_h} * {16'd0, cfg_out_w}
+                                                   + {16'd0, tile_x_seq} * {16'd0, cfg_tile_w})
+                                                  * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
+                            r_tile_row_count <= (tile_out_h_actual != 0) ? tile_out_h_actual : cfg_tile_h;
+                            r_tile_pixel_w <= (tile_out_w_actual != 0) ? tile_out_w_actual : cfg_tile_w;
+                            r_nhwc_row_stride <= {16'd0, cfg_out_w} * output_pixel_bytes;
+                            r_store_src_stride <= 16'd0;
+                            r_store_group_offset <= 32'd0;
+                            if (tile_out_w_actual != 0)
+                                r_tile_row_len <= (({16'd0, tile_out_w_actual}
+                                                   * output_pixel_bytes) >> 2);
+                            else
+                                r_tile_row_len <= tile_row_len * tile_row_count;
+                            if (tile_x_seq + 1 >= cfg_tile_num_w) begin
+                                tile_x_seq <= 16'd0;
+                                tile_y_seq <= tile_y_seq + 16'd1;
+                            end else begin
+                                tile_x_seq <= tile_x_seq + 16'd1;
+                            end
+                            ping_pong_flag   <= ~ping_pong_flag;
+                            db_prefetch_done <= 1'b1;
+                            prefetch_ready   <= 1'b0;
+                            bg_store_active  <= 1'b1;
+                            state            <= S_TILE_STORE;
+                        end else if (bg_prefetch_en && tile_done) begin
+                            // Compute finished tile k before tile k+1 finished
+                            // prefetching; hold compute in S_TILE_WAIT_DB until
+                            // prefetch_ready asserts.
+                            db_prefetch_done  <= 1'b0;
+                            tile_done_latched <= 1'b1;
                         end else if ((db_en || per_tile_store_en) && tile_done
                                      && !prefetch_active && !skip_act_load) begin
                             if (per_tile_store_en) begin
@@ -1010,24 +1131,84 @@ module npu_ctrl #(
                                 next_sram_offset <= (next_sram_offset >= ifm_half_now) ?
                                                     16'd0 : ifm_half_now;
                             end
+                        end else if (bg_prefetch_en && has_next_tile
+                                     && !prefetch_active && !prefetch_ready
+                                     && !next_param_active && !tile_done
+                                     && !compute_done && !comp_done_latched) begin
+                            // Background prefetch: kick off tile k+1 input load into
+                            // the alternate IFM half while compute works on tile k.
+                            dma_start      <= 1'b1;
+                            dma_dir        <= 1'b0;
+                            dma_sram_sel   <= 2'd1;
+                            dma_ext_addr   <= use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr;
+                            dma_sram_addr  <= ((~ping_pong_flag) ? ifm_half_now : 16'd0)
+                                            + (use_2d_load ? nxt_2d_sram_pad : 16'd0);
+                            dma_xfer_len   <= use_2d_load ? nxt_2d_xfer : next_xfer_words;
+                            if (use_2d_load) begin
+                                dma_row_len    <= nxt_2d_row_len;
+                                dma_row_count  <= nxt_2d_row_cnt;
+                                dma_out_stride <= load_in_stride;
+                                dma_src_row_len<= load_row_len[15:0];
+                            end else begin
+                                dma_row_len    <= 16'd0;
+                                dma_row_count  <= 16'd0;
+                                dma_out_stride <= 32'd0;
+                                dma_src_row_len<= 16'd0;
+                            end
+                            prefetch_active  <= 1'b1;
+                            prefetch_b_step  <= 1'b0;
+                            cur_tile_ddr_offset <= (use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr) - cfg_dma_in_addr;
+                            if (!use_2d_load)
+                                next_tile_ddr_addr <= next_tile_ddr_addr
+                                    + (cfg_tile_in_size != 0 ? cfg_tile_in_size : cfg_dma_in_size);
+                            next_sram_offset <= ((~ping_pong_flag) ? 16'd0 : ifm_half_now);
                         end
 
                         // ─── Prefetch DMA completion: flip ping_pong_flag ───
                         if (dma_done && prefetch_active) begin
-                            prefetch_active  <= 1'b0;
-                            if (prefetch_pending) begin
-                                ping_pong_flag  <= ~ping_pong_flag;
-                                prefetch_pending <= 1'b0;
-                                `ifndef SYNTHESIS
-                                $display("[PP_FLIP] t=%0t ping_pong %0d→%0d db_prefetch_done=1",
-                                         $time, ping_pong_flag, ~ping_pong_flag);
-                                `endif
-                            end
-                            if (cfg_dma_add_b_addr != 0) begin
-                                add_b_reload <= 1'b1;
-                                state <= S_LOAD_ADD_B;
+                            if (bg_prefetch_en) begin
+                                if ((cfg_dma_add_b_addr != 0) && !prefetch_b_step) begin
+                                    // Chain branch-B prefetch into the same alternate half.
+                                    dma_start     <= 1'b1;
+                                    dma_dir       <= 1'b0;
+                                    dma_sram_sel  <= 2'd1;
+                                    dma_ext_addr  <= cfg_dma_add_b_addr + cur_tile_ddr_offset;
+                                    dma_sram_addr <= cfg_out_base
+                                                   + ((~ping_pong_flag) ? ifm_half_now : 16'd0);
+                                    dma_xfer_len  <= tile_in_words;
+                                    if (use_2d_load) begin
+                                        dma_row_len    <= load_row_len[15:0];
+                                        dma_row_count  <= load_row_count;
+                                        dma_out_stride <= load_in_stride;
+                                        dma_src_row_len<= 16'd0;
+                                    end else begin
+                                        dma_row_len    <= 16'd0;
+                                        dma_row_count  <= 16'd0;
+                                        dma_out_stride <= 32'd0;
+                                        dma_src_row_len<= 16'd0;
+                                    end
+                                    prefetch_b_step <= 1'b1;
+                                end else begin
+                                    prefetch_active <= 1'b0;
+                                    prefetch_b_step <= 1'b0;
+                                    prefetch_ready  <= 1'b1;
+                                end
                             end else begin
-                                db_prefetch_done <= 1'b1;
+                                prefetch_active  <= 1'b0;
+                                if (prefetch_pending) begin
+                                    ping_pong_flag  <= ~ping_pong_flag;
+                                    prefetch_pending <= 1'b0;
+                                    `ifndef SYNTHESIS
+                                    $display("[PP_FLIP] t=%0t ping_pong %0d→%0d db_prefetch_done=1",
+                                             $time, ping_pong_flag, ~ping_pong_flag);
+                                    `endif
+                                end
+                                if (cfg_dma_add_b_addr != 0) begin
+                                    add_b_reload <= 1'b1;
+                                    state <= S_LOAD_ADD_B;
+                                end else begin
+                                    db_prefetch_done <= 1'b1;
+                                end
                             end
                         end
 
@@ -1050,9 +1231,12 @@ module npu_ctrl #(
                         end
 
                         // ─── Compute done (final tile) ───
-                        if (compute_done) begin
+                        if (compute_done || comp_done_latched) begin
+                            comp_done_latched <= 1'b0;
                             store_bank <= ping_pong_flag;
-                            if (db_en && prefetch_active) begin
+                            if (next_param_active) begin
+                                state <= S_WAIT_NEXT_PARAM;
+                            end else if (db_en && prefetch_active) begin
                                 state <= S_WAIT_PREFETCH;
                             end else begin
                                 if (skip_store)
@@ -1097,11 +1281,38 @@ module npu_ctrl #(
                     end
                 end
 
+                // Current untiled layer completed before the next layer's
+                // parameter DMA.  Finish that transfer before reusing the
+                // single DMA engine for output store.
+                S_WAIT_NEXT_PARAM: begin
+                    if (ctrl_abort) begin
+                        state <= S_DONE;
+                    end else if (dma_done && next_param_active) begin
+                        next_param_active <= 1'b0;
+                        next_param_ready  <= 1'b1;
+                        if (skip_store)
+                            state <= S_DONE;
+                        else
+                            state <= S_STORE_OUT;
+                    end else if (!next_param_active) begin
+                        if (skip_store)
+                            state <= S_DONE;
+                        else
+                            state <= S_STORE_OUT;
+                    end
+                end
+
                 // ─── Per-tile store: fire 2D DMA to store current tile to NHWC DDR ───
                 S_TILE_STORE: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else begin
+                        if (bg_store_active && tile_done) begin
+                            db_prefetch_done  <= 1'b0;
+                            tile_done_latched <= 1'b1;
+                        end
+                        if (bg_store_active && compute_done)
+                            comp_done_latched <= 1'b1;
                         // 2D DMA store: current tile output → DDR at NHWC offset
                         dma_start     <= 1'b1;
                         dma_dir       <= 1'b1;  // store
@@ -1163,11 +1374,25 @@ module npu_ctrl #(
                 S_TILE_STORE_WAIT: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;
-                    end else if (dma_done) begin
+                    end else begin
+                        if (bg_store_active && tile_done) begin
+                            db_prefetch_done  <= 1'b0;
+                            tile_done_latched <= 1'b1;
+                        end
+                        if (bg_store_active && compute_done)
+                            comp_done_latched <= 1'b1;
+                        if (dma_done) begin
                         // Clear 2D mode (revert to 1D for prefetch)
                         dma_row_len   <= 16'd0;
                         dma_row_count <= 16'd0;
-                        if (group_major_en
+                        if (bg_store_active) begin
+                            // Tile indices and banks advanced when this
+                            // background store was launched. Return to the
+                            // live compute/prefetch scheduler without doing
+                            // either operation a second time.
+                            bg_store_active <= 1'b0;
+                            state <= S_WAIT_COMP;
+                        end else if (group_major_en
                             && store_spatial_row + 1 < r_tile_row_count) begin
                             // A 2D DMA handles all pixels in one spatial row.
                             // Re-enter for the next row so column-tiled output
@@ -1201,8 +1426,15 @@ module npu_ctrl #(
                             end else begin
                                 tile_x_seq <= tile_x_seq + 1;
                             end
-                            // Fire prefetch for next tile
-                            if (!skip_act_load) begin
+                            if (bg_prefetch_en) begin
+                                // Tile k+1 was already prefetched into ~ping_pong_flag
+                                // while tile k computed. Flip banks and unblock compute
+                                // immediately; S_WAIT_COMP will kick off tile k+2 in the
+                                // background on the next cycle.
+                                ping_pong_flag   <= ~ping_pong_flag;
+                                db_prefetch_done <= 1'b1;
+                                prefetch_ready   <= 1'b0;
+                            end else if (!skip_act_load) begin
                                 dma_start      <= 1'b1;
                                 dma_dir        <= 1'b0;
                                 dma_sram_sel   <= 2'd1;  // activation
@@ -1246,6 +1478,7 @@ module npu_ctrl #(
                                 db_prefetch_done <= 1'b1;
                             end
                             state <= S_WAIT_COMP;
+                        end
                         end
                     end
                 end
@@ -1597,6 +1830,9 @@ module npu_ctrl #(
                         ping_pong_flag      <= 1'b0;
                         prefetch_active     <= 1'b0;
                         prefetch_pending    <= 1'b0;
+                        prefetch_ready      <= 1'b0;
+                        prefetch_b_step     <= 1'b0;
+                        tile_done_latched   <= 1'b0;
                         db_prefetch_done    <= 1'b1;
                         next_tile_ddr_addr  <= 32'd0;
                         cur_tile_ddr_offset <= 32'd0;
@@ -1626,4 +1862,10 @@ module npu_ctrl #(
     end
 
 `undef NPU_CTRL_RESET_STATE
+
+    // Compute blocks in S_TILE_WAIT_DB while this handshake runs. Splitting
+    // the store half from the load half tells us whether the tile boundary
+    // is paying for the DDR writeback or for the next tile's fetch.
+    assign ctrl_store_phase = (state == S_TILE_STORE)
+                           || (state == S_TILE_STORE_WAIT);
 endmodule

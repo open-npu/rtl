@@ -17,6 +17,7 @@ module npu_csr #(
     parameter DATA_W    = 32,   // Data bus width
     parameter ARRAY_SZ  = `ARRAY_SIZE,
     parameter SPAD_KB_P = `SPAD_KB,
+    parameter PARAM_DEPTH_P = `PARAM_DEPTH_W,
     // Version info (V1.0.0)
     parameter VERSION_MAJOR = 8'd1,
     parameter VERSION_MINOR = 8'd0,
@@ -49,6 +50,23 @@ module npu_csr #(
     input  wire [7:0]          hw_curr_layer,  // Current layer number
     input  wire [31:0]         hw_perf_cnt,    // Cycle counter
     input  wire [31:0]         hw_mac_cnt,     // MAC counter
+    input  wire [31:0]         hw_perf_dma_cnt,
+    input  wire [31:0]         hw_perf_compute_cnt,
+    input  wire [31:0]         hw_perf_overlap_cnt,
+    input  wire [31:0]         hw_perf_st_mac_cnt,     // 0x1A0: row/dw MAC issue
+    input  wire [31:0]         hw_perf_st_wait_cnt,    // 0x1A4: waiting on gather / weights / DB
+    input  wire [31:0]         hw_perf_st_wb_cnt,      // 0x1A8: PPU + writeback
+    input  wire [31:0]         hw_perf_st_pool_cnt,    // 0x1AC: pooling datapath
+    input  wire [31:0]         hw_perf_st_add_cnt,     // 0x1B0: elementwise add
+    input  wire [31:0]         hw_perf_st_rsz_cnt,     // 0x1B4: resize
+    input  wire [31:0]         hw_perf_st_cfg_cnt,     // 0x1B8: setup / layer and tile boundaries
+    input  wire [31:0]         hw_perf_st_oth_cnt,     // 0x1BC: everything else
+    input  wire [31:0]         hw_perf_wait_act_cnt,   // 0x1C0: waiting on activation data
+    input  wire [31:0]         hw_perf_wait_wgt_cnt,   // 0x1C4: waiting on weights
+    input  wire [31:0]         hw_perf_wait_db_cnt,    // 0x1C8: waiting on tile handshake
+    input  wire [31:0]         hw_perf_mac_idle_cnt,   // 0x1CC: MAC state, no MAC issued
+    input  wire [31:0]         hw_perf_wait_store_cnt, // 0x1D0: ... of which DDR writeback
+    input  wire                hw_next_param_ready,
 
     // ─── Control Outputs (to other modules) ───
     output wire                 ctrl_start,     // START pulse
@@ -99,6 +117,9 @@ module npu_csr #(
     output wire [DATA_W-1:0]   reg_dma_wgt_per_oc,
     output wire [DATA_W-1:0]   reg_wgt_layout,
     output wire [DATA_W-1:0]   reg_tile_in_hw,
+    output wire [DATA_W-1:0]   reg_next_param_addr,
+    output wire [DATA_W-1:0]   reg_next_param_cfg,
+    output wire [DATA_W-1:0]   reg_param_bank_ctrl,
 
     // ─── Post-Processing Config Outputs ───
     output wire [DATA_W-1:0]   reg_post_ctrl,
@@ -158,6 +179,9 @@ module npu_csr #(
     reg [DATA_W-1:0] r_dma_row_cfg;     // 0x144 — [31:16]=row_count, [15:0]=row_len (2D DMA)
     reg [DATA_W-1:0] r_dma_wgt_per_oc; // 0x148 — per-oc_group weight words (for large models)
     reg [DATA_W-1:0] r_wgt_layout;     // 0x14C — bit[0]: 0=OC-major, 1=K-major (64-lane row)
+    reg [DATA_W-1:0] r_next_param_addr;// 0x150 — next layer param DDR address
+    reg [DATA_W-1:0] r_next_param_cfg;// 0x154 — bit31 enable, [15:0] words
+    reg [DATA_W-1:0] r_param_bank_ctrl;// 0x158 — current bank/preloaded/next bank
 
     // ─── Group 3: Post-Processing Configuration ───
     reg [DATA_W-1:0] r_post_ctrl;     // 0x180
@@ -209,6 +233,7 @@ module npu_csr #(
 
     // ─── DMA Status (directly from hw inputs) ───
     wire [DATA_W-1:0] dma_status = {16'd0, 8'd0, 5'd0, hw_dma_busy, hw_dma_busy, hw_dma_busy};
+    localparam [15:0] PARAM_HALF_WORDS = PARAM_DEPTH_P / 2;
 
     // ─── IRQ generation ───
     // Set on pulse, clear on W1C write
@@ -262,6 +287,9 @@ module npu_csr #(
     assign reg_dma_wgt_per_oc   = r_dma_wgt_per_oc;
     assign reg_wgt_layout       = r_wgt_layout;
     assign reg_tile_in_hw       = r_tile_in_hw;
+    assign reg_next_param_addr  = r_next_param_addr;
+    assign reg_next_param_cfg   = r_next_param_cfg;
+    assign reg_param_bank_ctrl  = r_param_bank_ctrl;
     assign reg_post_ctrl        = r_post_ctrl;
     assign reg_post_param_addr  = r_dma_param_addr; // dual-mapped
     assign reg_post_param_count = r_post_param_count;
@@ -320,6 +348,9 @@ module npu_csr #(
             r_dma_row_cfg      <= 32'd0;
             r_dma_wgt_per_oc   <= 32'd0;
             r_wgt_layout       <= 32'd0;
+            r_next_param_addr  <= 32'd0;
+            r_next_param_cfg   <= 32'd0;
+            r_param_bank_ctrl  <= 32'd0;
             r_tile_in_hw       <= 32'd0;
             r_post_ctrl     <= 32'd0;
             r_post_param_count <= 32'd0;
@@ -398,6 +429,9 @@ module npu_csr #(
                         12'h144: r_dma_row_cfg      <= wb_dat_i;
                         12'h148: r_dma_wgt_per_oc   <= wb_dat_i;
                         12'h14C: r_wgt_layout       <= wb_dat_i;
+                        12'h150: r_next_param_addr  <= wb_dat_i;
+                        12'h154: r_next_param_cfg   <= wb_dat_i;
+                        12'h158: r_param_bank_ctrl  <= wb_dat_i;
                         12'h13C: r_tile_in_hw       <= wb_dat_i;
 
                         // Group 3: Post-Processing Configuration
@@ -433,6 +467,28 @@ module npu_csr #(
                         12'h028: wb_dat_o <= hw_serial_hi;
                         12'h02C: wb_dat_o <= hw_vendor_id;
                         12'h030: wb_dat_o <= r_layer_count;
+                        12'h034: wb_dat_o <= hw_perf_dma_cnt;
+                        12'h038: wb_dat_o <= hw_perf_compute_cnt;
+                        12'h03C: wb_dat_o <= hw_perf_overlap_cnt;
+                        // 0x1A0-0x1BC: compute FSM cycle histogram. Summing
+                        // these over a layer gives the in-layer breakdown
+                        // between MAC issue and the data-supply / writeback
+                        // machinery around it.
+                        12'h1A0: wb_dat_o <= hw_perf_st_mac_cnt;
+                        12'h1A4: wb_dat_o <= hw_perf_st_wait_cnt;
+                        12'h1A8: wb_dat_o <= hw_perf_st_wb_cnt;
+                        12'h1AC: wb_dat_o <= hw_perf_st_pool_cnt;
+                        12'h1B0: wb_dat_o <= hw_perf_st_add_cnt;
+                        12'h1B4: wb_dat_o <= hw_perf_st_rsz_cnt;
+                        12'h1B8: wb_dat_o <= hw_perf_st_cfg_cnt;
+                        12'h1BC: wb_dat_o <= hw_perf_st_oth_cnt;
+                        // 0x1C0-0x1CC: split of the "wait" bucket, plus the
+                        // count of MAC-state cycles that issued no MAC.
+                        12'h1C0: wb_dat_o <= hw_perf_wait_act_cnt;
+                        12'h1C4: wb_dat_o <= hw_perf_wait_wgt_cnt;
+                        12'h1C8: wb_dat_o <= hw_perf_wait_db_cnt;
+                        12'h1CC: wb_dat_o <= hw_perf_mac_idle_cnt;
+                        12'h1D0: wb_dat_o <= hw_perf_wait_store_cnt;
 
                         // Group 1: Layer Parameters
                         12'h040: wb_dat_o <= r_layer_mode;
@@ -471,6 +527,11 @@ module npu_csr #(
                         12'h144: wb_dat_o <= r_dma_row_cfg;
                         12'h148: wb_dat_o <= r_dma_wgt_per_oc;
                         12'h14C: wb_dat_o <= r_wgt_layout;
+                        12'h150: wb_dat_o <= r_next_param_addr;
+                        12'h154: wb_dat_o <= r_next_param_cfg;
+                        12'h158: wb_dat_o <= r_param_bank_ctrl;
+                        12'h15C: wb_dat_o <= {PARAM_HALF_WORDS, 15'd0,
+                                              hw_next_param_ready};
                         12'h13C: wb_dat_o <= r_tile_in_hw;
 
                         // Group 3: Post-Processing Configuration

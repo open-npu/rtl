@@ -66,6 +66,8 @@ async def init_dut(dut):
     dut.wb_ack_i.value = 0
     dut.wb_dat_i.value = 0
     dut.sram_rdata.value = 0
+    dut.sram_rdata_wide.value = 0
+    dut.sram_wide_wait.value = 0
 
     # Reset
     for _ in range(5):
@@ -212,15 +214,14 @@ async def test_single_store(dut):
     # Pre-load SRAM read data (will be driven when DMA reads SRAM)
     sram_data = 0xCAFEBABE
 
-    # We need to respond to SRAM reads. Since the DMA reads sram_rdata,
-    # we'll drive it based on sram_en/sram_addr_o in a background task.
+    # Stores fetch a 512-bit activation beat from the wide SRAM port.
     async def sram_responder():
         while True:
             await RisingEdge(dut.clk)
             await ReadOnly()
-            if int(dut.sram_en.value) and not int(dut.sram_we.value):
+            if int(dut.sram_wide_en.value):
                 await Timer(1, unit="step")
-                dut.sram_rdata.value = sram_data
+                dut.sram_rdata_wide.value = sram_data
 
     cocotb.start_soon(sram_responder())
 
@@ -520,10 +521,13 @@ async def test_store_stride(dut):
         while True:
             await RisingEdge(dut.clk)
             await ReadOnly()
-            if int(dut.sram_en.value) and not int(dut.sram_we.value):
+            if int(dut.sram_wide_en.value):
                 await Timer(1, unit="step")
-                addr = int(dut.sram_addr_o.value)
-                dut.sram_rdata.value = sram_data + addr
+                addr = int(dut.sram_wide_addr.value)
+                beat = 0
+                for lane in range(16):
+                    beat |= (sram_data + addr + lane) << (32 * lane)
+                dut.sram_rdata_wide.value = beat
 
     cocotb.start_soon(sram_responder())
 
@@ -551,3 +555,44 @@ async def test_store_stride(dut):
     expected = [(0xB000 + i * 16, sram_data + i) for i in range(N)]
     assert wb_mem.write_log == expected, \
         f"WB writes with stride=16: {wb_mem.write_log}, expected {expected}"
+
+
+@cocotb.test()
+async def test_store_waits_for_wide_port(dut):
+    """A store must not sample OFM data while compute owns the wide port."""
+    wb_mem = await init_dut(dut)
+    expected_data = 0x5A17_C0DE
+
+    dut.dir.value = 1
+    dut.ext_addr.value = 0xC000
+    dut.sram_addr.value = 7
+    dut.xfer_len.value = 1
+    dut.sram_wide_wait.value = 1
+    dut.sram_rdata_wide.value = 0
+
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    # Let the request reach S_STORE_LATCH, then keep the port denied.
+    for _ in range(5):
+        await RisingEdge(dut.clk)
+    assert int(dut.busy.value), "DMA stopped while the OFM port was denied"
+    assert not wb_mem.write_log, "DMA wrote stale OFM data before port grant"
+
+    # Model the SRAM data becoming valid on the granted wide-read cycle.
+    dut.sram_rdata_wide.value = expected_data
+    dut.sram_wide_wait.value = 0
+
+    for _ in range(20):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.done_pulse.value):
+            break
+        await Timer(1, unit="step")
+    else:
+        assert False, "DMA store did not resume after OFM port grant"
+
+    await Timer(1, unit="step")
+    assert wb_mem.write_log == [(0xC000, expected_data)], \
+        f"stalled store wrote {wb_mem.write_log}, expected granted OFM data"
