@@ -248,7 +248,8 @@ module npu_compute #(
         S_ADD_VEC_COMPUTE = 7'd77,
         S_ADD_VEC_WAIT    = 7'd78,
         S_ADD_VEC_WB      = 7'd79,
-        // Wide MaxPool states (64 INT8 or 32 INT16 channels per beat).
+        // Wide Pool states: one 64ch INT8 / 32ch INT16 pixel, or a batch of
+        // 4x16ch / 2x32ch INT8 MaxPool pixels per 64-lane operation.
         S_POOL_VEC_PARAM  = 7'd80,
         S_POOL_VEC_READ   = 7'd81,
         S_POOL_VEC_ACC    = 7'd82,
@@ -559,8 +560,17 @@ module npu_compute #(
     reg [15:0]             pool_wb_byte;     // PPU output to write
     reg [15:0]             pool_vec_ch_base;
     reg [6:0]              pool_vec_div_lane;
+    reg [2:0]              pool_vec_pix_idx;
+    reg [2:0]              pool_vec_batch_n;
     reg signed [ACC_W-1:0] pool_vec_acc [0:`MAC_LANES-1];
     reg [DATA_W*`MAC_LANES-1:0] pool_vec_out;
+    // Narrow-channel INT8 max-pool fills the 64-lane vector with adjacent
+    // output pixels: 4x16ch or 2x32ch. Each source pixel still uses one wide
+    // SRAM read, but comparison, PPU, and writeback are shared by the batch.
+    wire [2:0] pool_vec_pix_cap =
+        (!cfg_int16 && cfg_out_c == 16'd16) ? 3'd4 :
+        (!cfg_int16 && cfg_out_c == 16'd32) ? 3'd2 : 3'd1;
+    wire       pool_vec_multi = (pool_vec_pix_cap != 3'd1);
 
     // ─── Eltwise Add state ───
     reg [14:0] add_M_A, add_M_B;
@@ -766,6 +776,7 @@ module npu_compute #(
             pool_rd_phase <= 0; pool_wb_phase <= 0;
             pool_wb_addr <= 0; pool_wb_bytesel <= 0; pool_wb_byte <= 0;
             pool_vec_ch_base <= 0; pool_vec_div_lane <= 0; pool_vec_out <= 0;
+            pool_vec_pix_idx <= 0; pool_vec_batch_n <= 1;
             for (i = 0; i < `MAC_LANES; i = i + 1)
                 pool_vec_acc[i] <= {1'b1, {(ACC_W-1){1'b0}}};
             // Add resets
@@ -2481,8 +2492,20 @@ module npu_compute #(
                     && ((cfg_int16 && cfg_out_c >= 16'd32
                          && cfg_out_c[4:0] == 5'd0)
                         || (!cfg_int16 && cfg_out_c >= 16'd64
-                            && cfg_out_c[5:0] == 6'd0))) begin
+                            && cfg_out_c[5:0] == 6'd0)
+                        || (!cfg_int16 && !pool_mode
+                            && ((cfg_out_c == 16'd16
+                                 && out_tile_w[1:0] == 2'd0)
+                                || (cfg_out_c == 16'd32
+                                    && out_tile_w[0] == 1'b0))
+                            && pool_cfg_h == 4'd2 && pool_cfg_w == 4'd2
+                            && pool_cfg_sh == 4'd2 && pool_cfg_sw == 4'd2
+                            && cfg_pad_top == 8'd0 && cfg_pad_left == 8'd0))) begin
                     pool_vec_ch_base <= 0;
+                    pool_vec_pix_idx <= 0;
+                    pool_vec_batch_n <=
+                        (out_tile_w < {13'd0, pool_vec_pix_cap})
+                            ? out_tile_w[2:0] : pool_vec_pix_cap;
                     cache_issue <= 0;
                     cache_cap <= 0;
                     state <= S_POOL_VEC_PARAM;
@@ -2495,7 +2518,8 @@ module npu_compute #(
             // The read/capture overlap matches the row-engine SRAM pipeline.
             S_POOL_VEC_PARAM: begin : pool_vec_param_blk
                 reg [8:0] tgt;
-                tgt = cfg_int16 ? 9'd128 : 9'd256;
+                tgt = cfg_int16 ? 9'd128
+                    : (pool_vec_multi ? {cfg_out_c[6:0], 2'b00} : 9'd256);
                 if (cache_issue < tgt) begin
                     param_rd_en   <= 1'b1;
                     param_rd_addr <= cfg_param_base
@@ -2532,7 +2556,9 @@ module npu_compute #(
                        * $signed({1'b0, pool_sh})
                        - $signed({1'b0, cfg_pad_top[7:0]})
                        + $signed({1'b0, pool_fh});
-                iw_s = $signed({1'b0, tile_ow_origin + pool_ow})
+                iw_s = $signed({1'b0, tile_ow_origin + pool_ow
+                                + (pool_vec_multi
+                                   ? {13'd0, pool_vec_pix_idx} : 16'd0)})
                        * $signed({1'b0, pool_sw})
                        - $signed({1'b0, cfg_pad_left[7:0]})
                        + $signed({1'b0, pool_fw});
@@ -2561,7 +2587,10 @@ module npu_compute #(
                         reg [17:0] row_rel, col_rel;
                         row_rel = {2'd0, pool_oh} * {10'd0, pool_sh}
                                   + {14'd0, pool_fh};
-                        col_rel = {2'd0, pool_ow} * {10'd0, pool_sw}
+                        col_rel = ({2'd0, pool_ow}
+                                   + (pool_vec_multi
+                                      ? {15'd0, pool_vec_pix_idx} : 18'd0))
+                                  * {10'd0, pool_sw}
                                   + {14'd0, pool_fw};
                         elem_off = (row_rel[15:0] * tile_in_w
                                     + col_rel[15:0]) * cfg_in_c
@@ -2581,9 +2610,18 @@ module npu_compute #(
 
             S_POOL_VEC_ACC: begin : pool_vec_acc_blk
                 integer l;
+                integer dst;
                 reg signed [ACC_W-1:0] val;
                 for (l = 0; l < `MAC_LANES; l = l + 1) begin
-                    if (cfg_int16) begin
+                    if (pool_vec_multi) begin
+                        if (l < cfg_out_c) begin
+                            dst = pool_vec_pix_idx * cfg_out_c + l;
+                            val = {{(ACC_W-8){act_rd_data[8*l+7]}},
+                                   act_rd_data[8*l +: 8]};
+                            if (val > pool_vec_acc[dst])
+                                pool_vec_acc[dst] <= val;
+                        end
+                    end else if (cfg_int16) begin
                         if (l < 32) begin
                             val = {{(ACC_W-16){act_rd_data[16*l+15]}},
                                    act_rd_data[16*l +: 16]};
@@ -2605,7 +2643,13 @@ module npu_compute #(
                 if ({4'd0, pool_fw} + 1 >= pool_kw) begin
                     pool_fw <= 0;
                     if ({4'd0, pool_fh} + 1 >= pool_kh) begin
-                        if (pool_mode) begin
+                        if (pool_vec_multi
+                            && pool_vec_pix_idx + 1 < pool_vec_batch_n) begin
+                            pool_vec_pix_idx <= pool_vec_pix_idx + 1'b1;
+                            pool_fh <= 0;
+                            pool_count <= 0;
+                            state <= S_POOL_VEC_READ;
+                        end else if (pool_mode) begin
                             pool_vec_div_lane <= 0;
                             state <= S_POOL_VEC_DIV;
                         end else
@@ -2653,8 +2697,15 @@ module npu_compute #(
                 integer l;
                 reg [7:0] cw;
                 for (l = 0; l < `MAC_LANES; l = l + 1) begin
-                    if (!cfg_int16 || l < 32) begin
-                        cw = l[5:0] << 2;
+                    if ((pool_vec_multi
+                         && l < pool_vec_batch_n * cfg_out_c)
+                        || (!pool_vec_multi && (!cfg_int16 || l < 32))) begin
+                        if (pool_vec_multi && cfg_out_c == 16'd16)
+                            cw = {l[3:0], 2'b00};
+                        else if (pool_vec_multi && cfg_out_c == 16'd32)
+                            cw = {l[4:0], 2'b00};
+                        else
+                            cw = l[5:0] << 2;
                         ppu_acc_w[ACC_W*l +: ACC_W] <= pool_vec_acc[l];
                         ppu_mult_w[15*l +: 15] <= param_cache[cw][14:0];
                         ppu_shift_w[6*l +: 6] <= param_cache[cw][21:16];
@@ -2695,13 +2746,22 @@ module npu_compute #(
                 act_wr_en   <= 1'b1;
                 act_wr_addr <= out_base + byte_off[ACT_ADDR_W+1:2];
                 act_wr_wide <= wrwide;
-                act_wr_mask <= 64'hFFFF_FFFF_FFFF_FFFF;
+                if (pool_vec_multi
+                    && pool_vec_batch_n * cfg_out_c < 64)
+                    act_wr_mask <= (64'h1
+                                    << (pool_vec_batch_n * cfg_out_c)) - 1'b1;
+                else
+                    act_wr_mask <= 64'hFFFF_FFFF_FFFF_FFFF;
                 state <= S_POOL_VEC_NEXT;
             end
 
-            S_POOL_VEC_NEXT: begin
+            S_POOL_VEC_NEXT: begin : pool_vec_next_blk
+                reg [15:0] pix_step;
+                reg [15:0] remain;
+                pix_step = pool_vec_multi ? {13'd0, pool_vec_batch_n} : 16'd1;
                 pool_fh <= 0;
                 pool_fw <= 0;
+                pool_vec_pix_idx <= 0;
                 pool_rd_phase <= 0;
                 pool_count <= 0;
                 for (i = 0; i < `MAC_LANES; i = i + 1) begin
@@ -2710,8 +2770,11 @@ module npu_compute #(
                     else
                         pool_vec_acc[i] <= {1'b1, {(ACC_W-1){1'b0}}};
                 end
-                if (pool_ow + 1 >= out_tile_w) begin
+                if (pool_ow + pix_step >= out_tile_w) begin
                     pool_ow <= 0;
+                    pool_vec_batch_n <=
+                        (out_tile_w < {13'd0, pool_vec_pix_cap})
+                            ? out_tile_w[2:0] : pool_vec_pix_cap;
                     if (pool_oh + 1 >= out_tile_h) begin
                         pool_oh <= 0;
                         if (pool_vec_ch_base
@@ -2729,7 +2792,11 @@ module npu_compute #(
                         state <= S_POOL_VEC_READ;
                     end
                 end else begin
-                    pool_ow <= pool_ow + 1;
+                    pool_ow <= pool_ow + pix_step;
+                    remain = out_tile_w - (pool_ow + pix_step);
+                    pool_vec_batch_n <=
+                        (remain < {13'd0, pool_vec_pix_cap})
+                            ? remain[2:0] : pool_vec_pix_cap;
                     state <= S_POOL_VEC_READ;
                 end
             end
