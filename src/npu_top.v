@@ -22,7 +22,7 @@
 module npu_top #(
     parameter ARRAY_SIZE = `ARRAY_SIZE,
     parameter SPAD_KB    = `SPAD_KB,          // total KB reported in HW_CONFIG
-    // IFM 24KB, OFM 48KB, weight 80KB, param 12KB. See npu_defines.vh.
+    // IFM 32KB, OFM 48KB, weight 80KB, param 12KB. See npu_defines.vh.
     parameter IFM_DEPTH   = `IFM_DEPTH,
     parameter OFM_DEPTH   = `OFM_DEPTH,
     parameter WGT_DEPTH   = `WGT_DEPTH_W,
