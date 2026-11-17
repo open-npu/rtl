@@ -13,15 +13,16 @@
 `define ARRAY_SIZE     8
 `endif
 
-// Physical scratchpad is IFM+OFM+WGT+PARAM = 164KB, not one scaled SPAD_KB.
-// IFM is 24KB: the largest double-buffered input tile in the checked models
-// is ~11.5KB, so a 12KB half still holds it. OFM stays 48KB because a
+// Physical scratchpad is IFM+OFM+WGT+PARAM = 172KB, not one scaled SPAD_KB.
+// IFM is 32KB: each 16KB half holds the existing large-model tiles without
+// re-tiling, so group-major weight residency can overlap the next activation
+// load. OFM stays 48KB because a
 // double-buffered output tile is 22528 bytes and the half must hold it.
 // Weight is 80KB: the largest resident block is 73728 bytes (8ch 3x3x512
 // int16). Param stays 12KB so a 576-channel table that is not reloaded
 // still fits.
 `ifndef IFM_KB
-`define IFM_KB         24
+`define IFM_KB         32
 `endif
 `ifndef OFM_KB
 `define OFM_KB         48

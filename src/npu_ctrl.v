@@ -212,7 +212,6 @@ module npu_ctrl #(
     // reload protocol and intentionally retain the normal tile-major order.
     assign group_major_en = cfg_dma_store_mode[1]
                           && cfg_dma_store_mode[0]
-                          && !db_en
                           && (cfg_layer_mode[3:0] == 4'd0)
                           && (cfg_tile_h != 16'd0)
                           && (cfg_dma_wgt_per_oc != 0)
@@ -656,8 +655,8 @@ module npu_ctrl #(
                       && ((tile_x_seq + 16'd1 < cfg_tile_num_w)
                           || (tile_y_seq + 16'd1 < cfg_tile_num_h));
     wire bg_prefetch_en = db_en && per_tile_store_en && !skip_act_load
-                       && !group_major_en && !slice_stream && !is_concat_op
-                       && (cfg_dma_wgt_per_oc == 32'd0)
+                       && !slice_stream && !is_concat_op
+                       && ((cfg_dma_wgt_per_oc == 32'd0) || group_major_en)
                        && !param_needs_reload;
 
     // Shared by the async (!rst_n) and synchronous (ctrl_soft_rst) branches so
@@ -1037,14 +1036,22 @@ module npu_ctrl #(
                                                   * {16'd0, cfg_out_c} * (cfg_int16 ? 32'd2 : 32'd1);
                             r_tile_row_count <= (tile_out_h_actual != 0) ? tile_out_h_actual : cfg_tile_h;
                             r_tile_pixel_w <= (tile_out_w_actual != 0) ? tile_out_w_actual : cfg_tile_w;
-                            r_nhwc_row_stride <= {16'd0, cfg_out_w} * output_pixel_bytes;
-                            r_store_src_stride <= 16'd0;
-                            r_store_group_offset <= 32'd0;
-                            if (tile_out_w_actual != 0)
-                                r_tile_row_len <= (({16'd0, tile_out_w_actual}
-                                                   * output_pixel_bytes) >> 2);
-                            else
-                                r_tile_row_len <= tile_row_len * tile_row_count;
+                            if (group_major_en) begin
+                                r_nhwc_row_stride <= output_pixel_bytes;
+                                r_tile_row_len <= store_group_bytes[17:2];
+                                r_store_src_stride <= output_pixel_bytes[17:2];
+                                r_store_group_offset <= {16'd0, store_group_base_ch}
+                                                      * (cfg_int16 ? 32'd2 : 32'd1);
+                            end else begin
+                                r_nhwc_row_stride <= {16'd0, cfg_out_w} * output_pixel_bytes;
+                                r_store_src_stride <= 16'd0;
+                                r_store_group_offset <= 32'd0;
+                                if (tile_out_w_actual != 0)
+                                    r_tile_row_len <= (({16'd0, tile_out_w_actual}
+                                                       * output_pixel_bytes) >> 2);
+                                else
+                                    r_tile_row_len <= tile_row_len * tile_row_count;
+                            end
                             if (tile_x_seq + 1 >= cfg_tile_num_w) begin
                                 tile_x_seq <= 16'd0;
                                 tile_y_seq <= tile_y_seq + 16'd1;
@@ -1386,12 +1393,21 @@ module npu_ctrl #(
                         dma_row_len   <= 16'd0;
                         dma_row_count <= 16'd0;
                         if (bg_store_active) begin
-                            // Tile indices and banks advanced when this
-                            // background store was launched. Return to the
-                            // live compute/prefetch scheduler without doing
-                            // either operation a second time.
-                            bg_store_active <= 1'b0;
-                            state <= S_WAIT_COMP;
+                            if (group_major_en
+                                && store_spatial_row + 1 < r_tile_row_count) begin
+                                // A group-major tile needs one strided DMA per
+                                // spatial row. Keep draining the old OFM bank
+                                // while compute runs from the alternate bank.
+                                store_spatial_row <= store_spatial_row + 1'b1;
+                                state <= S_TILE_STORE;
+                            end else begin
+                                // Tile indices and banks advanced when this
+                                // background store was launched. Return to the
+                                // live compute/prefetch scheduler without doing
+                                // either operation a second time.
+                                bg_store_active <= 1'b0;
+                                state <= S_WAIT_COMP;
+                            end
                         end else if (group_major_en
                             && store_spatial_row + 1 < r_tile_row_count) begin
                             // A 2D DMA handles all pixels in one spatial row.

@@ -11,7 +11,7 @@
 TOP        ?= npu_top
 FREQ_MHZ   ?= 200
 ARRAY_SIZE ?= 8
-SPAD_KB    ?= 164
+SPAD_KB    ?= 172
 ACC_WIDTH  ?= 44
 
 # ─── Paths ───
