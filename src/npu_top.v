@@ -62,6 +62,10 @@ module npu_top #(
 
     // --- CSR ↔ Controller ---
     wire        ctrl_start, ctrl_abort, ctrl_soft_rst, ctrl_auto_next;
+    wire        ctrl_super_req, ctrl_super_slot_valid;
+    wire [1:0]  ctrl_super_slot;
+    wire        super_slot_en;
+    wire [1:0]  super_slot_select;
     // Cancel all in-flight datapath activity on SOFT_RST or ABORT. SRAM
     // contents and programmed CSRs intentionally remain intact.
     wire        engine_rst_n = rst_n & ~(ctrl_soft_rst | ctrl_abort);
@@ -106,6 +110,7 @@ module npu_top #(
     wire [31:0] reg_tile_in_hw;
     wire [31:0] reg_next_param_addr, reg_next_param_cfg;
     wire [31:0] reg_param_bank_ctrl;
+    wire [31:0] reg_wgt_sram_base, reg_param_sram_base;
 
     // --- CSR Post-Processing Config outputs ---
     wire [31:0] reg_post_ctrl, reg_post_param_addr;
@@ -121,6 +126,12 @@ module npu_top #(
 
     // --- Controller ↔ Compute ---
     wire        compute_start, compute_done;
+    wire        compute_single_tile_en;
+    wire [15:0] compute_external_tile_y, compute_external_tile_x;
+    wire [15:0] compute_external_tile_h, compute_external_tile_w;
+    wire        compute_external_origin_en, compute_halo_expand_en;
+    wire signed [16:0] compute_external_origin_h, compute_external_origin_w;
+    wire [15:0] compute_external_tile_in_w;
     wire        oc_group_done, wgt_reload_done;
     wire        group_major_en;
     wire [15:0] oc_group_idx;
@@ -128,7 +139,7 @@ module npu_top #(
     wire [1:0]  dma_sram_sel;
     wire        act_role_swap;
     wire        next_param_ready;
-    wire [PARAM_ADDR_W-1:0] compute_param_base;
+    wire [15:0] compute_param_base;
 
     // --- DMA ↔ SRAM MUX ---
     wire        dma_sram_en, dma_sram_we;
@@ -386,11 +397,16 @@ module npu_top #(
         .hw_perf_mac_idle_cnt(perf_mac_idle_cnt),
         .hw_perf_wait_store_cnt(perf_wait_store_cnt),
         .hw_next_param_ready(next_param_ready),
+        .hw_super_slot_en(super_slot_en),
+        .hw_super_slot   (super_slot_select),
         // Control outputs
         .ctrl_start     (ctrl_start),
         .ctrl_abort     (ctrl_abort),
         .ctrl_soft_rst  (ctrl_soft_rst),
         .ctrl_auto_next (ctrl_auto_next),
+        .ctrl_super_req (ctrl_super_req),
+        .ctrl_super_slot(ctrl_super_slot),
+        .ctrl_super_slot_valid(ctrl_super_slot_valid),
         .reg_layer_count(reg_layer_count),
         .irq_o          (irq_o),
         // Layer parameters
@@ -432,6 +448,8 @@ module npu_top #(
         .reg_next_param_addr (reg_next_param_addr),
         .reg_next_param_cfg  (reg_next_param_cfg),
         .reg_param_bank_ctrl (reg_param_bank_ctrl),
+        .reg_wgt_sram_base   (reg_wgt_sram_base),
+        .reg_param_sram_base (reg_param_sram_base),
         // Post-processing config
         .reg_post_ctrl          (reg_post_ctrl),
         .reg_post_param_addr    (reg_post_param_addr),
@@ -459,6 +477,11 @@ module npu_top #(
         .ctrl_start     (ctrl_start),
         .ctrl_abort     (ctrl_abort),
         .ctrl_soft_rst  (ctrl_soft_rst),
+        .ctrl_super_req (ctrl_super_req),
+        .ctrl_super_slot(ctrl_super_slot),
+        .ctrl_super_slot_valid(ctrl_super_slot_valid),
+        .super_slot_en   (super_slot_en),
+        .super_slot_select(super_slot_select),
         .hw_busy        (hw_busy),
         .hw_done        (hw_done),
         .hw_error       (hw_error),
@@ -474,6 +497,16 @@ module npu_top #(
         .dma_done       (dma_done),
         // Compute control
         .compute_start  (compute_start),
+        .compute_single_tile_en(compute_single_tile_en),
+        .compute_external_tile_y(compute_external_tile_y),
+        .compute_external_tile_x(compute_external_tile_x),
+        .compute_external_tile_h(compute_external_tile_h),
+        .compute_external_tile_w(compute_external_tile_w),
+        .compute_external_origin_en(compute_external_origin_en),
+        .compute_external_origin_h(compute_external_origin_h),
+        .compute_external_origin_w(compute_external_origin_w),
+        .compute_external_tile_in_w(compute_external_tile_in_w),
+        .compute_halo_expand_en(compute_halo_expand_en),
         .compute_done   (compute_done),
         .oc_group_done  (oc_group_done),
         .oc_group_idx   (oc_group_idx),
@@ -489,6 +522,8 @@ module npu_top #(
         .cfg_dma_param_addr (reg_dma_param_addr),
         .cfg_dma_in_size    (reg_dma_in_size),
         .cfg_dma_wgt_size   (reg_dma_wgt_size),
+        .cfg_wgt_sram_base  (reg_wgt_sram_base),
+        .cfg_param_sram_base(reg_param_sram_base),
         .cfg_dma_wgt_per_oc (reg_dma_wgt_per_oc),
         .cfg_wgt_layout     (reg_wgt_layout[0]),
         .cfg_dma_out_size   (reg_dma_out_size),
@@ -950,11 +985,12 @@ module npu_top #(
         .cfg_act_base   (effective_act_base),
         .cfg_out_base   (reg_sram_base[ACT_ADDR_W+16-1:16]),
         .cfg_ofm_base   (effective_ofm_base),
+        .cfg_wgt_base   (reg_wgt_sram_base[WGT_ADDR_W-1:0]),
         .cfg_pool_cfg   (reg_pool_cfg),
         .cfg_resize_cfg (reg_resize_cfg),
         .cfg_deconv_cfg (reg_deconv_cfg),
         .cfg_concat_cfg (reg_concat_cfg),
-        .cfg_param_base (compute_param_base),
+        .cfg_param_base (compute_param_base[PARAM_ADDR_W-1:0]),
         .cfg_2d_load    (npu_2d_load),  // 2D load when in_stride set
         // Weight SRAM Port B
         .wgt_rd_en      (wgt_b_en),
@@ -1018,6 +1054,16 @@ module npu_top #(
         .cfg_wgt_layout     (reg_wgt_layout[0]),
         .cfg_group_major    (group_major_en),
         .db_prefetch_done   (db_prefetch_done),
+        .cfg_single_tile_en (compute_single_tile_en),
+        .cfg_external_tile_y(compute_external_tile_y),
+        .cfg_external_tile_x(compute_external_tile_x),
+        .cfg_external_tile_h_actual(compute_external_tile_h),
+        .cfg_external_tile_w_actual(compute_external_tile_w),
+        .cfg_external_origin_en(compute_external_origin_en),
+        .cfg_external_origin_h(compute_external_origin_h),
+        .cfg_external_origin_w(compute_external_origin_w),
+        .cfg_external_tile_in_w(compute_external_tile_in_w),
+        .cfg_halo_expand_en(compute_halo_expand_en),
         .tile_out_h_actual  (tile_out_h_actual),
         .tile_out_w_actual  (tile_out_w_actual),
         .dbg_state          (compute_state)

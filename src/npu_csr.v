@@ -67,12 +67,17 @@ module npu_csr #(
     input  wire [31:0]         hw_perf_mac_idle_cnt,   // 0x1CC: MAC state, no MAC issued
     input  wire [31:0]         hw_perf_wait_store_cnt, // 0x1D0: ... of which DDR writeback
     input  wire                hw_next_param_ready,
+    input  wire                hw_super_slot_en,
+    input  wire [1:0]          hw_super_slot,
 
     // ─── Control Outputs (to other modules) ───
     output wire                 ctrl_start,     // START pulse
     output wire                 ctrl_abort,     // ABORT pulse
     output wire                 ctrl_soft_rst,  // Soft reset pulse
     output wire                 ctrl_auto_next, // AUTO_NEXT mode
+    output wire                 ctrl_super_req, // Phase-1 super-block request (unsupported until block FSM lands)
+    output wire [1:0]           ctrl_super_slot,
+    output wire                 ctrl_super_slot_valid,
 
     // ─── Layer Count Output ───
     output wire [7:0]           reg_layer_count, // Total layer count for auto-next
@@ -120,6 +125,8 @@ module npu_csr #(
     output wire [DATA_W-1:0]   reg_next_param_addr,
     output wire [DATA_W-1:0]   reg_next_param_cfg,
     output wire [DATA_W-1:0]   reg_param_bank_ctrl,
+    output wire [DATA_W-1:0]   reg_wgt_sram_base,
+    output wire [DATA_W-1:0]   reg_param_sram_base,
 
     // ─── Post-Processing Config Outputs ───
     output wire [DATA_W-1:0]   reg_post_ctrl,
@@ -182,6 +189,25 @@ module npu_csr #(
     reg [DATA_W-1:0] r_next_param_addr;// 0x150 — next layer param DDR address
     reg [DATA_W-1:0] r_next_param_cfg;// 0x154 — bit31 enable, [15:0] words
     reg [DATA_W-1:0] r_param_bank_ctrl;// 0x158 — current bank/preloaded/next bank
+    // 0x160 SUPER_CTRL: bit0=request, [2:1]=START slot, [9:8]=window slot.
+    // The request is deliberately rejected by npu_ctrl until the controller-
+    // owned three-layer FSM exists.  Keeping the storage and mux isolated
+    // behind bit0 lets firmware and verification land without changing any
+    // legacy descriptor path.
+    reg [DATA_W-1:0] r_super_ctrl;
+    reg [1:0]        r_super_active_slot;
+    reg              r_super_frozen;
+    // Freeze on the bus acceptance edge, not one cycle later when r_ctrl[0]
+    // becomes visible as ctrl_start. This closes the first legal Wishbone
+    // write slot after START against descriptor/window selection mutation.
+    wire super_start_accept = valid_access && !wb_ack_o && wb_we_i
+                            && (addr == 12'h000) && wb_dat_i[0]
+                            && r_super_ctrl[0];
+    // 0x400-0x4FF: selected descriptor window (44 implemented words).
+    // Slots are ordinary flops in this first prototype so START can freeze a
+    // complete descriptor atomically and synthesis does not depend on RAM
+    // read-during-write behavior.
+    reg [DATA_W-1:0] r_super_desc [0:2][0:43];
 
     // ─── Group 3: Post-Processing Configuration ───
     reg [DATA_W-1:0] r_post_ctrl;     // 0x180
@@ -250,54 +276,63 @@ module npu_csr #(
     assign ctrl_abort     = r_ctrl[1];
     assign ctrl_soft_rst  = r_ctrl[2];
     assign ctrl_auto_next = r_ctrl[3];
+    assign ctrl_super_req = r_super_ctrl[0];
+    assign ctrl_super_slot = (r_super_frozen && hw_super_slot_en)
+                           ? hw_super_slot
+                           : (r_super_frozen ? r_super_active_slot
+                                             : r_super_ctrl[2:1]);
+    assign ctrl_super_slot_valid = (ctrl_super_slot < 2'd3);
     assign reg_layer_count = r_layer_count[7:0];
 
     // ─── Register outputs ───
-    assign reg_layer_mode       = r_layer_mode;
-    assign reg_in_dim_hw        = r_in_dim_hw;
-    assign reg_in_dim_c         = r_in_dim_c;
-    assign reg_out_dim_hw       = r_out_dim_hw;
-    assign reg_out_dim_c        = r_out_dim_c;
-    assign reg_kernel_size      = r_kernel_size;
-    assign reg_stride           = r_stride;
-    assign reg_padding          = r_padding;
-    assign reg_pool_cfg         = r_pool_cfg;
-    assign reg_resize_cfg       = r_resize_cfg;
-    assign reg_deconv_cfg       = r_deconv_cfg;
-    assign reg_concat_cfg       = r_concat_cfg;
-    assign reg_tile_cfg         = r_tile_cfg;
-    assign reg_tile_count       = r_tile_count;
-    assign reg_sram_base        = r_sram_base;
-    assign reg_dma_in_addr      = r_dma_in_addr;
-    assign reg_dma_out_addr     = r_dma_out_addr;
-    assign reg_dma_wgt_addr     = r_dma_wgt_addr;
-    assign reg_dma_param_addr   = r_dma_param_addr;
-    assign reg_dma_in_stride    = r_dma_in_stride;
-    assign reg_dma_out_stride   = r_dma_out_stride;
-    assign reg_dma_ctrl         = r_dma_ctrl;
-    assign reg_dma_add_b_addr   = r_dma_add_b_addr;
-    assign reg_dma_add_param_addr = r_dma_add_param;
-    assign reg_dma_in_size      = r_dma_in_size;
-    assign reg_dma_wgt_size     = r_dma_wgt_size;
-    assign reg_dma_out_size     = r_dma_out_size;
-    assign reg_dma_tile_in_size = r_dma_tile_in_size;
-    assign reg_dma_tile_out_size = r_dma_tile_out_size;
-    assign reg_dma_store_mode   = r_dma_store_mode;
-    assign reg_dma_row_cfg      = r_dma_row_cfg;
-    assign reg_dma_wgt_per_oc   = r_dma_wgt_per_oc;
-    assign reg_wgt_layout       = r_wgt_layout;
-    assign reg_tile_in_hw       = r_tile_in_hw;
-    assign reg_next_param_addr  = r_next_param_addr;
-    assign reg_next_param_cfg   = r_next_param_cfg;
-    assign reg_param_bank_ctrl  = r_param_bank_ctrl;
-    assign reg_post_ctrl        = r_post_ctrl;
-    assign reg_post_param_addr  = r_dma_param_addr; // dual-mapped
-    assign reg_post_param_count = r_post_param_count;
-    assign reg_post_clamp       = r_post_clamp;
-    assign reg_post_act_cfg     = r_post_act_cfg;
-    assign reg_post_add_param_addr = r_dma_add_param; // dual-mapped
-    assign reg_post_add_input_addr = r_dma_add_b_addr; // dual-mapped
-    assign reg_post_add_stride  = r_post_add_stride;
+    wire super_mux = ctrl_super_req && ctrl_super_slot_valid;
+    assign reg_layer_mode       = super_mux ? r_super_desc[ctrl_super_slot][0]  : r_layer_mode;
+    assign reg_in_dim_hw        = super_mux ? r_super_desc[ctrl_super_slot][1]  : r_in_dim_hw;
+    assign reg_in_dim_c         = super_mux ? r_super_desc[ctrl_super_slot][2]  : r_in_dim_c;
+    assign reg_out_dim_hw       = super_mux ? r_super_desc[ctrl_super_slot][3]  : r_out_dim_hw;
+    assign reg_out_dim_c        = super_mux ? r_super_desc[ctrl_super_slot][4]  : r_out_dim_c;
+    assign reg_kernel_size      = super_mux ? r_super_desc[ctrl_super_slot][5]  : r_kernel_size;
+    assign reg_stride           = super_mux ? r_super_desc[ctrl_super_slot][6]  : r_stride;
+    assign reg_padding          = super_mux ? r_super_desc[ctrl_super_slot][7]  : r_padding;
+    assign reg_pool_cfg         = super_mux ? r_super_desc[ctrl_super_slot][8]  : r_pool_cfg;
+    assign reg_resize_cfg       = super_mux ? r_super_desc[ctrl_super_slot][9]  : r_resize_cfg;
+    assign reg_deconv_cfg       = super_mux ? r_super_desc[ctrl_super_slot][10] : r_deconv_cfg;
+    assign reg_concat_cfg       = super_mux ? r_super_desc[ctrl_super_slot][11] : r_concat_cfg;
+    assign reg_tile_cfg         = super_mux ? r_super_desc[ctrl_super_slot][12] : r_tile_cfg;
+    assign reg_tile_count       = super_mux ? r_super_desc[ctrl_super_slot][13] : r_tile_count;
+    assign reg_sram_base        = super_mux ? r_super_desc[ctrl_super_slot][14] : r_sram_base;
+    assign reg_dma_in_addr      = super_mux ? r_super_desc[ctrl_super_slot][15] : r_dma_in_addr;
+    assign reg_dma_out_addr     = super_mux ? r_super_desc[ctrl_super_slot][16] : r_dma_out_addr;
+    assign reg_dma_wgt_addr     = super_mux ? r_super_desc[ctrl_super_slot][17] : r_dma_wgt_addr;
+    assign reg_dma_param_addr   = super_mux ? r_super_desc[ctrl_super_slot][18] : r_dma_param_addr;
+    assign reg_dma_in_stride    = super_mux ? r_super_desc[ctrl_super_slot][19] : r_dma_in_stride;
+    assign reg_dma_out_stride   = super_mux ? r_super_desc[ctrl_super_slot][20] : r_dma_out_stride;
+    assign reg_dma_ctrl         = super_mux ? r_super_desc[ctrl_super_slot][21] : r_dma_ctrl;
+    assign reg_dma_add_b_addr   = super_mux ? r_super_desc[ctrl_super_slot][22] : r_dma_add_b_addr;
+    assign reg_dma_add_param_addr = super_mux ? r_super_desc[ctrl_super_slot][23] : r_dma_add_param;
+    assign reg_dma_in_size      = super_mux ? r_super_desc[ctrl_super_slot][24] : r_dma_in_size;
+    assign reg_dma_wgt_size     = super_mux ? r_super_desc[ctrl_super_slot][25] : r_dma_wgt_size;
+    assign reg_dma_out_size     = super_mux ? r_super_desc[ctrl_super_slot][26] : r_dma_out_size;
+    assign reg_dma_tile_in_size = super_mux ? r_super_desc[ctrl_super_slot][27] : r_dma_tile_in_size;
+    assign reg_dma_tile_out_size = super_mux ? r_super_desc[ctrl_super_slot][28] : r_dma_tile_out_size;
+    assign reg_dma_store_mode   = super_mux ? r_super_desc[ctrl_super_slot][29] : r_dma_store_mode;
+    assign reg_dma_row_cfg      = super_mux ? r_super_desc[ctrl_super_slot][30] : r_dma_row_cfg;
+    assign reg_dma_wgt_per_oc   = super_mux ? r_super_desc[ctrl_super_slot][31] : r_dma_wgt_per_oc;
+    assign reg_wgt_layout       = super_mux ? r_super_desc[ctrl_super_slot][32] : r_wgt_layout;
+    assign reg_tile_in_hw       = super_mux ? r_super_desc[ctrl_super_slot][33] : r_tile_in_hw;
+    assign reg_next_param_addr  = super_mux ? r_super_desc[ctrl_super_slot][34] : r_next_param_addr;
+    assign reg_next_param_cfg   = super_mux ? r_super_desc[ctrl_super_slot][35] : r_next_param_cfg;
+    assign reg_param_bank_ctrl  = super_mux ? r_super_desc[ctrl_super_slot][36] : r_param_bank_ctrl;
+    assign reg_post_ctrl        = super_mux ? r_super_desc[ctrl_super_slot][37] : r_post_ctrl;
+    assign reg_post_param_addr  = reg_dma_param_addr; // dual-mapped
+    assign reg_post_param_count = super_mux ? r_super_desc[ctrl_super_slot][38] : r_post_param_count;
+    assign reg_post_clamp       = super_mux ? r_super_desc[ctrl_super_slot][39] : r_post_clamp;
+    assign reg_post_act_cfg     = super_mux ? r_super_desc[ctrl_super_slot][40] : r_post_act_cfg;
+    assign reg_post_add_param_addr = reg_dma_add_param_addr; // dual-mapped
+    assign reg_post_add_input_addr = reg_dma_add_b_addr; // dual-mapped
+    assign reg_post_add_stride  = super_mux ? r_super_desc[ctrl_super_slot][41] : r_post_add_stride;
+    assign reg_wgt_sram_base    = super_mux ? r_super_desc[ctrl_super_slot][42] : 32'd0;
+    assign reg_param_sram_base  = super_mux ? r_super_desc[ctrl_super_slot][43] : 32'd0;
 
     // ─── Status register (assembled from hw inputs) ───
     wire [DATA_W-1:0] status_reg = {16'd0, hw_curr_layer, 4'd0,
@@ -305,6 +340,8 @@ module npu_csr #(
 
     // ─── LUT initialization ───
     integer lut_i;
+    integer super_i;
+    integer super_j;
 
     // ─── Main register write/read logic ───
     always @(posedge clk or negedge rst_n) begin
@@ -351,6 +388,9 @@ module npu_csr #(
             r_next_param_addr  <= 32'd0;
             r_next_param_cfg   <= 32'd0;
             r_param_bank_ctrl  <= 32'd0;
+            r_super_ctrl       <= 32'd0;
+            r_super_active_slot<= 2'd0;
+            r_super_frozen     <= 1'b0;
             r_tile_in_hw       <= 32'd0;
             r_post_ctrl     <= 32'd0;
             r_post_param_count <= 32'd0;
@@ -359,11 +399,22 @@ module npu_csr #(
             r_post_add_stride <= 32'd0;
             for (lut_i = 0; lut_i < 128; lut_i = lut_i + 1)
                 r_lut[lut_i] <= 32'd0;
+            for (super_i = 0; super_i < 3; super_i = super_i + 1)
+                for (super_j = 0; super_j < 44; super_j = super_j + 1)
+                    r_super_desc[super_i][super_j] <= 32'd0;
         end else begin
             // ─── Self-clearing control bits (pulse for 1 cycle) ───
             r_ctrl[0] <= 1'b0;  // START auto-clear
             r_ctrl[1] <= 1'b0;  // ABORT auto-clear
             r_ctrl[2] <= 1'b0;  // SOFT_RST auto-clear
+            // DONE/ERROR/SOFT_RST releases a completed transaction. A newly
+            // accepted START has higher priority if both occur on one edge.
+            if (hw_done || hw_error || ctrl_soft_rst)
+                r_super_frozen <= 1'b0;
+            if (super_start_accept) begin
+                r_super_active_slot <= r_super_ctrl[2:1];
+                r_super_frozen <= 1'b1;
+            end
 
             // ─── IRQ status set from hardware pulses ───
             if (irq_done_set)  r_irq_status[0] <= 1'b1;
@@ -432,6 +483,7 @@ module npu_csr #(
                         12'h150: r_next_param_addr  <= wb_dat_i;
                         12'h154: r_next_param_cfg   <= wb_dat_i;
                         12'h158: r_param_bank_ctrl  <= wb_dat_i;
+                        12'h160: if (!r_super_frozen) r_super_ctrl <= wb_dat_i;
                         12'h13C: r_tile_in_hw       <= wb_dat_i;
 
                         // Group 3: Post-Processing Configuration
@@ -443,6 +495,15 @@ module npu_csr #(
                         12'h194: r_dma_add_param    <= wb_dat_i; // dual-map
                         12'h198: r_dma_add_b_addr   <= wb_dat_i; // dual-map
                         12'h19C: r_post_add_stride  <= wb_dat_i;
+
+                        // Super descriptor window.  Slot 3 is reserved and
+                        // ignores writes.  A frozen START descriptor is
+                        // immutable until DONE/ERROR/SOFT_RST.
+                        12'b0100_????_????:
+                            if (!r_super_frozen && r_super_ctrl[9:8] < 2'd3
+                                && addr[7:2] < 6'd44)
+                                r_super_desc[r_super_ctrl[9:8]][addr[7:2]]
+                                    <= wb_dat_i;
 
                         // Group 4: LUT Data (0x200-0x3FF)
                         12'b0010_????_????: r_lut[addr[8:2]] <= wb_dat_i;
@@ -532,6 +593,11 @@ module npu_csr #(
                         12'h158: wb_dat_o <= r_param_bank_ctrl;
                         12'h15C: wb_dat_o <= {PARAM_HALF_WORDS, 15'd0,
                                               hw_next_param_ready};
+                        12'h160: wb_dat_o <= r_super_ctrl;
+                        // bit0=implemented capability (0 for this isolated
+                        // foundation), bit1=frozen, [3:2]=active slot.
+                        12'h164: wb_dat_o <= {28'd0, ctrl_super_slot,
+                                              r_super_frozen, 1'b0};
                         12'h13C: wb_dat_o <= r_tile_in_hw;
 
                         // Group 3: Post-Processing Configuration
@@ -543,6 +609,14 @@ module npu_csr #(
                         12'h194: wb_dat_o <= r_dma_add_param;  // dual-map
                         12'h198: wb_dat_o <= r_dma_add_b_addr; // dual-map
                         12'h19C: wb_dat_o <= r_post_add_stride;
+
+                        12'b0100_????_????:
+                            if (r_super_ctrl[9:8] < 2'd3
+                                && addr[7:2] < 6'd44)
+                                wb_dat_o <= r_super_desc[r_super_ctrl[9:8]]
+                                                       [addr[7:2]];
+                            else
+                                wb_dat_o <= 32'd0;
 
                         // Group 4: LUT Data (0x200-0x3FF)
                         12'b0010_????_????: wb_dat_o <= r_lut[addr[8:2]];
