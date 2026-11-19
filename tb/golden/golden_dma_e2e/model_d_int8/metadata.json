@@ -635,9 +635,9 @@
     "in_zp": 0,
     "input_src": -1,
     "residual_src": 8,
-    "add_M_A": 27464,
+    "add_M_A": 30651,
     "add_S_A": 15,
-    "add_M_B": 25573,
+    "add_M_B": 30619,
     "add_S_B": 15,
     "ddr_add_b_addr": 809377792
   },
@@ -983,9 +983,9 @@
     "in_zp": 0,
     "input_src": -1,
     "residual_src": 15,
-    "add_M_A": 28891,
+    "add_M_A": 25537,
     "add_S_A": 15,
-    "add_M_B": 25511,
+    "add_M_B": 19619,
     "add_S_B": 16,
     "ddr_add_b_addr": 810221568
   },

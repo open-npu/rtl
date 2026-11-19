@@ -995,7 +995,13 @@ module npu_ctrl #(
                 S_LOAD_ACT: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;
-                    end else if (skip_act_load || in_words == 0) begin
+                    // Use the full byte count for the empty-input test.
+                    // in_words is the DMA's 16-bit transfer length; exactly
+                    // 65536 words (256 KiB) wraps to zero there.  Tiled layers
+                    // still transfer tile_in_words, so treating that wrap as
+                    // an empty tensor skips only tile(0,0) while later tile
+                    // prefetches succeed (Model D INT16 L5).
+                    end else if (skip_act_load || cfg_dma_in_size == 0) begin
                         // Fused mid/end: previous OFM becomes this layer's IFM.
                         // Swap before Add-B / concat preload so those DMAs hit
                         // the post-swap banks.
