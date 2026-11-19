@@ -200,6 +200,36 @@ async def test_full_layer_sequence(dut):
     await Timer(1, unit="step")
 
 
+@cocotb.test()
+async def test_exact_256k_tiled_input_loads_first_tile(dut):
+    """A 65536-word full tensor must not wrap the empty-input test."""
+    await init_dut(dut)
+
+    dut.cfg_dma_in_size.value = 0x40000
+    dut.cfg_tile_h.value = 8
+    dut.cfg_tile_w.value = 8
+    dut.cfg_tile_num_h.value = 4
+    dut.cfg_tile_num_w.value = 4
+    dut.cfg_tile_in_size.value = 0x4000
+    dut.cfg_dma_store_mode.value = 1
+    dut.cfg_dma_tile_out_size.value = 0x2000
+
+    dut.ctrl_start.value = 1
+    await RisingEdge(dut.clk)
+    dut.ctrl_start.value = 0
+
+    assert await wait_for_dma_start(dut), "Weight DMA start not issued"
+    await complete_dma(dut)
+
+    assert await wait_for_dma_start(dut), (
+        "256 KiB input wrapped to zero and skipped tile(0,0)")
+    await ReadOnly()
+    assert int(dut.dma_dir.value) == 0
+    assert int(dut.dma_sram_sel.value) == 1
+    assert int(dut.dma_xfer_len.value) == 0x1000
+    await Timer(1, unit="step")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 4: Abort during DMA load
 # ─────────────────────────────────────────────────────────────────────────────
