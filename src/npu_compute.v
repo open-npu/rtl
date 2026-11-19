@@ -50,6 +50,19 @@ module npu_compute #(
     input  wire                         cfg_wgt_layout,  // 0=legacy OC-major, 1=K-major (64-lane row)
     input  wire                         cfg_group_major, // Reuse one resident OC group across all spatial tiles
     input  wire                         db_prefetch_done,  // DB_EN: prefetch complete, safe to start next tile
+    // Controller-owned tile mode.  Coordinates are tile indices; actual
+    // dimensions are already clipped at the output boundary.  One START
+    // executes exactly this tile and produces DONE without tile_done.
+    input  wire                         cfg_single_tile_en,
+    input  wire [15:0]                  cfg_external_tile_y,
+    input  wire [15:0]                  cfg_external_tile_x,
+    input  wire [15:0]                  cfg_external_tile_h_actual,
+    input  wire [15:0]                  cfg_external_tile_w_actual,
+    input  wire                         cfg_external_origin_en,
+    input  wire signed [16:0]           cfg_external_origin_h,
+    input  wire signed [16:0]           cfg_external_origin_w,
+    input  wire [15:0]                  cfg_external_tile_in_w,
+    input  wire                         cfg_halo_expand_en,
     // Per-tile store support: actual (clipped) tile output dimensions
     output wire [15:0]                  tile_out_h_actual, // Current tile's actual output height (clipped at border)
     output wire [15:0]                  tile_out_w_actual, // Current tile's actual output width (clipped at border)
@@ -78,6 +91,7 @@ module npu_compute #(
     input  wire [ACT_ADDR_W-1:0]        cfg_act_base,   // Input activation base (word addr)
     input  wire [ACT_ADDR_W-1:0]        cfg_out_base,   // CSR output offset inside the OFM bank
     input  wire [ACT_ADDR_W-1:0]        cfg_ofm_base,   // OFM write base, including the DB half
+    input  wire [WGT_ADDR_W-1:0]        cfg_wgt_base,   // descriptor-local weight SRAM word base
     input  wire [PARAM_ADDR_W-1:0]      cfg_param_base, // selected parameter ping/pong bank
     input  wire [31:0]                  cfg_pool_cfg,   // Pooling config register
     input  wire [31:0]                  cfg_resize_cfg, // Resize config register
@@ -263,6 +277,11 @@ module npu_compute #(
 
     // ─── Tile iteration ───
     reg [15:0] tile_y, tile_x;
+    reg        single_tile_active;
+    reg [15:0] single_tile_h_actual, single_tile_w_actual;
+    reg        external_origin_active, halo_expand_active;
+    reg signed [16:0] external_origin_h, external_origin_w;
+    reg [15:0] external_tile_in_w;
     reg        tile_done_r;
     reg        tile_wait_delay;  // DB_EN wait: skip 1 cycle, then wait for prefetch
     assign tile_done = tile_done_r;
@@ -273,6 +292,18 @@ module npu_compute #(
     assign tile_out_h_actual = out_tile_h;
     assign tile_out_w_actual = out_tile_w;
     assign dbg_state = state;
+    // Group-major owns the spatial loop and is therefore incompatible with
+    // an externally owned single-tile invocation.
+    wire group_major_active = cfg_group_major && !single_tile_active;
+    wire signed [17:0] halo_global_oh = external_origin_h
+                                      + $signed({1'b0, ppu_oh});
+    wire signed [17:0] halo_global_ow = external_origin_w
+                                      + $signed({1'b0, ppu_ow});
+    wire halo_output_pad = halo_expand_active
+                         && ((halo_global_oh < 0)
+                             || (halo_global_oh >= $signed({2'b0, cfg_out_h}))
+                             || (halo_global_ow < 0)
+                             || (halo_global_ow >= $signed({2'b0, cfg_out_w})));
     reg [15:0] oc_group;
 
     // ─── Latched config ───
@@ -730,6 +761,14 @@ module npu_compute #(
             dw_in_data_w   <= 0;
             // Internal state
             tile_y <= 0; tile_x <= 0; oc_group <= 0;
+            single_tile_active <= 1'b0;
+            single_tile_h_actual <= 16'd0;
+            single_tile_w_actual <= 16'd0;
+            external_origin_active <= 1'b0;
+            halo_expand_active <= 1'b0;
+            external_origin_h <= 17'sd0;
+            external_origin_w <= 17'sd0;
+            external_tile_in_w <= 16'd0;
             oc_groups_total <= 1; k_depth <= 1;
             out_tile_h <= 1; out_tile_w <= 1;
             wgt_word_addr <= 0;
@@ -1024,12 +1063,25 @@ module npu_compute #(
                             poh = gp_oh[ga_p[2:0]];
                             pow = gp_ow[ga_p[2:0]];
                         end
-                        ih = $signed({1'b0, tile_oh_origin + poh})
-                           * $signed({1'b0, cfg_stride_h})
-                           + $signed({16'd0, ga_fh}) - $signed({16'd0, cfg_pad_top});
-                        iw = $signed({1'b0, tile_ow_origin + pow})
-                           * $signed({1'b0, cfg_stride_w})
-                           + $signed({16'd0, ga_fw}) - $signed({16'd0, cfg_pad_left});
+                        if (external_origin_active) begin
+                            ih = (external_origin_h + $signed({1'b0, poh}))
+                               * $signed({1'b0, cfg_stride_h})
+                               + $signed({16'd0, ga_fh})
+                               - $signed({16'd0, cfg_pad_top});
+                            iw = (external_origin_w + $signed({1'b0, pow}))
+                               * $signed({1'b0, cfg_stride_w})
+                               + $signed({16'd0, ga_fw})
+                               - $signed({16'd0, cfg_pad_left});
+                        end else begin
+                            ih = $signed({1'b0, tile_oh_origin + poh})
+                               * $signed({1'b0, cfg_stride_h})
+                               + $signed({16'd0, ga_fh})
+                               - $signed({16'd0, cfg_pad_top});
+                            iw = $signed({1'b0, tile_ow_origin + pow})
+                               * $signed({1'b0, cfg_stride_w})
+                               + $signed({16'd0, ga_fw})
+                               - $signed({16'd0, cfg_pad_left});
+                        end
                         is_pad = (ih < 0) || (ih >= $signed({1'b0, cfg_in_h}))
                               || (iw < 0) || (iw >= $signed({1'b0, cfg_in_w}));
                         // Depthwise pixels of a group are contiguous in NHWC
@@ -1260,7 +1312,19 @@ module npu_compute #(
                     k_depth <= {8'd0, cfg_kernel_h} * {8'd0, cfg_kernel_w} * cfg_in_c;
                     kw_eff  <= cfg_kernel_w;
 
-                    if (cfg_tile_h == 17'd0) begin
+                    single_tile_active <= cfg_single_tile_en;
+                    single_tile_h_actual <= cfg_external_tile_h_actual;
+                    single_tile_w_actual <= cfg_external_tile_w_actual;
+                    external_origin_active <= cfg_external_origin_en;
+                    external_origin_h <= cfg_external_origin_h;
+                    external_origin_w <= cfg_external_origin_w;
+                    external_tile_in_w <= cfg_external_tile_in_w;
+                    halo_expand_active <= cfg_halo_expand_en;
+
+                    if (cfg_single_tile_en) begin
+                        out_tile_h <= cfg_external_tile_h_actual;
+                        out_tile_w <= cfg_external_tile_w_actual;
+                    end else if (cfg_tile_h == 17'd0) begin
                         out_tile_h <= cfg_out_h;
                         out_tile_w <= cfg_out_w;
                     end else begin
@@ -1268,8 +1332,8 @@ module npu_compute #(
                         out_tile_w <= cfg_tile_w;
                     end
 
-                    tile_y <= 0;
-                    tile_x <= 0;
+                    tile_y <= cfg_single_tile_en ? cfg_external_tile_y : 16'd0;
+                    tile_x <= cfg_single_tile_en ? cfg_external_tile_x : 16'd0;
                     oc_group <= 0;
                     // A layer with no output channels has nothing to compute;
                     // the OC loop would otherwise still run one group and
@@ -1281,7 +1345,7 @@ module npu_compute #(
             // ══════════════════════════════════════════════════════════════
             S_TILE_SETUP: begin
                 // Compute base addresses
-                wgt_base <= 0;  // Weight base fixed (all OC weights from start)
+                wgt_base <= cfg_wgt_base;
                 param_base <= cfg_param_base;
                 // Input: always use cfg_act_base; tile offset is folded into
                 // conv_ih_base/conv_iw_base via tile_oh_origin/tile_ow_origin
@@ -1290,7 +1354,32 @@ module npu_compute #(
                 // Without this, border-tile clipping persists into next tile
                 // (e.g., tile(0,3) clips out_tile_w to 4, tile(1,0) inherits 4).
                 // For non-tiled (cfg_tile_h=0): use full output dims.
-                if (cfg_tile_h == 17'd0) begin
+                if (single_tile_active) begin
+                    out_tile_h <= single_tile_h_actual;
+                    out_tile_w <= single_tile_w_actual;
+                    tile_oh_origin <= tile_y * cfg_tile_h;
+                    tile_ow_origin <= tile_x * cfg_tile_w;
+                    if (cfg_op_type == 8'd5) begin
+                        begin : ext_rsz_tile_origin_blk
+                            reg [31:0] ext_out_start_h, ext_out_start_w;
+                            ext_out_start_h = tile_y * cfg_tile_h;
+                            ext_out_start_w = tile_x * cfg_tile_w;
+                            if (resize_mode) begin
+                                rsz_tile_ih_origin <= (cfg_out_h > 1)
+                                    ? (ext_out_start_h * (cfg_in_h - 1))
+                                      / (cfg_out_h - 1) : 0;
+                                rsz_tile_iw_origin <= (cfg_out_w > 1)
+                                    ? (ext_out_start_w * (cfg_in_w - 1))
+                                      / (cfg_out_w - 1) : 0;
+                            end else begin
+                                rsz_tile_ih_origin <= (cfg_out_h != 0)
+                                    ? (ext_out_start_h * cfg_in_h) / cfg_out_h : 0;
+                                rsz_tile_iw_origin <= (cfg_out_w != 0)
+                                    ? (ext_out_start_w * cfg_in_w) / cfg_out_w : 0;
+                            end
+                        end
+                    end
+                end else if (cfg_tile_h == 17'd0) begin
                     out_tile_h <= cfg_out_h;
                     out_tile_w <= cfg_out_w;
                     tile_oh_origin <= 17'd0;
@@ -1332,7 +1421,7 @@ module npu_compute #(
                              tile_ow_origin, out_tile_w, tile_in_w);
                 `endif
                 // Clip tile dimensions to image boundary (after reset + origin)
-                if (cfg_tile_h != 17'd0) begin
+                if (cfg_tile_h != 17'd0 && !single_tile_active) begin
                     if (cfg_tile_w > cfg_out_w - tile_x * cfg_tile_w)
                         out_tile_w <= cfg_out_w - tile_x * cfg_tile_w;
                     if (cfg_tile_h > cfg_out_h - tile_y * cfg_tile_h)
@@ -1341,6 +1430,8 @@ module npu_compute #(
                 // Compute the input tile width used by activation addressing.
                 if (cfg_tile_h == 17'd0) begin
                     tile_in_w <= cfg_in_w;
+                end else if (single_tile_active && external_tile_in_w != 0) begin
+                    tile_in_w <= external_tile_in_w;
                 end else begin
                     // Pooling uses pool_cfg params, Conv uses cfg_stride/kw_eff
                     if (cfg_op_type == 3) begin  // POOLING
@@ -1366,7 +1457,7 @@ module npu_compute #(
 
                 // The normal schedule starts each spatial tile at OC group 0.
                 // Group-major keeps the resident group while walking all tiles.
-                if (!cfg_group_major)
+                if (!group_major_active)
                     oc_group <= 0;
                 row_ks0 <= 16'd0;
                 row_ks_reload <= 1'b0;
@@ -1388,7 +1479,7 @@ module npu_compute #(
                     // the previous tile's final group and group 0 must be
                     // restored. Group-major keeps one group resident across
                     // tiles; group 0 was loaded before compute_start.
-                    if (cfg_wgt_per_oc != 0 && !cfg_group_major) begin
+                    if (cfg_wgt_per_oc != 0 && !group_major_active) begin
                         oc_group_done <= 1'b1;  // Request reload of oc_group 0
                         state <= S_WAIT_WGT_RELOAD;
                     end else begin
@@ -1399,13 +1490,16 @@ module npu_compute #(
 
             // ══════════════════════════════════════════════════════════════
             S_OC_SETUP: begin
-                // Weight base: 0 if per-oc reload, else offset into full weight SRAM
+                // Weight base is descriptor-relative. Per-OC reloads replace
+                // the contents at cfg_wgt_base; resident groups add offsets.
                 if (cfg_wgt_per_oc != 0)
-                    wgt_base <= 0;
+                    wgt_base <= cfg_wgt_base;
                 else if (cfg_int16)
-                    wgt_base <= (oc_group * ARRAY_SIZE_16 * k_depth) >> 1;
+                    wgt_base <= cfg_wgt_base
+                              + ((oc_group * ARRAY_SIZE_16 * k_depth) >> 1);
                 else
-                    wgt_base <= (oc_group * ARRAY_SIZE_16 * k_depth) >> 2;
+                    wgt_base <= cfg_wgt_base
+                              + ((oc_group * ARRAY_SIZE_16 * k_depth) >> 2);
                 // Param base: 4 words per channel, ARRAY_SIZE channels per group.
                 // When per-oc PARAM reload is active (weights reload per oc_group
                 // AND out_c exceeds the param SRAM capacity of SPAD_KB*16/4
@@ -1552,11 +1646,15 @@ module npu_compute #(
                         // address. Dense conv groups are whole 64*k_depth
                         // blocks, so the group base is a plain multiple.
                         if (cfg_op_type == 8'd1)
-                            wgt_base <= 0;
+                            wgt_base <= cfg_wgt_base;
                         else if (cfg_int16)
-                            wgt_base <= (oc_group * {9'd0, row_group_ch} * k_depth) >> 1;
+                            wgt_base <= cfg_wgt_base
+                                      + ((oc_group * {9'd0, row_group_ch}
+                                          * k_depth) >> 1);
                         else
-                            wgt_base <= (oc_group * {9'd0, row_group_ch} * k_depth) >> 2;
+                            wgt_base <= cfg_wgt_base
+                                      + ((oc_group * {9'd0, row_group_ch}
+                                          * k_depth) >> 2);
                     end
                     // Reloaded params sit at SRAM[0]. Resident params are
                     // addressed by the 64-channel group.
@@ -1895,7 +1993,7 @@ module npu_compute #(
 
 
             S_OC_NEXT: begin
-                if (cfg_group_major) begin
+                if (group_major_active) begin
                     // One OC group has completed for this tile. Keep its
                     // weights resident and advance spatially. At the last
                     // tile, request the next group only after the controller
@@ -1998,7 +2096,7 @@ module npu_compute #(
                         param_word_idx <= 0;
                         param_read_issued <= 1'b0;
                         state <= S_POOL_CH_SETUP;
-                    end else if (cfg_group_major) begin
+                    end else if (group_major_active) begin
                         // Weight, params, and tile(0,0) activation are all
                         // resident when the controller acknowledges a
                         // group-major reload.
@@ -2010,7 +2108,9 @@ module npu_compute #(
             end
 
             S_TILE_NEXT: begin
-                if (cfg_tile_h == 17'd0) begin
+                if (single_tile_active) begin
+                    state <= S_DONE;
+                end else if (cfg_tile_h == 17'd0) begin
                     state <= S_DONE;
                 end else if (tile_x + 1 >= cfg_tile_num_w) begin
                     if (tile_y + 1 >= cfg_tile_num_h) begin
@@ -3107,11 +3207,14 @@ module npu_compute #(
                 add_param_idx <= 0;
                 add_param_phase <= 0;
                 add_vec_active <= 1'b0;
-                tile_x <= 0;
-                tile_y <= 0;
+                tile_x <= single_tile_active ? tile_x : 16'd0;
+                tile_y <= single_tile_active ? tile_y : 16'd0;
                 // Set tile dimensions for actual tile size calculation.
                 // Clip border tiles to image boundary (same as S_TILE_SETUP).
-                if (cfg_tile_h == 17'd0) begin
+                if (single_tile_active) begin
+                    out_tile_h <= single_tile_h_actual;
+                    out_tile_w <= single_tile_w_actual;
+                end else if (cfg_tile_h == 17'd0) begin
                     out_tile_h <= cfg_out_h;
                     out_tile_w <= cfg_out_w;
                 end else begin
@@ -3471,7 +3574,10 @@ module npu_compute #(
                 step = add_vec_active ? (cfg_int16 ? 32'd32 : 32'd64) : 32'd1;
                 // Use padded tile size for SRAM layout (DMA skips padding via src_row_len)
                 // Concat iterates input elements (in_c per pixel), not out_c.
-                elems_per_tile = {17'd0, cfg_tile_h} * {17'd0, cfg_tile_w}
+                elems_per_tile = {17'd0, (single_tile_active
+                                           ? single_tile_h_actual : cfg_tile_h)}
+                                 * {17'd0, (single_tile_active
+                                           ? single_tile_w_actual : cfg_tile_w)}
                                  * {17'd0, (is_concat ? cfg_in_c : cfg_out_c)};
                 if (cfg_tile_h == 17'd0 || elems_per_tile == 0) begin
                     // Non-tiled: original logic
@@ -3503,7 +3609,9 @@ module npu_compute #(
                     end
                 end else if ({17'd0, add_tile_elem_cnt} + step >= elems_per_tile) begin
                     // Current tile done — use tile-local counter for boundary check
-                    if (tile_x + 1 >= cfg_tile_num_w) begin
+                    if (single_tile_active) begin
+                        state <= S_DONE;
+                    end else if (tile_x + 1 >= cfg_tile_num_w) begin
                         if (tile_y + 1 >= cfg_tile_num_h) begin
                             state <= S_DONE;  // Final tile
                         end else begin
@@ -4007,7 +4115,10 @@ module npu_compute #(
                     bytes = 1024'd0;
                     for (c = 0; c < ROW_N; c = c + 1) begin
                         if (c < nlane) begin
-                            if (ppu_vout_w[c])
+                            if (halo_output_pad)
+                                lane = $signed(param_cache[{c[5:0], 2'b00}
+                                                          + 8'd1][15:0]);
+                            else if (ppu_vout_w[c])
                                 lane = ppu_out_w[DATA_W*c +: DATA_W];
                             else if (c == 0 && ppu_out_valid)
                                 lane = ppu_out_data;
@@ -4037,7 +4148,10 @@ module npu_compute #(
                         // them with the runtime lane count.
                         for (c = 0; c < 32; c = c + 1) begin
                             if (c < nlane) begin
-                                if (ppu_vout_w[c])
+                                if (halo_output_pad)
+                                    lane = $signed(param_cache[{c[5:0], 2'b00}
+                                                              + 8'd1][15:0]);
+                                else if (ppu_vout_w[c])
                                     lane = ppu_out_w[DATA_W*c +: DATA_W];
                                 else if (c == 0 && ppu_out_valid)
                                     lane = ppu_out_data;
@@ -4049,7 +4163,10 @@ module npu_compute #(
                     end else begin
                         for (c = 0; c < ROW_N; c = c + 1) begin
                             if (c < nlane) begin
-                                if (ppu_vout_w[c])
+                                if (halo_output_pad)
+                                    lane = $signed(param_cache[{c[5:0], 2'b00}
+                                                              + 8'd1][15:0]);
+                                else if (ppu_vout_w[c])
                                     lane = ppu_out_w[DATA_W*c +: DATA_W];
                                 else if (c == 0 && ppu_out_valid)
                                     lane = ppu_out_data;
@@ -4079,7 +4196,10 @@ module npu_compute #(
                     bytes = 1024'd0;
                     for (c = 0; c < ROW_N; c = c + 1) begin
                         if (c < nlane) begin
-                            if (ppu_vout_w[c])
+                            if (halo_output_pad)
+                                lane = $signed(param_cache[{c[5:0], 2'b00}
+                                                          + 8'd1][15:0]);
+                            else if (ppu_vout_w[c])
                                 lane = ppu_out_w[DATA_W*c +: DATA_W];
                             else if (c == 0 && ppu_out_valid)
                                 lane = ppu_out_data;
