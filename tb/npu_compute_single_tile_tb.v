@@ -62,6 +62,7 @@ module npu_compute_single_tile_tb;
         .cfg_op_type(op_type), .cfg_int16(1'b0), .cfg_in_c(16'd1),
         .cfg_out_h(16'd8), .cfg_out_w(16'd12), .cfg_out_c(16'd1),
         .cfg_kernel_h(8'd1), .cfg_kernel_w(8'd1),
+        .cfg_dilation_h(8'd1), .cfg_dilation_w(8'd1),
         .cfg_stride_h(8'd1), .cfg_stride_w(8'd1),
         .cfg_pad_top(8'd0), .cfg_pad_left(8'd0),
         .cfg_tile_h(16'd4), .cfg_tile_w(16'd4),

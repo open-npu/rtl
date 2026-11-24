@@ -85,6 +85,11 @@ module npu_top #(
     wire [31:0] dma_out_stride;
     wire        db_en_is_active = reg_dma_ctrl[0] && hw_busy;
 
+    wire [7:0]  eff_dilation_h = (reg_kernel_size[23:16] == 8'd0)
+                               ? 8'd1 : reg_kernel_size[23:16];
+    wire [7:0]  eff_dilation_w = (reg_kernel_size[31:24] == 8'd0)
+                               ? 8'd1 : reg_kernel_size[31:24];
+
     // --- CSR Layer Config outputs ---
     wire [31:0] reg_layer_mode, reg_in_dim_hw, reg_in_dim_c;
     wire [31:0] reg_out_dim_hw, reg_out_dim_c, reg_kernel_size;
@@ -557,6 +562,8 @@ module npu_top #(
         .cfg_stride_w          (reg_stride[15:8]),
         .cfg_kernel_h          (reg_kernel_size[7:0]),
         .cfg_kernel_w          (reg_kernel_size[15:8]),
+        .cfg_dilation_h        (eff_dilation_h),
+        .cfg_dilation_w        (eff_dilation_w),
         .cfg_pad_top           (reg_padding[7:0]),
         .cfg_pad_left          (reg_padding[15:8]),
         .cfg_pool_cfg          (reg_pool_cfg),
@@ -638,7 +645,8 @@ module npu_top #(
     // ════════════════════════════════════════════════════════════════════
 
     // Address width calculations
-    localparam ACT_ADDR_W   = $clog2(OFM_DEPTH); // OFM is the wider activation bank
+    localparam ACT_ADDR_W   = $clog2(
+        (IFM_DEPTH > OFM_DEPTH) ? IFM_DEPTH : OFM_DEPTH);
     localparam IFM_ADDR_W   = $clog2(IFM_DEPTH);
     localparam WGT_ADDR_W   = $clog2(WGT_DEPTH);
     localparam PARAM_ADDR_W = $clog2(PARAM_DEPTH);
@@ -971,6 +979,8 @@ module npu_top #(
         .cfg_out_c      (reg_out_dim_c[15:0]),
         .cfg_kernel_h   (reg_kernel_size[7:0]),
         .cfg_kernel_w   (reg_kernel_size[15:8]),
+        .cfg_dilation_h (eff_dilation_h),
+        .cfg_dilation_w (eff_dilation_w),
         .cfg_stride_h   (reg_stride[7:0]),
         .cfg_stride_w   (reg_stride[15:8]),
         .cfg_pad_top    (reg_padding[7:0]),

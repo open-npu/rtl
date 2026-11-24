@@ -77,6 +77,8 @@ module npu_compute #(
     input  wire [15:0]                  cfg_out_c,
     input  wire [7:0]                   cfg_kernel_h,
     input  wire [7:0]                   cfg_kernel_w,
+    input  wire [7:0]                   cfg_dilation_h,
+    input  wire [7:0]                   cfg_dilation_w,
     input  wire [7:0]                   cfg_stride_h,
     input  wire [7:0]                   cfg_stride_w,
     input  wire [7:0]                   cfg_pad_top,
@@ -1066,20 +1068,20 @@ module npu_compute #(
                         if (external_origin_active) begin
                             ih = (external_origin_h + $signed({1'b0, poh}))
                                * $signed({1'b0, cfg_stride_h})
-                               + $signed({16'd0, ga_fh})
+                               + $signed({16'd0, ga_fh}) * $signed({1'b0, cfg_dilation_h})
                                - $signed({16'd0, cfg_pad_top});
                             iw = (external_origin_w + $signed({1'b0, pow}))
                                * $signed({1'b0, cfg_stride_w})
-                               + $signed({16'd0, ga_fw})
+                               + $signed({16'd0, ga_fw}) * $signed({1'b0, cfg_dilation_w})
                                - $signed({16'd0, cfg_pad_left});
                         end else begin
                             ih = $signed({1'b0, tile_oh_origin + poh})
                                * $signed({1'b0, cfg_stride_h})
-                               + $signed({16'd0, ga_fh})
+                               + $signed({16'd0, ga_fh}) * $signed({1'b0, cfg_dilation_h})
                                - $signed({16'd0, cfg_pad_top});
                             iw = $signed({1'b0, tile_ow_origin + pow})
                                * $signed({1'b0, cfg_stride_w})
-                               + $signed({16'd0, ga_fw})
+                               + $signed({16'd0, ga_fw}) * $signed({1'b0, cfg_dilation_w})
                                - $signed({16'd0, cfg_pad_left});
                         end
                         is_pad = (ih < 0) || (ih >= $signed({1'b0, cfg_in_h}))
@@ -1114,7 +1116,8 @@ module npu_compute #(
                             nelt = {11'd0, step} * {9'd0, row_nch};
                             base = {2'd0, ga_p} * {2'd0, row_nch};
                             tend = ({11'd0, ga_p} + {11'd0, step} >= {11'd0, row_pv});
-                        end else if (!row_slice && !cfg_int16 && cfg_in_c == 16'd1) begin
+                        end else if (!row_slice && !cfg_int16 && cfg_in_c == 16'd1
+                                && cfg_dilation_w == 8'd1) begin
                             // C=1 INT8 horizontal taps are consecutive bytes.
                             // Gather one in-bounds or padding run per request
                             // instead of wasting a wide read on every tap.
@@ -1162,9 +1165,11 @@ module npu_compute #(
                             if (cfg_tile_h == 16'd0)
                                 elem = (ih[15:0] * cfg_in_w + iw[15:0]) * cfg_in_c;
                             else
-                                elem = (({16'd0, poh} * {8'd0, cfg_stride_h} + {16'd0, ga_fh})
+                                elem = (({16'd0, poh} * {8'd0, cfg_stride_h}
+                                         + {16'd0, ga_fh} * {8'd0, cfg_dilation_h})
                                       * tile_in_w
-                                      + {16'd0, pow} * {8'd0, cfg_stride_w} + {16'd0, ga_fw})
+                                      + {16'd0, pow} * {8'd0, cfg_stride_w}
+                                      + {16'd0, ga_fw} * {8'd0, cfg_dilation_w})
                                       * cfg_in_c;
                             if (row_dw)
                                 elem = elem + ({16'd0, oc_group} * 32'd64);
@@ -1310,7 +1315,9 @@ module npu_compute #(
                         oc_groups_total <= (cfg_out_c + ARRAY_SIZE_16 - 1) / ARRAY_SIZE_16;
 
                     k_depth <= {8'd0, cfg_kernel_h} * {8'd0, cfg_kernel_w} * cfg_in_c;
-                    kw_eff  <= cfg_kernel_w;
+                    kw_eff  <= (cfg_kernel_w == 8'd0) ? 16'd0
+                             : (({8'd0, cfg_kernel_w} - 16'd1)
+                                * {8'd0, cfg_dilation_w} + 16'd1);
 
                     single_tile_active <= cfg_single_tile_en;
                     single_tile_h_actual <= cfg_external_tile_h_actual;
@@ -1560,13 +1567,13 @@ module npu_compute #(
                         // Depthwise additionally needs stride 1, so one tap
                         // of those pixels is a single contiguous read.
                         psh = 3'd0;
-                        if (((cfg_op_type != 8'd1)
+                        if (!halo_expand_active && (((cfg_op_type != 8'd1)
                                 && (((cfg_out_c << (cfg_int16 ? 1 : 0)) & 16'd3) == 0)
                                 && ((({9'd0, nch} << (cfg_int16 ? 1 : 0)) & 16'd3) == 0))
                                 || ((cfg_op_type == 8'd1)
                                     && rem_oc == cfg_out_c
                                     && cfg_stride_w == 8'd1
-                                    && cfg_in_c == cfg_out_c)) begin
+                                    && cfg_in_c == cfg_out_c))) begin
                             for (ps = 1; ps <= ROW_PSH_MAX; ps = ps + 1)
                                 if ((({9'd0, nch} << ps) <= ROW_N)
                                         && (cfg_op_type != 8'd1
@@ -2397,9 +2404,11 @@ module npu_compute #(
                         ppu_wait_cnt <= 0;
                     end else if (!dw_kdone) begin
                         ih_s = $signed({1'b0, tile_oh_origin + dw_oh}) * $signed({1'b0, cfg_stride_h[7:0]})
-                             - $signed({1'b0, cfg_pad_top[7:0]}) + $signed({1'b0, dw_fh});
+                             - $signed({1'b0, cfg_pad_top[7:0]})
+                             + $signed({1'b0, dw_fh}) * $signed({1'b0, cfg_dilation_h});
                         iw_s = $signed({1'b0, tile_ow_origin + dw_ow}) * $signed({1'b0, cfg_stride_w[7:0]})
-                             - $signed({1'b0, cfg_pad_left[7:0]}) + $signed({1'b0, dw_fw});
+                             - $signed({1'b0, cfg_pad_left[7:0]})
+                             + $signed({1'b0, dw_fw}) * $signed({1'b0, cfg_dilation_w});
                         is_pad = (ih_s < 0) || (ih_s >= $signed({1'b0, cfg_in_h}))
                               || (iw_s < 0) || (iw_s >= $signed({1'b0, cfg_in_w}));
                         is_last = (dw_fw + 4'd1 >= cfg_kernel_w[3:0])
@@ -2438,8 +2447,10 @@ module npu_compute #(
                             end else begin
                                 begin : dw_addr_2d_blk
                                     reg [17:0] row_rel, col_rel;
-                                    row_rel = {2'd0, dw_oh} * {10'd0, cfg_stride_h} + {14'd0, dw_fh};
-                                    col_rel = {2'd0, dw_ow} * {10'd0, cfg_stride_w} + {14'd0, dw_fw};
+                                    row_rel = {2'd0, dw_oh} * {10'd0, cfg_stride_h}
+                                            + {14'd0, dw_fh} * {10'd0, cfg_dilation_h};
+                                    col_rel = {2'd0, dw_ow} * {10'd0, cfg_stride_w}
+                                            + {14'd0, dw_fw} * {10'd0, cfg_dilation_w};
                                     elem_off = (row_rel[15:0] * tile_in_w + col_rel[15:0])
                                                * cfg_in_c + dw_ch_base;
                                 end

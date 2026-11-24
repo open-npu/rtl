@@ -115,6 +115,8 @@ module npu_ctrl #(
     input  wire [7:0]   cfg_stride_w,          // stride width (for tile_in_w calc)
     input  wire [7:0]   cfg_kernel_h,          // kernel height (for tile_in_h calc)
     input  wire [7:0]   cfg_kernel_w,          // kernel width (for tile_in_w calc)
+    input  wire [7:0]   cfg_dilation_h,        // dilation height (>=1)
+    input  wire [7:0]   cfg_dilation_w,        // dilation width (>=1)
     input  wire [7:0]   cfg_pad_top,           // padding top (for 2D load offset)
     input  wire [7:0]   cfg_pad_left,          // padding left (for 2D load offset)
     input  wire [31:0]  cfg_pool_cfg,          // pool config [19:16]=sw [15:12]=sh [11:8]=w [7:4]=h
@@ -520,12 +522,16 @@ module npu_ctrl #(
     wire [3:0] pool_w = cfg_pool_cfg[11:8];
     wire [3:0] pool_sh = cfg_pool_cfg[15:12];
     wire [3:0] pool_sw = cfg_pool_cfg[19:16];
+    wire [15:0] kh_eff_ctrl = (cfg_kernel_h == 8'd0) ? 16'd0 :
+        (({8'd0, cfg_kernel_h} - 16'd1) * {8'd0, cfg_dilation_h} + 16'd1);
+    wire [15:0] kw_eff_ctrl = (cfg_kernel_w == 8'd0) ? 16'd0 :
+        (({8'd0, cfg_kernel_w} - 16'd1) * {8'd0, cfg_dilation_w} + 16'd1);
     wire [15:0] tile_in_h_calc = is_pool ?
         ({8'd0, cfg_tile_h} * {8'd0, pool_sh} + {8'd0, pool_h} - {8'd0, pool_sh}) :
-        ({8'd0, cfg_tile_h} - 16'd1) * {8'd0, cfg_stride_h} + {8'd0, cfg_kernel_h};
+        ({8'd0, cfg_tile_h} - 16'd1) * {8'd0, cfg_stride_h} + kh_eff_ctrl;
     wire [15:0] tile_in_w_calc = is_pool ?
         ({8'd0, cfg_tile_w} * {8'd0, pool_sw} + {8'd0, pool_w} - {8'd0, pool_sw}) :
-        ({8'd0, cfg_tile_w} - 16'd1) * {8'd0, cfg_stride_w} + {8'd0, cfg_kernel_w};
+        ({8'd0, cfg_tile_w} - 16'd1) * {8'd0, cfg_stride_w} + kw_eff_ctrl;
     wire [31:0] load_row_len = ({16'd0, tile_in_w_calc} * {16'd0, cfg_in_c}
                                  * (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
     wire [31:0] load_in_stride = {16'd0, cfg_in_w} * {16'd0, cfg_in_c}
@@ -1990,49 +1996,49 @@ module npu_ctrl #(
                     end
                 end
 
-                // ─── Validated model_x INT8 stride-1 super-tile path ───
+                // ─── Generalized INT8 stride-1 Conv1x1→DW3x3→Conv1x1 super-tile path ───
                 S_SUPER_SLOT_WAIT: state <= S_SUPER_VALIDATE;
 
                 S_SUPER_VALIDATE: begin : super_validate
                     reg pattern_bad, mode_bad, capacity_bad, overlap_bad;
                     reg [31:0] wend, pend;
                     reg [31:0] expect_wgt_bytes;
-                    reg [31:0] ifm_peak_bytes, ofm_peak_bytes;
+                    reg [31:0] ifm_peak_bytes, ofm_peak_bytes, stage2_out_bytes;
                     wend = cfg_wgt_sram_base + (cfg_dma_wgt_size >> 2);
                     pend = cfg_param_sram_base + ({16'd0, cfg_param_count} << 2);
                     mode_bad = cfg_int16 || (cfg_dma_ctrl[3:0] != 4'd0)
                              || cfg_dma_store_mode[1]
                              || (cfg_dma_wgt_per_oc != 0) || !cfg_wgt_layout
-                             || (cfg_dma_add_b_addr != 0);
+                             || (cfg_dma_add_b_addr != 0)
+                             || (cfg_dilation_h != 8'd1)
+                             || (cfg_dilation_w != 8'd1);
                     pattern_bad = 1'b0;
                     expect_wgt_bytes = 0;
+                    stage2_out_bytes = 0;
                     case (super_load_slot)
                         2'd0: begin
-                            expect_wgt_bytes = {16'd0, cfg_in_c}
-                                             * {16'd0, cfg_out_c};
+                            expect_wgt_bytes = (({16'd0, cfg_in_c}
+                                               * {16'd0, cfg_out_c}) + 32'd3) & ~32'd3;
                             pattern_bad =
                             (cfg_layer_mode[3:0] != 4'd0)
-                            || cfg_in_h != cfg_in_w
+                            || cfg_in_h == 0 || cfg_in_w == 0
                             || cfg_out_h != cfg_in_h || cfg_out_w != cfg_in_w
-                            || !(((cfg_in_c == 56) && (cfg_out_c == 112))
-                              || ((cfg_in_c == 96) && (cfg_out_c == 192)))
+                            || cfg_in_c == 0 || (cfg_in_c[1:0] != 2'd0)
+                            || cfg_out_c == 0
                             || cfg_kernel_h != 1 || cfg_kernel_w != 1
                             || cfg_stride_h != 1 || cfg_stride_w != 1
                             || cfg_pad_top != 0 || cfg_pad_left != 0
                             || cfg_dma_wgt_size != expect_wgt_bytes
                             || cfg_param_count != cfg_out_c
-                            || !(((cfg_in_h == 56) && (cfg_tile_h == 28)
-                                  && (cfg_tile_w == 10) && (cfg_tile_num_h == 2)
-                                  && (cfg_tile_num_w == 6))
-                              || ((cfg_in_h == 28) && (cfg_tile_h == 28)
-                                  && (cfg_tile_w == 6) && (cfg_tile_num_h == 1)
-                                  && (cfg_tile_num_w == 5))
-                              || ((cfg_in_h == 14) && (cfg_tile_h == 14)
-                                  && (cfg_tile_w == 12) && (cfg_tile_num_h == 1)
-                                  && (cfg_tile_num_w == 2)));
+                            || cfg_tile_h == 0 || cfg_tile_w == 0
+                            || cfg_tile_num_h == 0 || cfg_tile_num_w == 0
+                            || ({16'd0, cfg_tile_num_h} * {16'd0, cfg_tile_h} < {16'd0, cfg_in_h})
+                            || (({16'd0, cfg_tile_num_h} - 32'd1) * {16'd0, cfg_tile_h} >= {16'd0, cfg_in_h})
+                            || ({16'd0, cfg_tile_num_w} * {16'd0, cfg_tile_w} < {16'd0, cfg_in_w})
+                            || (({16'd0, cfg_tile_num_w} - 32'd1) * {16'd0, cfg_tile_w} >= {16'd0, cfg_in_w});
                         end
                         2'd1: begin
-                            expect_wgt_bytes = 32'd9 * {16'd0, super_mid_c};
+                            expect_wgt_bytes = ((32'd9 * {16'd0, super_mid_c}) + 32'd3) & ~32'd3;
                             pattern_bad =
                             (cfg_layer_mode[3:0] != 4'd1)
                             || cfg_in_h != super_full_h || cfg_in_w != super_full_w
@@ -2048,18 +2054,22 @@ module npu_ctrl #(
                             || cfg_tile_num_w != super_tiles_w;
                         end
                         2'd2: begin
-                            expect_wgt_bytes = {16'd0, super_mid_c}
-                                             * {16'd0, super_in_c};
+                            expect_wgt_bytes = (({16'd0, super_mid_c}
+                                               * {16'd0, cfg_out_c}) + 32'd3) & ~32'd3;
+                            stage2_out_bytes = {16'd0, super_tile_h}
+                                             * {16'd0, super_tile_w}
+                                             * {16'd0, cfg_out_c};
                             pattern_bad =
                             (cfg_layer_mode[3:0] != 4'd0)
                             || cfg_in_h != super_full_h || cfg_in_w != super_full_w
                             || cfg_out_h != super_full_h || cfg_out_w != super_full_w
-                            || cfg_in_c != super_mid_c || cfg_out_c != super_in_c
+                            || cfg_in_c != super_mid_c
+                            || cfg_out_c == 0 || (cfg_out_c[1:0] != 2'd0)
                             || cfg_kernel_h != 1 || cfg_kernel_w != 1
                             || cfg_stride_h != 1 || cfg_stride_w != 1
                             || cfg_pad_top != 0 || cfg_pad_left != 0
                             || cfg_dma_wgt_size != expect_wgt_bytes
-                            || cfg_param_count != super_in_c
+                            || cfg_param_count != cfg_out_c
                             || cfg_tile_h != super_tile_h || cfg_tile_w != super_tile_w
                             || cfg_tile_num_h != super_tiles_h
                             || cfg_tile_num_w != super_tiles_w;
@@ -2081,6 +2091,8 @@ module npu_ctrl #(
                                    * ({16'd0, cfg_tile_w} + 32'd2)
                                    * {16'd0, (super_load_slot == 0
                                              ? cfg_out_c : super_mid_c)};
+                    if (stage2_out_bytes > ofm_peak_bytes)
+                        ofm_peak_bytes = stage2_out_bytes;
                     capacity_bad = (wend > WGT_DEPTH) || (pend > PARAM_DEPTH)
                                  || (ifm_peak_bytes > IFM_DEPTH * 4)
                                  || (ofm_peak_bytes > OFM_DEPTH * 4);
@@ -2122,6 +2134,8 @@ module npu_ctrl #(
                             super_wgt_end1 <= wend;
                             super_param_base1 <= cfg_param_sram_base;
                             super_param_end1 <= pend;
+                        end else begin
+                            super_out_c <= cfg_out_c;
                         end
                         state <= S_SUPER_LOAD_WGT;
                     end

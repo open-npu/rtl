@@ -183,6 +183,7 @@ module npu_compute_tb #(
         .cfg_int16(cfg_int16),
         .cfg_in_c(cfg_in_c), .cfg_out_h(cfg_out_h), .cfg_out_w(cfg_out_w),
         .cfg_out_c(cfg_out_c), .cfg_kernel_h(cfg_kernel_h), .cfg_kernel_w(cfg_kernel_w),
+        .cfg_dilation_h(8'd1), .cfg_dilation_w(8'd1),
         .cfg_stride_h(cfg_stride_h), .cfg_stride_w(cfg_stride_w),
         .cfg_pad_top(cfg_pad_top), .cfg_pad_left(cfg_pad_left),
         .cfg_tile_h(cfg_tile_h), .cfg_tile_w(cfg_tile_w),

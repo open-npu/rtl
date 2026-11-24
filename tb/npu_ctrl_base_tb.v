@@ -46,6 +46,7 @@ module npu_ctrl_base_tb;
         .cfg_in_w(16'd1), .cfg_in_h(16'd1), .cfg_in_c(16'd1),
         .cfg_stride_h(8'd1), .cfg_stride_w(8'd1),
         .cfg_kernel_h(8'd1), .cfg_kernel_w(8'd1),
+        .cfg_dilation_h(8'd1), .cfg_dilation_w(8'd1),
         .cfg_pad_top(8'd0), .cfg_pad_left(8'd0), .cfg_pool_cfg(32'd0),
         .cfg_tile_h(16'd0), .cfg_tile_w(16'd0),
         .cfg_tile_num_h(16'd0), .cfg_tile_num_w(16'd0),
