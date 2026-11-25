@@ -1,16 +1,17 @@
-# Open-NPU Yosys synthesis sanity flow
-# Pass A: parse and hierarchy-check the top-level RTL and exact row-core ports.
-# This is a bounded Yosys structural sanity pass, not a technology synthesis.
-#
-# npu_compute is syntax/lint checked by the RTL regression flow. It contains
-# multi-write row buffers and large procedural lane loops
-# that stock Yosys lowers into >50k mux decoders. Full compute synthesis belongs
-# in the target backend after those buffers are mapped to macros; this script is
-# intentionally a bounded source-list and top-level connectivity check.
+# Open-NPU Yosys full RTL synthesis check (no npu_compute blackbox)
+# Synthesizes all RTL control & compute datapaths including npu_compute,
+# npu_ppu_bank, npu_dw_bank, npu_dma, npu_csr, npu_ctrl, and npu_top.
+# Top-level SRAM macros (npu_sram / npu_sram_wide) remain blackboxed as
+# foundry memory macros; internal compute row buffers infer $mem_v2.
 
-read_verilog -sv -nomem2reg -DSYNTHESIS -I../include \
+read_verilog -sv -DSYNTHESIS -I../include \
     ../src/npu_sram.v \
-    ../src/npu_sram_wide.v \
+    ../src/npu_sram_wide.v
+
+blackbox npu_sram
+blackbox npu_sram_wide
+
+read_verilog -defer -sv -DSYNTHESIS -I../include \
     ../src/npu_ppu.v \
     ../src/npu_ppu_bank.v \
     ../src/npu_dw_conv.v \
@@ -18,19 +19,17 @@ read_verilog -sv -nomem2reg -DSYNTHESIS -I../include \
     ../src/npu_csr.v \
     ../src/npu_dma.v \
     ../src/npu_ctrl.v \
+    ../src/npu_compute.v \
     ../src/npu_top.v
 
-# Read the exact production interface with its procedural body preprocessed
-# away, avoiding an independently maintained stub port list.
-read_verilog -sv -nomem2reg -DSYNTHESIS -DNPU_COMPUTE_BLACKBOX \
-    -I../include \
-    ../src/npu_compute.v
-
-blackbox npu_sram
-blackbox npu_sram_wide
-blackbox npu_ppu_bank
-blackbox npu_dw_bank
-
 hierarchy -check -top npu_top
+proc
+opt_expr
+opt_clean
+memory_dff
+opt_clean
+memory_collect
+opt_clean
 check
 stat
+

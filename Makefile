@@ -47,12 +47,7 @@ sim_verilator:
 	./obj_dir/V$(TOP)
 
 # ─── Yosys Synthesis ───
-#
-# Stock Yosys expands the compute row's dynamic multi-write arrays into more
-# than 50k mux decoders during `proc`.  That is neither bounded enough for CI
-# nor representative of a backend where these arrays are SRAM/register-file
-# macros.  Keep the default gate honest and bounded: parse the production
-# interfaces, elaborate the top-level connectivity, then run check/stat.
+# Full RTL synthesis check (including real npu_compute, npu_ppu_bank, npu_dw_bank).
 
 syn:
 	mkdir -p $(SYN_DIR)
@@ -61,13 +56,9 @@ syn:
 		-s npu_synth.ys \
 		> synth.log 2>&1 \
 		|| { tail -40 synth.log; exit 1; }
-	@echo "structural sanity passed (npu_top, ARRAY_SIZE=$(ARRAY_SIZE), SPAD_KB=$(SPAD_KB), ACC_WIDTH=$(ACC_WIDTH))"
+	@echo "Yosys full RTL synthesis passed (npu_top, ARRAY_SIZE=$(ARRAY_SIZE), SPAD_KB=$(SPAD_KB), ACC_WIDTH=$(ACC_WIDTH))"
 
-# Full technology synthesis needs a backend-specific mapping for the compute
-# row memories.  Fail immediately instead of appearing to hang in `proc`.
-syn-full:
-	@echo "ERROR: full stock-Yosys synthesis is unsupported: map the compute row arrays to backend memory macros first." >&2
-	@exit 2
+syn-full: syn
 
 # Backward-compatible spelling.
 syn-area: syn-full
