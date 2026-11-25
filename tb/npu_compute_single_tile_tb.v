@@ -71,7 +71,7 @@ module npu_compute_single_tile_tb;
         .cfg_act_base(13'd0), .cfg_out_base(13'd0), .cfg_ofm_base(13'd0),
         .cfg_wgt_base(WGT_AW'(37)), .cfg_param_base(PARAM_AW'(91)),
         .cfg_pool_cfg(pool_cfg), .cfg_resize_cfg(32'd0),
-        .cfg_deconv_cfg(32'd0), .cfg_concat_cfg(32'd0), .cfg_2d_load(1'b0),
+        .cfg_concat_cfg(32'd0), .cfg_2d_load(1'b0),
         .wgt_rd_en(wgt_rd_en), .wgt_rd_addr(wgt_rd_addr),
         .wgt_rd_data({`SRAM_B_WIDTH{1'b0}}),
         .act_rd_en(), .act_rd_addr(), .act_rd_data({`SRAM_B_WIDTH{1'b0}}),
@@ -163,10 +163,10 @@ module npu_compute_single_tile_tb;
         // output channel's quantized zero-point, rather than arithmetic zero.
         @(negedge clk); rst_n = 0;
         @(negedge clk); rst_n = 1;
-        dut.param_cache[1]  = 32'h0000_0011;
-        dut.param_cache[5]  = 32'h0000_0022;
-        dut.param_cache[9]  = 32'h0000_0033;
-        dut.param_cache[13] = 32'h0000_0044;
+        dut.pc_zp[0] = 16'h0011;
+        dut.pc_zp[1] = 16'h0022;
+        dut.pc_zp[2] = 16'h0033;
+        dut.pc_zp[3] = 16'h0044;
         force dut.row_ppu = 1'b1;
         force dut.row_drain = 1'b0;
         force dut.halo_expand_active = 1'b1;

@@ -547,24 +547,61 @@ module npu_ctrl #(
     // npu_compute.v:664-667 scales the origin into input space; this must match
     // it BIT-EXACTLY or every tile but (0,0) is misaligned, so reuse the same
     // Q40 reciprocal-multiply rather than an independently-rounded division.
-    // Reciprocals mirror npu_compute.v:2590-2591. Registered so the divider
-    // stays out of the DMA address path; CSRs are written long before START.
-    reg [39:0] rsz_recip_h, rsz_recip_w;
-    // ctrl_soft_rst is a CSR bit, not an async reset source, so it must be
-    // tested in the clocked branch. Folding it into the `!rst_n` branch makes
-    // the block unsynthesizable (Yosys: "Multiple edge sensitive events").
+    // Reciprocals mirror npu_compute.v via a 40-step 17-bit restoring
+    // shift-subtract divider triggered only when cfg_out_h/cfg_out_w changes
+    // (eliminating two 40-bit combinational dividers from npu_ctrl).
+    reg [40:0] rsz_recip_h, rsz_recip_w;
+    reg [15:0] rsz_prev_oh, rsz_prev_ow;
+    reg [16:0] rsz_rem_h,   rsz_rem_w;
+    reg [39:0] rsz_q_h,     rsz_q_w;
+    reg [5:0]  rsz_div_cnt;
+    wire       rsz_cfg_chg  = (cfg_out_h != rsz_prev_oh) || (cfg_out_w != rsz_prev_ow);
+    wire       rsz_div_busy = (rsz_div_cnt != 6'd0) || rsz_cfg_chg;
+    wire [16:0] rsz_rn_h    = {rsz_rem_h[15:0], 1'b1};
+    wire [16:0] rsz_rn_w    = {rsz_rem_w[15:0], 1'b1};
+    wire        rsz_ge_h    = (rsz_rn_h >= {1'b0, rsz_prev_oh});
+    wire        rsz_ge_w    = (rsz_rn_w >= {1'b0, rsz_prev_ow});
+    wire [39:0] rsz_qn_h    = {rsz_q_h[38:0], rsz_ge_h};
+    wire [39:0] rsz_qn_w    = {rsz_q_w[38:0], rsz_ge_w};
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            rsz_recip_h <= 40'd0;
-            rsz_recip_w <= 40'd0;
+            rsz_recip_h <= 41'd0;
+            rsz_recip_w <= 41'd0;
+            rsz_prev_oh <= 16'd0;
+            rsz_prev_ow <= 16'd0;
+            rsz_rem_h   <= 17'd0;
+            rsz_rem_w   <= 17'd0;
+            rsz_q_h     <= 40'd0;
+            rsz_q_w     <= 40'd0;
+            rsz_div_cnt <= 6'd0;
         end else if (ctrl_soft_rst) begin
-            rsz_recip_h <= 40'd0;
-            rsz_recip_w <= 40'd0;
-        end else begin
-            rsz_recip_h <= (cfg_out_h != 16'd0) ?
-                           ((40'hFFFFFFFFFF / {24'd0, cfg_out_h}) + 40'd1) : 40'd0;
-            rsz_recip_w <= (cfg_out_w != 16'd0) ?
-                           ((40'hFFFFFFFFFF / {24'd0, cfg_out_w}) + 40'd1) : 40'd0;
+            rsz_recip_h <= 41'd0;
+            rsz_recip_w <= 41'd0;
+            rsz_prev_oh <= 16'd0;
+            rsz_prev_ow <= 16'd0;
+            rsz_rem_h   <= 17'd0;
+            rsz_rem_w   <= 17'd0;
+            rsz_q_h     <= 40'd0;
+            rsz_q_w     <= 40'd0;
+            rsz_div_cnt <= 6'd0;
+        end else if (rsz_cfg_chg) begin
+            rsz_prev_oh <= cfg_out_h;
+            rsz_prev_ow <= cfg_out_w;
+            rsz_rem_h   <= 17'd0;
+            rsz_rem_w   <= 17'd0;
+            rsz_q_h     <= 40'd0;
+            rsz_q_w     <= 40'd0;
+            rsz_div_cnt <= 6'd40;
+        end else if (rsz_div_cnt != 6'd0) begin
+            rsz_rem_h   <= rsz_ge_h ? (rsz_rn_h - {1'b0, rsz_prev_oh}) : rsz_rn_h;
+            rsz_rem_w   <= rsz_ge_w ? (rsz_rn_w - {1'b0, rsz_prev_ow}) : rsz_rn_w;
+            rsz_q_h     <= rsz_qn_h;
+            rsz_q_w     <= rsz_qn_w;
+            rsz_div_cnt <= rsz_div_cnt - 6'd1;
+            if (rsz_div_cnt == 6'd1) begin
+                rsz_recip_h <= (rsz_prev_oh != 16'd0) ? ({1'b0, rsz_qn_h} + 41'd1) : 41'd0;
+                rsz_recip_w <= (rsz_prev_ow != 16'd0) ? ({1'b0, rsz_qn_w} + 41'd1) : 41'd0;
+            end
         end
     end
 
@@ -576,11 +613,11 @@ module npu_ctrl #(
         input [15:0] tile_idx;
         input [15:0] tile_dim;
         input [15:0] in_dim;
-        input [39:0] recip_out;
+        input [40:0] recip_out;
         reg   [71:0] prod;
         begin
             prod = ({56'd0, tile_idx} * {56'd0, tile_dim})
-                   * {56'd0, in_dim} * {32'd0, recip_out};
+                   * {56'd0, in_dim} * {31'd0, recip_out};
             rsz_tile_org = prod[55:40];
         end
     endfunction
@@ -1001,6 +1038,8 @@ module npu_ctrl #(
                 S_LOAD_ACT: begin
                     if (ctrl_abort) begin
                         state <= S_DONE;
+                    end else if (is_resize && rsz_div_busy) begin
+                        // Wait until the 40-step Resize reciprocal finishes
                     // Use the full byte count for the empty-input test.
                     // in_words is the DMA's 16-bit transfer length; exactly
                     // 65536 words (256 KiB) wraps to zero there.  Tiled layers
@@ -1032,7 +1071,7 @@ module npu_ctrl #(
                             dma_row_len    <= dws_row_len;
                             dma_row_count  <= dws_row_count;
                             dma_out_stride <= dws_stride;
-                            `ifndef SYNTHESIS
+                            `ifdef NPU_SIM_DEBUG
                             $display("[DWS_LOAD_INIT] t=%0t slice0 rlen=%0d rcnt=%0d stride=%0d addr=0x%08x",
                                      $time, dws_row_len, dws_row_count, dws_stride, cfg_dma_in_addr);
                             `endif
@@ -1040,7 +1079,7 @@ module npu_ctrl #(
                         dma_xfer_len  <= use_2d_load ? cur_2d_xfer : load_xfer_words;
                         // 2D load when in_stride != 0 (NHWC chain mode)
                         if (use_2d_load) begin
-                            `ifndef SYNTHESIS
+                            `ifdef NPU_SIM_DEBUG
                             $display("[2D_LOAD_INIT] t=%0t use_2d=%0d in_stride=%0d rlen=%0d rcnt=%0d stride=%0d addr=0x%08x sram_pad=%0d",
                                      $time, use_2d_load, cfg_dma_in_stride, cur_2d_row_len, cur_2d_row_cnt, load_in_stride, cfg_dma_in_addr, cur_2d_sram_pad);
                             `endif
@@ -1265,7 +1304,7 @@ module npu_ctrl #(
                                     else
                                         r_tile_row_len <= tile_row_len * tile_row_count;
                                 end
-                                `ifndef SYNTHESIS
+                                `ifdef NPU_SIM_DEBUG
                                 $display("[PTS_TILEDONE] t=%0t tile_done fired, ping_pong=%0d → S_TILE_STORE", $time, ping_pong_flag);
                                 `endif
                                 state <= S_TILE_STORE;
@@ -1368,7 +1407,7 @@ module npu_ctrl #(
                                 if (prefetch_pending) begin
                                     ping_pong_flag  <= ~ping_pong_flag;
                                     prefetch_pending <= 1'b0;
-                                    `ifndef SYNTHESIS
+                                    `ifdef NPU_SIM_DEBUG
                                     $display("[PP_FLIP] t=%0t ping_pong %0d→%0d db_prefetch_done=1",
                                              $time, ping_pong_flag, ~ping_pong_flag);
                                     `endif
@@ -1525,7 +1564,7 @@ module npu_ctrl #(
                                                  (cfg_int16 ? 32'd2 : 32'd1)) >> 2;
                         else
                             dma_src_row_len <= 16'd0;  // same as row_len
-                        `ifndef SYNTHESIS
+                        `ifdef NPU_SIM_DEBUG
                         $display("[PTS_STORE] t=%0t ty=%0d tx=%0d ddr=0x%08x sram=%0d len=%0d row_len=%0d row_cnt=%0d stride=%0d bank=%0d",
                                  $time, tile_y_seq, tile_x_seq,
                                  cfg_dma_out_addr + r_tile_ddr_offset
@@ -1636,7 +1675,7 @@ module npu_ctrl #(
                                 prefetch_pending <= db_en;
                                 db_prefetch_done <= 1'b0;
                                 cur_tile_ddr_offset <= (use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr) - cfg_dma_in_addr;
-                                `ifndef SYNTHESIS
+                                `ifdef NPU_SIM_DEBUG
                                 $display("[PTS_PREFETCH] t=%0t ddr=0x%08x sram=%0d len=%0d offset=%0d 2d=%0d rcnt=%0d",
                                          $time, use_2d_load ? next_tile_in_addr_2d : next_tile_ddr_addr,
                                          next_sram_offset, next_xfer_words,
@@ -1958,7 +1997,7 @@ module npu_ctrl #(
                                             ? (is_concat_op ? ofm_half_now : ifm_half_now)
                                             : 16'd0);
                         dma_xfer_len  <= is_concat_op ? concat_b_xfer_words : tile_in_words;
-                        `ifndef SYNTHESIS
+                        `ifdef NPU_SIM_DEBUG
                         if (tile_x_seq == 0 && tile_y_seq == 0)
                             $display("[ADD_B_GO] t=%0t ext=0x%08x offset=%0d start=%0d dma_busy=%0d",
                                     $time, cfg_dma_add_b_addr + cur_tile_ddr_offset, cur_tile_ddr_offset, dma_start, dma_busy);

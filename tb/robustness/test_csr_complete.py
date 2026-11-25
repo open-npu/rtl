@@ -148,7 +148,6 @@ async def test_rw_roundtrip(dut):
         (0x05C, "PADDING"),
         (0x060, "POOL_CFG"),
         (0x064, "RESIZE_CFG"),
-        (0x068, "DECONV_CFG"),
         (0x06C, "CONCAT_CFG"),
         (0x070, "TILE_CFG"),
         (0x074, "TILE_COUNT"),
@@ -207,6 +206,7 @@ async def test_reserved_address(dut):
         0x034,  # Between LAYER_COUNT and Group 1
         0x038,
         0x03C,
+        0x068,  # Retired DECONV_CFG
         0x07C,  # After SRAM_BASE in Group 1
         0x080,
         0x0FC,  # End of Group 1 gap
@@ -279,7 +279,6 @@ async def test_write_during_busy(dut):
     # While busy, write to various registers (simulating next-layer setup)
     test_values = {
         0x064: 0xAAAA1111,  # RESIZE_CFG
-        0x068: 0xBBBB2222,  # DECONV_CFG
         0x06C: 0xCCCC3333,  # CONCAT_CFG
         0x070: 0xDDDD4444,  # TILE_CFG
         0x110: 0xEEEE5555,  # DMA_IN_STRIDE

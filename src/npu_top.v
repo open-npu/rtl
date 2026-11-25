@@ -94,7 +94,7 @@ module npu_top #(
     wire [31:0] reg_layer_mode, reg_in_dim_hw, reg_in_dim_c;
     wire [31:0] reg_out_dim_hw, reg_out_dim_c, reg_kernel_size;
     wire [31:0] reg_stride, reg_padding, reg_pool_cfg;
-    wire [31:0] reg_resize_cfg, reg_deconv_cfg, reg_concat_cfg;
+    wire [31:0] reg_resize_cfg, reg_concat_cfg;
     wire [31:0] reg_tile_cfg, reg_tile_count, reg_sram_base;
 
     // --- CSR DMA Config outputs ---
@@ -425,7 +425,6 @@ module npu_top #(
         .reg_padding    (reg_padding),
         .reg_pool_cfg   (reg_pool_cfg),
         .reg_resize_cfg (reg_resize_cfg),
-        .reg_deconv_cfg (reg_deconv_cfg),
         .reg_concat_cfg (reg_concat_cfg),
         .reg_tile_cfg   (reg_tile_cfg),
         .reg_tile_count (reg_tile_count),
@@ -998,7 +997,6 @@ module npu_top #(
         .cfg_wgt_base   (reg_wgt_sram_base[WGT_ADDR_W-1:0]),
         .cfg_pool_cfg   (reg_pool_cfg),
         .cfg_resize_cfg (reg_resize_cfg),
-        .cfg_deconv_cfg (reg_deconv_cfg),
         .cfg_concat_cfg (reg_concat_cfg),
         .cfg_param_base (compute_param_base[PARAM_ADDR_W-1:0]),
         .cfg_2d_load    (npu_2d_load),  // 2D load when in_stride set

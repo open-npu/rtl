@@ -24,7 +24,7 @@ module npu_csr #(
     parameter VERSION_PATCH = 8'd0,
     // Hardware config
     parameter HAS_INT16 = 1,
-    parameter HAS_LUT   = 1,
+    parameter HAS_LUT   = 0,
     parameter HAS_IPU   = 0
 )(
     input  wire                 clk,
@@ -96,7 +96,6 @@ module npu_csr #(
     output wire [DATA_W-1:0]   reg_padding,
     output wire [DATA_W-1:0]   reg_pool_cfg,
     output wire [DATA_W-1:0]   reg_resize_cfg,
-    output wire [DATA_W-1:0]   reg_deconv_cfg,
     output wire [DATA_W-1:0]   reg_concat_cfg,
     output wire [DATA_W-1:0]   reg_tile_cfg,
     output wire [DATA_W-1:0]   reg_tile_count,
@@ -160,7 +159,6 @@ module npu_csr #(
     reg [DATA_W-1:0] r_padding;       // 0x05C
     reg [DATA_W-1:0] r_pool_cfg;      // 0x060
     reg [DATA_W-1:0] r_resize_cfg;    // 0x064
-    reg [DATA_W-1:0] r_deconv_cfg;    // 0x068
     reg [DATA_W-1:0] r_concat_cfg;    // 0x06C
     reg [DATA_W-1:0] r_tile_cfg;      // 0x070
     reg [DATA_W-1:0] r_tile_count;    // 0x074
@@ -218,11 +216,6 @@ module npu_csr #(
     // r_dma_add_param serves as POST_ADD_PARAM_ADDR (0x194) — dual-mapped
     // r_dma_add_b_addr serves as POST_ADD_INPUT_ADDR (0x198) — dual-mapped
     reg [DATA_W-1:0] r_post_add_stride; // 0x19C
-
-    // ─── Group 4: LUT Data (256 entries packed 4-per-word for INT8) ───
-    // ASIC: infer SRAM macro; FPGA: infer BRAM
-    (* ram_style = "block" *)
-    reg [DATA_W-1:0] r_lut [0:127];   // 128 words covers both INT8(64) and INT16(128)
 
     // ─── Read-Only Hardware Config ───
     wire [DATA_W-1:0] hw_version = {8'd0, VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH};
@@ -296,7 +289,6 @@ module npu_csr #(
     assign reg_padding          = super_mux ? r_super_desc[ctrl_super_slot][7]  : r_padding;
     assign reg_pool_cfg         = super_mux ? r_super_desc[ctrl_super_slot][8]  : r_pool_cfg;
     assign reg_resize_cfg       = super_mux ? r_super_desc[ctrl_super_slot][9]  : r_resize_cfg;
-    assign reg_deconv_cfg       = super_mux ? r_super_desc[ctrl_super_slot][10] : r_deconv_cfg;
     assign reg_concat_cfg       = super_mux ? r_super_desc[ctrl_super_slot][11] : r_concat_cfg;
     assign reg_tile_cfg         = super_mux ? r_super_desc[ctrl_super_slot][12] : r_tile_cfg;
     assign reg_tile_count       = super_mux ? r_super_desc[ctrl_super_slot][13] : r_tile_count;
@@ -338,8 +330,6 @@ module npu_csr #(
     wire [DATA_W-1:0] status_reg = {16'd0, hw_curr_layer, 4'd0,
                                      hw_done, hw_error, hw_dma_busy, hw_busy};
 
-    // ─── LUT initialization ───
-    integer lut_i;
     integer super_i;
     integer super_j;
 
@@ -362,7 +352,6 @@ module npu_csr #(
             r_padding    <= 32'd0;
             r_pool_cfg   <= 32'd0;
             r_resize_cfg <= 32'd0;
-            r_deconv_cfg <= 32'd0;
             r_concat_cfg <= 32'd0;
             r_tile_cfg   <= 32'd0;
             r_tile_count <= 32'd0;
@@ -397,8 +386,6 @@ module npu_csr #(
             r_post_clamp    <= 32'd0;
             r_post_act_cfg  <= 32'd0;
             r_post_add_stride <= 32'd0;
-            for (lut_i = 0; lut_i < 128; lut_i = lut_i + 1)
-                r_lut[lut_i] <= 32'd0;
             for (super_i = 0; super_i < 3; super_i = super_i + 1)
                 for (super_j = 0; super_j < 44; super_j = super_j + 1)
                     r_super_desc[super_i][super_j] <= 32'd0;
@@ -439,7 +426,7 @@ module npu_csr #(
                         12'h044: r_in_dim_hw  <= wb_dat_i;
                         12'h048: begin
                             r_in_dim_c   <= wb_dat_i;
-                            `ifndef SYNTHESIS
+                            `ifdef NPU_SIM_DEBUG
                             $display("[CSR_IN_C] write 0x%08x", wb_dat_i);
                             `endif
                         end
@@ -450,7 +437,6 @@ module npu_csr #(
                         12'h05C: r_padding    <= wb_dat_i;
                         12'h060: r_pool_cfg   <= wb_dat_i;
                         12'h064: r_resize_cfg <= wb_dat_i;
-                        12'h068: r_deconv_cfg <= wb_dat_i;
                         12'h06C: r_concat_cfg <= wb_dat_i;
                         12'h070: r_tile_cfg   <= wb_dat_i;
                         12'h074: r_tile_count <= wb_dat_i;
@@ -463,7 +449,7 @@ module npu_csr #(
                         12'h10C: r_dma_param_addr<= wb_dat_i; // dual-map w/ 0x184
                         12'h110: begin
                             r_dma_in_stride <= wb_dat_i;
-                            `ifndef SYNTHESIS
+                            `ifdef NPU_SIM_DEBUG
                             $display("[CSR_IN_STRIDE] write 0x%08x", wb_dat_i);
                             `endif
                         end
@@ -504,10 +490,6 @@ module npu_csr #(
                                 && addr[7:2] < 6'd44)
                                 r_super_desc[r_super_ctrl[9:8]][addr[7:2]]
                                     <= wb_dat_i;
-
-                        // Group 4: LUT Data (0x200-0x3FF)
-                        12'b0010_????_????: r_lut[addr[8:2]] <= wb_dat_i;
-                        12'b0011_????_????: r_lut[addr[8:2]] <= wb_dat_i;
 
                         default: ; // ignore writes to RO/reserved
                     endcase
@@ -562,7 +544,6 @@ module npu_csr #(
                         12'h05C: wb_dat_o <= r_padding;
                         12'h060: wb_dat_o <= r_pool_cfg;
                         12'h064: wb_dat_o <= r_resize_cfg;
-                        12'h068: wb_dat_o <= r_deconv_cfg;
                         12'h06C: wb_dat_o <= r_concat_cfg;
                         12'h070: wb_dat_o <= r_tile_cfg;
                         12'h074: wb_dat_o <= r_tile_count;
@@ -617,10 +598,6 @@ module npu_csr #(
                                                        [addr[7:2]];
                             else
                                 wb_dat_o <= 32'd0;
-
-                        // Group 4: LUT Data (0x200-0x3FF)
-                        12'b0010_????_????: wb_dat_o <= r_lut[addr[8:2]];
-                        12'b0011_????_????: wb_dat_o <= r_lut[addr[8:2]];
 
                         default: wb_dat_o <= 32'd0;
                     endcase

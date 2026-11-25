@@ -194,7 +194,7 @@ module npu_compute_tb #(
         .cfg_wgt_base({WGT_ADDR_W{1'b0}}),
         .cfg_param_base({PARAM_ADDR_W{1'b0}}),
         .cfg_pool_cfg(32'd0), .cfg_resize_cfg(32'd0),
-        .cfg_deconv_cfg(32'd0), .cfg_concat_cfg(32'd0),
+        .cfg_concat_cfg(32'd0),
         .cfg_2d_load(1'b0),
         // SRAM
         .wgt_rd_en(wgt_rd_en), .wgt_rd_addr(wgt_rd_addr), .wgt_rd_data(wgt_rd_data),

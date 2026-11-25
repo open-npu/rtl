@@ -97,7 +97,6 @@ module npu_compute #(
     input  wire [PARAM_ADDR_W-1:0]      cfg_param_base, // selected parameter ping/pong bank
     input  wire [31:0]                  cfg_pool_cfg,   // Pooling config register
     input  wire [31:0]                  cfg_resize_cfg, // Resize config register
-    input  wire [31:0]                  cfg_deconv_cfg, // Deconv config: [7:0]=INSERT_H, [15:8]=INSERT_W
     input  wire [31:0]                  cfg_concat_cfg, // Concat config: [15:0]=OFFSET, [31:16]=TOTAL_C
     input  wire                         cfg_2d_load,    // 2D DMA load mode (chain: SRAM row 0 = input row 0, not padding)
 
@@ -243,6 +242,7 @@ module npu_compute #(
         S_RESIZE_READ1    = 7'd53,
         S_RESIZE_READ2    = 7'd54,
         S_RESIZE_READ3    = 7'd55,
+        S_RESIZE_RECIP    = 7'd56, // 40-cycle restoring reciprocal precompute
         S_RESIZE_PPU      = 7'd57,
         S_RESIZE_PPU_WAIT = 7'd58,
         S_RESIZE_WB       = 7'd59,
@@ -543,10 +543,19 @@ module npu_compute #(
         ((row_one_oc_bytes << 2) <= `WEIGHT_BUF_SIZE) ? 7'd4  :
         ((row_one_oc_bytes << 1) <= `WEIGHT_BUF_SIZE) ? 7'd2  :
         ( row_one_oc_bytes       <= `WEIGHT_BUF_SIZE) ? 7'd1  : 7'd0;
+    wire [2:0]  row_dense_sh =
+        ((row_one_oc_bytes << 6) <= `WEIGHT_BUF_SIZE) ? 3'd6 :
+        ((row_one_oc_bytes << 5) <= `WEIGHT_BUF_SIZE) ? 3'd5 :
+        ((row_one_oc_bytes << 4) <= `WEIGHT_BUF_SIZE) ? 3'd4 :
+        ((row_one_oc_bytes << 3) <= `WEIGHT_BUF_SIZE) ? 3'd3 :
+        ((row_one_oc_bytes << 2) <= `WEIGHT_BUF_SIZE) ? 3'd2 :
+        ((row_one_oc_bytes << 1) <= `WEIGHT_BUF_SIZE) ? 3'd1 : 3'd0;
     wire        row_kslice = cfg_wgt_per_oc[31] && cfg_wgt_layout
                            && (cfg_op_type == 8'd0 || cfg_op_type == 8'd2);
     wire [6:0]  row_group_ch = (cfg_op_type == 8'd1 || row_kslice)
                               ? ROW_N[6:0] : row_dense_grp;
+    wire [2:0]  row_group_sh = (cfg_op_type == 8'd1 || row_kslice)
+                              ? 3'd6 : row_dense_sh;
     wire [15:0] row_ks_cap = cfg_int16
                            ? (`WGT_DEPTH_W / 32)
                            : (`WGT_DEPTH_W / 16);
@@ -651,7 +660,11 @@ module npu_compute #(
     reg [ACT_ADDR_W-1:0]   rsz_wb_addr;
     reg [1:0]              rsz_wb_bytesel;
     reg [15:0]             rsz_wb_byte;
-    // Combined resize reciprocals, precomputed once per layer.
+    // Combined resize reciprocals, precomputed once per layer via 40-step restoring shift-subtract.
+    reg [40:0]             rsz_rcp_h, rsz_rcp_w, rsz_rcp_hm1, rsz_rcp_wm1;
+    reg [16:0]             rsz_rem_h, rsz_rem_w, rsz_rem_hm1, rsz_rem_wm1;
+    reg [39:0]             rsz_q_h,   rsz_q_w,   rsz_q_hm1,   rsz_q_wm1;
+    reg [5:0]              rsz_div_cnt;
     reg signed [55:0]      recip_scale_h;      // cfg_in_h * Q40(1/out_h)
     reg signed [55:0]      recip_scale_w;      // cfg_in_w * Q40(1/out_w)
     reg signed [55:0]      recip_scale_h_m1;   // ((cfg_in_h-1)<<8) * Q40(1/(out_h-1))
@@ -1046,6 +1059,8 @@ module npu_compute #(
             wst_ic <= 7'd0;
             wst_kend <= 16'd0;
             wst_f_kend <= 2'd0;
+            row_ki <= 16'd0;
+            row_kc0 <= 16'd0;
             ga_pad_r <= 1'b0;
             ga_next_fh0 <= 16'd0;
             ga_next_fw0 <= 16'd0;
@@ -1107,6 +1122,10 @@ module npu_compute #(
             rsz_ih0 <= 0; rsz_iw0 <= 0; rsz_ih1 <= 0; rsz_iw1 <= 0;
             rsz_rd_phase <= 0; rsz_wb_phase <= 0;
             rsz_wb_addr <= 0; rsz_wb_bytesel <= 0; rsz_wb_byte <= 0;
+            rsz_rcp_h <= 41'd0; rsz_rcp_w <= 41'd0; rsz_rcp_hm1 <= 41'd0; rsz_rcp_wm1 <= 41'd0;
+            rsz_rem_h <= 17'd0; rsz_rem_w <= 17'd0; rsz_rem_hm1 <= 17'd0; rsz_rem_wm1 <= 17'd0;
+            rsz_q_h   <= 40'd0; rsz_q_w   <= 40'd0; rsz_q_hm1   <= 40'd0; rsz_q_wm1   <= 40'd0;
+            rsz_div_cnt <= 6'd0;
         end else begin
             // ─── Default pulse deassertion ───
             done         <= 1'b0;
@@ -1339,14 +1358,12 @@ module npu_compute #(
             S_IDLE: begin
                 if (start) begin
                     if (use_row)
-                        oc_groups_total <= (cfg_out_c + {9'd0, row_group_ch} - 1)
-                                         / {9'd0, row_group_ch};
-                    else if (cfg_op_type == 8'd1)
-                        oc_groups_total <= (cfg_out_c + ARRAY_SIZE_16 - 1) / ARRAY_SIZE_16;
+                        oc_groups_total <= (cfg_out_c + {9'd0, row_group_ch} - 16'd1)
+                                         >> row_group_sh;
                     else if (cfg_op_type == 8'd3 || cfg_op_type == 8'd5)
                         oc_groups_total <= cfg_out_c;
                     else
-                        oc_groups_total <= (cfg_out_c + ARRAY_SIZE_16 - 1) / ARRAY_SIZE_16;
+                        oc_groups_total <= (cfg_out_c + ARRAY_SIZE_16 - 16'd1) >> COL_W;
 
                     k_depth <= {8'd0, cfg_kernel_h} * {8'd0, cfg_kernel_w} * cfg_in_c;
                     kw_eff  <= (cfg_kernel_w == 8'd0) ? 16'd0
@@ -1379,7 +1396,22 @@ module npu_compute #(
                     // A layer with no output channels has nothing to compute;
                     // the OC loop would otherwise still run one group and
                     // stall waiting for a drain that never arrives.
-                    state  <= (cfg_out_c == 16'd0) ? S_DONE : S_TILE_SETUP;
+                    if (cfg_out_c == 16'd0) begin
+                        state <= S_DONE;
+                    end else if (cfg_op_type == 8'd5) begin
+                        rsz_rem_h   <= 17'd0;
+                        rsz_rem_w   <= 17'd0;
+                        rsz_rem_hm1 <= 17'd0;
+                        rsz_rem_wm1 <= 17'd0;
+                        rsz_q_h     <= 40'd0;
+                        rsz_q_w     <= 40'd0;
+                        rsz_q_hm1   <= 40'd0;
+                        rsz_q_wm1   <= 40'd0;
+                        rsz_div_cnt <= 6'd0;
+                        state       <= S_RESIZE_RECIP;
+                    end else begin
+                        state <= S_TILE_SETUP;
+                    end
                 end
             end
 
@@ -1403,20 +1435,23 @@ module npu_compute #(
                     if (cfg_op_type == 8'd5) begin
                         begin : ext_rsz_tile_origin_blk
                             reg [31:0] ext_out_start_h, ext_out_start_w;
+                            reg [71:0] ext_prod_h, ext_prod_w;
                             ext_out_start_h = tile_y * cfg_tile_h;
                             ext_out_start_w = tile_x * cfg_tile_w;
                             if (resize_mode) begin
-                                rsz_tile_ih_origin <= (cfg_out_h > 1)
-                                    ? (ext_out_start_h * (cfg_in_h - 1))
-                                      / (cfg_out_h - 1) : 0;
-                                rsz_tile_iw_origin <= (cfg_out_w > 1)
-                                    ? (ext_out_start_w * (cfg_in_w - 1))
-                                      / (cfg_out_w - 1) : 0;
+                                ext_prod_h = ({40'd0, ext_out_start_h} * {56'd0, cfg_in_h - 16'd1})
+                                           * {31'd0, rsz_rcp_hm1};
+                                ext_prod_w = ({40'd0, ext_out_start_w} * {56'd0, cfg_in_w - 16'd1})
+                                           * {31'd0, rsz_rcp_wm1};
+                                rsz_tile_ih_origin <= (cfg_out_h > 16'd1) ? ext_prod_h[56:40] : 17'd0;
+                                rsz_tile_iw_origin <= (cfg_out_w > 16'd1) ? ext_prod_w[56:40] : 17'd0;
                             end else begin
-                                rsz_tile_ih_origin <= (cfg_out_h != 0)
-                                    ? (ext_out_start_h * cfg_in_h) / cfg_out_h : 0;
-                                rsz_tile_iw_origin <= (cfg_out_w != 0)
-                                    ? (ext_out_start_w * cfg_in_w) / cfg_out_w : 0;
+                                ext_prod_h = ({40'd0, ext_out_start_h} * {56'd0, cfg_in_h})
+                                           * {31'd0, rsz_rcp_h};
+                                ext_prod_w = ({40'd0, ext_out_start_w} * {56'd0, cfg_in_w})
+                                           * {31'd0, rsz_rcp_w};
+                                rsz_tile_ih_origin <= (cfg_out_h != 16'd0) ? ext_prod_h[56:40] : 17'd0;
+                                rsz_tile_iw_origin <= (cfg_out_w != 16'd0) ? ext_prod_w[56:40] : 17'd0;
                             end
                         end
                     end
@@ -1433,29 +1468,32 @@ module npu_compute #(
                     // Compute tile origin using FULL tile dims (not clipped)
                     tile_oh_origin <= tile_y * cfg_tile_h;
                     tile_ow_origin <= tile_x * cfg_tile_w;
-                    // Hoist tile-input origin for Resize (avoid 4x redundant division)
+                    // Hoist tile-input origin for Resize via precomputed Q40 reciprocals
                     if (cfg_op_type == 8'd5) begin
                         begin : rsz_tile_origin_blk
                             reg [31:0] out_start_h, out_start_w;
+                            reg [71:0] org_prod_h, org_prod_w;
                             out_start_h = tile_y * cfg_tile_h;
                             out_start_w = tile_x * cfg_tile_w;
                             if (resize_mode) begin
-                                rsz_tile_ih_origin <= (cfg_out_h > 1)
-                                    ? (out_start_h * (cfg_in_h - 1)) / (cfg_out_h - 1)
-                                    : 0;
-                                rsz_tile_iw_origin <= (cfg_out_w > 1)
-                                    ? (out_start_w * (cfg_in_w - 1)) / (cfg_out_w - 1)
-                                    : 0;
+                                org_prod_h = ({40'd0, out_start_h} * {56'd0, cfg_in_h - 16'd1})
+                                           * {31'd0, rsz_rcp_hm1};
+                                org_prod_w = ({40'd0, out_start_w} * {56'd0, cfg_in_w - 16'd1})
+                                           * {31'd0, rsz_rcp_wm1};
+                                rsz_tile_ih_origin <= (cfg_out_h > 16'd1) ? org_prod_h[56:40] : 17'd0;
+                                rsz_tile_iw_origin <= (cfg_out_w > 16'd1) ? org_prod_w[56:40] : 17'd0;
                             end else begin
-                                rsz_tile_ih_origin <= (cfg_out_h != 0)
-                                    ? (out_start_h * cfg_in_h) / cfg_out_h : 0;
-                                rsz_tile_iw_origin <= (cfg_out_w != 0)
-                                    ? (out_start_w * cfg_in_w) / cfg_out_w : 0;
+                                org_prod_h = ({40'd0, out_start_h} * {56'd0, cfg_in_h})
+                                           * {31'd0, rsz_rcp_h};
+                                org_prod_w = ({40'd0, out_start_w} * {56'd0, cfg_in_w})
+                                           * {31'd0, rsz_rcp_w};
+                                rsz_tile_ih_origin <= (cfg_out_h != 16'd0) ? org_prod_h[56:40] : 17'd0;
+                                rsz_tile_iw_origin <= (cfg_out_w != 16'd0) ? org_prod_w[56:40] : 17'd0;
                             end
                         end
                     end
                 end
-                `ifndef SYNTHESIS
+                `ifdef NPU_SIM_DEBUG
                 if (cfg_tile_h != 0)
                     $display("[CMP_TILE] t=%0t tile(%0d,%0d) act_base=%0d out_base=%0d ow_origin_reg=%0d out_tw=%0d tile_in_w=%0d",
                              $time, tile_y, tile_x, act_base, act_base + cfg_out_base,
@@ -1669,6 +1707,8 @@ module npu_compute #(
                         wst_sc     <= 7'd0;
                         wst_skip   <= 6'd0;
                         wst_iss_byte <= 32'd0;
+                        row_ki     <= 16'd0;
+                        row_kc0    <= 16'd0;
                         dwl_on     <= 1'b0;
                         dwl_tap    <= 16'd0;
                         dwl_ph     <= 2'd0;
@@ -2942,7 +2982,7 @@ module npu_compute #(
                          - $signed({1'b0, cfg_pad_left[7:0]}) + $signed({1'b0, pool_fw});
                     is_oob = (ih_s < 0) || (ih_s >= $signed({1'b0, cfg_in_h}))
                           || (iw_s < 0) || (iw_s >= $signed({1'b0, cfg_in_w}));
-                    `ifndef SYNTHESIS
+                    `ifdef NPU_SIM_DEBUG
                     if (pool_ch == 9 && pool_oh == 0 && pool_ow == 2 && tile_y == 0 && tile_x == 5)
                         $display("[POOL_DBG] t=%0t ch=%0d oh=%0d ow=%0d fh=%0d fw=%0d ih=%0d iw=%0d oob=%0d tile_in_w=%0d",
                                  $time, pool_ch, pool_oh, pool_ow, pool_fh, pool_fw,
@@ -3167,7 +3207,7 @@ module npu_compute #(
             S_POOL_CH_NEXT: begin
                 if (pool_ch + 1 >= cfg_out_c) begin
                     state <= S_TILE_NEXT;
-                end else if (pool_stream && ((pool_ch + 1) % ARRAY_SIZE == 0)) begin
+                end else if (pool_stream && (pool_ch[COL_W-1:0] == {COL_W{1'b1}})) begin
                     // Stream group boundary: request next act slice reload
                     pool_ch <= pool_ch + 1;
                     pool_grp_base <= pool_grp_base + ARRAY_SIZE;
@@ -3444,9 +3484,6 @@ module npu_compute #(
             S_ADD_PPU_WAIT: begin
                 if (ppu_out_valid) begin
                     // Compute writeback address
-                    if (add_elem_cnt >= 16'd18816 && add_elem_cnt <= 16'd18820)
-                        $display("[PPU_OUT_DBG] elem=%0d ppu_out_data=0x%04x ppu_acc_in=%0d",
-                                 add_elem_cnt, ppu_out_data, ppu_acc_in);
                     begin : add_wb_addr_calc
                         reg [31:0] byte_off;
                         if (is_concat) begin
@@ -3505,15 +3542,12 @@ module npu_compute #(
                         act_wr_en   <= 1'b1;
                         act_wr_addr <= add_wb_addr;
                         act_wr_data <= merged;
-                        `ifndef SYNTHESIS
+                        `ifdef NPU_SIM_DEBUG
                         if (tile_x == 0 && tile_y == 0 && add_tile_elem_cnt >= 384 && add_tile_elem_cnt <= 390)
                             $display("[ADD_WB] t=%0t elem=%0d tile_elem=%0d wb_addr=%0d rd=0x%08x merged=0x%08x byte=0x%04x bytesel=%0d",
                                      $time, add_elem_cnt, add_tile_elem_cnt, add_wb_addr,
                                      act_rd_data, merged, add_wb_byte, add_wb_bytesel);
                         `endif
-                        if (add_elem_cnt >= 16'd18816 && add_elem_cnt <= 16'd18820)
-                            $display("[WB_DBG] elem=%0d tile(%0d,%0d) wb_addr=%0d cfg_act_base=%0d tile_elem=%0d merged=0x%08x wb_byte=0x%04x",
-                                     add_elem_cnt, tile_y, tile_x, add_wb_addr, act_base, add_tile_elem_cnt, merged, add_wb_byte);
                     end
                     state <= S_ADD_NEXT;
                 end
@@ -3615,8 +3649,58 @@ module npu_compute #(
 
             // ══════════════════════════════════════════════════════════════
             // Resize Path (op_type=5)
-            // Flow: SETUP → CH_SETUP → COORD → READ0[/1/2/3] → INTERP → PPU → WB → PIX_NEXT → CH_NEXT
+            // Flow: RECIP (once/layer) → TILE_SETUP → SETUP → CH_SETUP → COORD → READ0[/1/2/3] → INTERP → PPU → WB
             // ══════════════════════════════════════════════════════════════
+            S_RESIZE_RECIP: begin : resize_recip_step_blk
+                reg [16:0] rn_h, rn_w, rn_hm1, rn_wm1;
+                reg [15:0] d_hm1, d_wm1;
+                reg        ge_h, ge_w, ge_hm1, ge_wm1;
+                reg [39:0] qn_h, qn_w, qn_hm1, qn_wm1;
+                reg [40:0] rcp_h_fin, rcp_w_fin, rcp_hm1_fin, rcp_wm1_fin;
+                reg [24:0] in_h_m1_sh, in_w_m1_sh;
+                d_hm1  = cfg_out_h - 16'd1;
+                d_wm1  = cfg_out_w - 16'd1;
+                rn_h   = {rsz_rem_h[15:0],   1'b1};
+                rn_w   = {rsz_rem_w[15:0],   1'b1};
+                rn_hm1 = {rsz_rem_hm1[15:0], 1'b1};
+                rn_wm1 = {rsz_rem_wm1[15:0], 1'b1};
+                ge_h   = (rn_h   >= {1'b0, cfg_out_h});
+                ge_w   = (rn_w   >= {1'b0, cfg_out_w});
+                ge_hm1 = (rn_hm1 >= {1'b0, d_hm1});
+                ge_wm1 = (rn_wm1 >= {1'b0, d_wm1});
+                qn_h   = {rsz_q_h[38:0],   ge_h};
+                qn_w   = {rsz_q_w[38:0],   ge_w};
+                qn_hm1 = {rsz_q_hm1[38:0], ge_hm1};
+                qn_wm1 = {rsz_q_wm1[38:0], ge_wm1};
+                rsz_rem_h   <= ge_h   ? (rn_h   - {1'b0, cfg_out_h}) : rn_h;
+                rsz_rem_w   <= ge_w   ? (rn_w   - {1'b0, cfg_out_w}) : rn_w;
+                rsz_rem_hm1 <= ge_hm1 ? (rn_hm1 - {1'b0, d_hm1})     : rn_hm1;
+                rsz_rem_wm1 <= ge_wm1 ? (rn_wm1 - {1'b0, d_wm1})     : rn_wm1;
+                rsz_q_h     <= qn_h;
+                rsz_q_w     <= qn_w;
+                rsz_q_hm1   <= qn_hm1;
+                rsz_q_wm1   <= qn_wm1;
+                if (rsz_div_cnt == 6'd39) begin
+                    rcp_h_fin   = (cfg_out_h != 16'd0) ? ({1'b0, qn_h}   + 41'd1) : 41'd0;
+                    rcp_w_fin   = (cfg_out_w != 16'd0) ? ({1'b0, qn_w}   + 41'd1) : 41'd0;
+                    rcp_hm1_fin = (cfg_out_h >  16'd1) ? ({1'b0, qn_hm1} + 41'd1) : 41'd0;
+                    rcp_wm1_fin = (cfg_out_w >  16'd1) ? ({1'b0, qn_wm1} + 41'd1) : 41'd0;
+                    rsz_rcp_h   <= rcp_h_fin;
+                    rsz_rcp_w   <= rcp_w_fin;
+                    rsz_rcp_hm1 <= rcp_hm1_fin;
+                    rsz_rcp_wm1 <= rcp_wm1_fin;
+                    recip_scale_h <= {40'd0, cfg_in_h} * {15'd0, rcp_h_fin};
+                    recip_scale_w <= {40'd0, cfg_in_w} * {15'd0, rcp_w_fin};
+                    in_h_m1_sh = ({9'd0, cfg_in_h} - 25'd1) << 8;
+                    in_w_m1_sh = ({9'd0, cfg_in_w} - 25'd1) << 8;
+                    recip_scale_h_m1 <= {31'd0, in_h_m1_sh} * {15'd0, rcp_hm1_fin};
+                    recip_scale_w_m1 <= {31'd0, in_w_m1_sh} * {15'd0, rcp_wm1_fin};
+                    state <= S_TILE_SETUP;
+                end else begin
+                    rsz_div_cnt <= rsz_div_cnt + 6'd1;
+                end
+            end
+
             S_RESIZE_SETUP: begin
                 rsz_ch <= 0;
                 rsz_oh <= 0;
@@ -3624,20 +3708,6 @@ module npu_compute #(
                 param_word_idx <= 0;
                 param_read_issued <= 1'b0;
                 rsz_rd_phase <= 0;
-                // Precompute reciprocals (division here is once per layer, not critical path)
-                // Precompute combined reciprocals (single multiply per pixel).
-                recip_scale_h <= {16'd0, cfg_in_h} * ((cfg_out_h > 0) ? (40'hFFFFFFFFFF / cfg_out_h) + 1 : 0);
-                recip_scale_w <= {16'd0, cfg_in_w} * ((cfg_out_w > 0) ? (40'hFFFFFFFFFF / cfg_out_w) + 1 : 0);
-                // Avoid unsized concat: use explicit sizing
-                begin : resize_recip_m1_blk
-                    reg [24:0] in_h_m1_shifted, in_w_m1_shifted;
-                    in_h_m1_shifted = {9'd0, cfg_in_h[15:0]} - 17'd1;
-                    in_h_m1_shifted = in_h_m1_shifted << 8;
-                    in_w_m1_shifted = {9'd0, cfg_in_w[15:0]} - 17'd1;
-                    in_w_m1_shifted = in_w_m1_shifted << 8;
-                    recip_scale_h_m1 <= {16'd0, in_h_m1_shifted} * ((cfg_out_h > 17'd1) ? (40'hFFFFFFFFFF / (cfg_out_h - 17'd1)) + 1 : 0);
-                    recip_scale_w_m1 <= {16'd0, in_w_m1_shifted} * ((cfg_out_w > 17'd1) ? (40'hFFFFFFFFFF / (cfg_out_w - 17'd1)) + 1 : 0);
-                end
                 state <= S_RESIZE_CH_SETUP;
             end
 

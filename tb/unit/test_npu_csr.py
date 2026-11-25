@@ -66,9 +66,9 @@ async def test_hw_config_register(dut):
     # HAS_INT16=1 → bit 24
     has_int16 = (val >> 24) & 1
     assert has_int16 == 1, f"HAS_INT16: got {has_int16}, expected 1"
-    # HAS_LUT=1 → bit 25
+    # HAS_LUT=0 → bit 25 (retired dead LUT RAM)
     has_lut = (val >> 25) & 1
-    assert has_lut == 1, f"HAS_LUT: got {has_lut}, expected 1"
+    assert has_lut == 0, f"HAS_LUT: got {has_lut}, expected 0"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,26 +215,12 @@ async def test_dual_map_param_addr(dut):
 # ─────────────────────────────────────────────────────────────────────────────
 @cocotb.test()
 async def test_lut_readwrite(dut):
-    """Write and readback LUT entries at various offsets."""
+    """Retired LUT range (0x200-0x3FF) acknowledges writes and reads back zero."""
     wb = await init_dut(dut)
-    # Write first LUT word (0x200)
-    await wb.write(0x200, 0x04030201)
-    val = await wb.read(0x200)
-    assert val == 0x04030201, f"LUT[0]: got {val:#010x}"
-
-    # Write last INT8 LUT word (0x2FC = entry 63)
-    await wb.write(0x2FC, 0xAABBCCDD)
-    val = await wb.read(0x2FC)
-    assert val == 0xAABBCCDD, f"LUT[63]: got {val:#010x}"
-
-    # Write INT16 range (0x300+)
-    await wb.write(0x300, 0x11223344)
-    val = await wb.read(0x300)
-    assert val == 0x11223344, f"LUT[64]: got {val:#010x}"
-
-    # Verify first write still intact
-    val = await wb.read(0x200)
-    assert val == 0x04030201, f"LUT[0] corrupted: got {val:#010x}"
+    for addr, data in ((0x200, 0x04030201), (0x2FC, 0xAABBCCDD), (0x300, 0x11223344)):
+        await wb.write(addr, data)
+        val = await wb.read(addr)
+        assert val == 0, f"Retired LUT[{addr:#05x}]: expected 0, got {val:#010x}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
