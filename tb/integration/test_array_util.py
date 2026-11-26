@@ -26,7 +26,7 @@ META = os.environ.get(
     "UTIL_META",
     os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        "..", "golden", "golden_dma_e2e", "model_e_int8", "metadata.json",
+        "..", "golden", "golden_dma_e2e", "model_s_int8", "metadata.json",
     ),
 )
 

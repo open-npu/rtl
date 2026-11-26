@@ -249,7 +249,8 @@ module npu_ctrl #(
         ((dense_k_bytes << 2) <= wgt_capacity_bytes) ? 7'd4  :
         ((dense_k_bytes << 1) <= wgt_capacity_bytes) ? 7'd2  :
         ( dense_k_bytes       <= wgt_capacity_bytes) ? 7'd1  : 7'd0;
-    wire [6:0] row_ctrl_group = wgt_k_slice ? 7'd64 : row_dense_grp;
+    wire [6:0] row_ctrl_group = ((cfg_layer_mode[3:0] == 4'd1) || wgt_k_slice)
+                              ? 7'd64 : row_dense_grp;
     wire [31:0] row_group_bytes = {25'd0, row_ctrl_group}
                                  * (cfg_int16 ? 32'd2 : 32'd1);
     wire [31:0] output_pixel_bytes = {16'd0, cfg_out_c}
@@ -328,11 +329,15 @@ module npu_ctrl #(
                                    : wgt_words);
     // Dense row groups are 64/32/16/8/... channels depending on what fits
     // WGT SRAM. The old fixed 16-channel block remains for non-row paths.
+    wire [31:0] dw_k_elems = {24'd0, cfg_kernel_h} * {24'd0, cfg_kernel_w};
     wire        row_param_grp = cfg_wgt_layout && !dw_stream
-                             && (cfg_layer_mode[3:0] == 4'd0
-                                 || cfg_layer_mode[3:0] == 4'd2);
+                             && ((cfg_layer_mode[3:0] == 4'd0)
+                                 || (cfg_layer_mode[3:0] == 4'd2)
+                                 || ((cfg_layer_mode[3:0] == 4'd1)
+                                     && (dw_k_elems != 32'd0)));
     wire [15:0] param_grp_words = row_param_grp
-                                ? ({9'd0, row_ctrl_group} << 2) : 16'd64;
+                                ? ({9'd0, row_ctrl_group} << 2)
+                                : (`ARRAY_SIZE * 4);
     wire [31:0] param_grp_bytes = {16'd0, param_grp_words} << 2;
     wire [31:0] initial_param_words = param_needs_reload ? {16'd0, param_grp_words}
                                                          : {16'd0, param_words};
@@ -923,11 +928,6 @@ module npu_ctrl #(
                                 compute_single_tile_en <= 1'b0;
                                 state <= S_SUPER_SLOT_WAIT;
                             end
-                        // E1: slice-stream layers need all PPU params resident
-                        //     (no per-oc param reload on this path)
-                        end else if (slice_stream && ({17'd0, cfg_out_c} * 4 > PARAM_DEPTH)) begin
-                            hw_error_code <= 4'd1;
-                            state <= S_ERROR;
                         // E3: channel slice must fit below the stream output
                         //     region (DW_STREAM_OUT_BASE)
                         end else if (slice_stream && (dws_act_words32 > ifm_cap)) begin
@@ -1761,7 +1761,8 @@ module npu_ctrl #(
                         dma_sram_sel  <= 2'd2;  // param bank
                         dma_ext_addr  <= cfg_dma_param_addr
                             + (row_param_grp ? {16'd0, oc_group_idx} * param_grp_bytes
-                               : {16'd0, oc_group_idx} * 32'd256);
+                               : pool_stream ? {16'd0, oc_group_idx} * 32'd16
+                               : {16'd0, oc_group_idx} * (`ARRAY_SIZE * 32'd16));
                         dma_sram_addr <= compute_param_base;
                         dma_xfer_len  <= param_grp_words;
                         dma_row_len   <= 16'd0;
@@ -1902,8 +1903,12 @@ module npu_ctrl #(
                     if (ctrl_abort) begin
                         state <= S_DONE;
                     end else if (dma_done) begin
-                        wgt_reload_done <= 1'b1;  // slice + block resident
-                        state <= S_DWS_RELOAD_ACK;
+                        if (param_needs_reload)
+                            state <= S_RELOAD_PARAM;
+                        else begin
+                            wgt_reload_done <= 1'b1;  // slice + block resident
+                            state <= S_DWS_RELOAD_ACK;
+                        end
                     end
                 end
 

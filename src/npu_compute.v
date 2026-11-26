@@ -1550,7 +1550,11 @@ module npu_compute #(
                     // the previous tile's final group and group 0 must be
                     // restored. Group-major keeps one group resident across
                     // tiles; group 0 was loaded before compute_start.
-                    if (cfg_wgt_per_oc != 0 && !group_major_active) begin
+                    if (!group_major_active
+                        && ((cfg_wgt_per_oc != 0)
+                            || (use_row
+                                && (({17'd0, cfg_out_c} * 16'd4) > `PARAM_DEPTH_W)
+                                && (tile_y != 16'd0 || tile_x != 16'd0)))) begin
                         oc_group_done <= 1'b1;  // Request reload of oc_group 0
                         state <= S_WAIT_WGT_RELOAD;
                     end else begin
@@ -2111,8 +2115,13 @@ module npu_compute #(
                         dw_grp_base <= (oc_group + 1) * ARRAY_SIZE_16;
                         oc_group_done <= 1'b1;
                         state <= S_WAIT_WGT_RELOAD;
-                    end else if (cfg_op_type == 8'd1) begin
-                        state <= S_OC_SETUP;
+                    end else if (cfg_op_type == 8'd1 && !use_row) begin
+                        if (({17'd0, cfg_out_c} * 16'd4) > `PARAM_DEPTH_W) begin
+                            oc_group_done <= 1'b1;
+                            state <= S_WAIT_WGT_RELOAD;
+                        end else begin
+                            state <= S_OC_SETUP;
+                        end
                     end else if (cfg_op_type == 8'd5) begin
                         rsz_ch <= rsz_ch + 1;
                         param_word_idx <= 0;
@@ -2345,7 +2354,9 @@ module npu_compute #(
                 if (!param_read_issued) begin
                     param_rd_en   <= 1'b1;
                     param_rd_addr <= cfg_param_base
-                                   + (dw_ch_base << 2) + cache_issue[8:0];
+                                   + ((({17'd0, cfg_out_c} * 16'd4) > `PARAM_DEPTH_W)
+                                      ? 16'd0 : (dw_ch_base << 2))
+                                   + cache_issue[8:0];
                     param_read_issued <= 1'b1;
                     act_read_issued <= 1'b0;
                 end else if (!act_read_issued) begin
@@ -2929,7 +2940,10 @@ module npu_compute #(
                 if (!param_read_issued) begin
                     param_rd_en   <= 1'b1;
                     param_rd_addr <= cfg_param_base
-                                   + (pool_ch * 4) + param_word_idx;
+                                   + (((pool_stream
+                                        && (({17'd0, cfg_out_c} * 16'd4) > `PARAM_DEPTH_W))
+                                       ? (pool_ch - pool_grp_base) : pool_ch) * 4)
+                                   + param_word_idx;
                     param_read_issued <= 1'b1;
                     act_read_issued <= 1'b0;
                 end else if (!act_read_issued) begin
