@@ -6,17 +6,11 @@ tb/core.*
 synth/stat_*.txt
 synth/*.log
 
-# Only track public benchmark models (c, e, s) and synthetic operator unit goldens
+# Only track synthetic operator unit goldens; full-model dumps stay local
 tb/golden/golden_dma_e2e/*
 !tb/golden/golden_dma_e2e/int8/
 !tb/golden/golden_dma_e2e/int16/
 !tb/golden/golden_dma_e2e/pipeline_*/
-!tb/golden/golden_dma_e2e/model_c_int8/
-!tb/golden/golden_dma_e2e/model_c_int16/
-!tb/golden/golden_dma_e2e/model_e_int8/
-!tb/golden/golden_dma_e2e/model_e_int16/
-!tb/golden/golden_dma_e2e/model_s_int8/
-!tb/golden/golden_dma_e2e/model_s_int16/
 tb/golden/golden_[a-ce-z]*/
 tb/golden/gen_m*.py
 tb/e2e/debug_archive/

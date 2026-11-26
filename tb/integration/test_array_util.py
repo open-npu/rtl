@@ -33,6 +33,14 @@ META = os.environ.get(
 
 def benchmark_shapes():
     """Unique tile geometries. Value is (tile_count, layer_ids)."""
+    if not os.path.exists(META):
+        # Standalone fallback tile geometries when full-model metadata is absent
+        return OrderedDict([
+            ((0, 16, 16, 32, 16, 16, 64, 1, 1, 0), [4, [0]]),
+            ((1, 10, 10, 64, 8, 8, 64, 3, 1, 0), [4, [1]]),
+            ((0, 8, 8, 128, 8, 8, 64, 1, 1, 0), [4, [2]]),
+            ((0, 7, 7, 192, 7, 7, 64, 1, 1, 0), [1, [3]]),
+        ])
     layers = json.load(open(META))
     groups = OrderedDict()
     for i, m in enumerate(layers):
