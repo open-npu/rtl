@@ -523,13 +523,13 @@ async def test_dma_e2e_single_dw_int16(dut):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test: Full 10-layer synth_dw (INT8)
+# Test: Full 10-layer Synthetic Conv/DW Chain (INT8)
 # ═══════════════════════════════════════════════════════════════════════
 
 
 @cocotb.test()
-async def test_dma_e2e_synth_dw_int8(dut):
-    """Full 10-layer synth_dw via DMA+Wishbone (INT8).
+async def test_dma_e2e_chain10_int8(dut):
+    """Full 10-layer synthetic Conv/DW chain via DMA+Wishbone (INT8).
 
     Layer chaining: output of layer N in DDR is used as input for layer N+1.
     """
@@ -570,13 +570,13 @@ async def test_dma_e2e_synth_dw_int8(dut):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test: Full 10-layer synth_dw (INT16)
+# Test: Full 10-layer Synthetic Conv/DW Chain (INT16)
 # ═══════════════════════════════════════════════════════════════════════
 
 
 @cocotb.test()
-async def test_dma_e2e_synth_dw_int16(dut):
-    """Full 10-layer synth_dw via DMA+Wishbone (INT16).
+async def test_dma_e2e_chain10_int16(dut):
+    """Full 10-layer synthetic Conv/DW chain via DMA+Wishbone (INT16).
 
     Layer chaining: output of layer N in DDR is used as input for layer N+1.
     """
@@ -1106,7 +1106,7 @@ async def program_layer_fused_db_en(wb, meta, sched_ctrl, out_base=None, db_en=T
     await wb.write(0x118, dma_ctrl)
 
 
-# KNOWN-ISSUE (2026-08-17): fused-block golden contract drifted (byte-shuffle pattern in mismatches). Fused blocks are covered bit-exact by model_x SoC E2E. Reopen if standalone fused coverage is needed.
+# KNOWN-ISSUE (2026-08-17): fused-block golden contract drifted (byte-shuffle pattern in mismatches). Fused blocks are covered bit-exact by full-model SoC E2E. Reopen if standalone fused coverage is needed.
 # Not collected: expect_fail / skip would fail the Phase-1 FAIL/SKIP gate.
 async def _retired_dma_e2e_tiling_int8_db_en_fused(dut):
     """Fused block (Conv1x1->DW->Conv1x1) with DB_EN on FUSE_START only.

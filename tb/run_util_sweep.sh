@@ -9,7 +9,7 @@ if [ "$mode" != row ]; then
     exit 1
 fi
 build=sim_build_util_$mode
-for m in a b c d e h i j k l; do
+for m in ${MODELS:-a c e}; do
     meta=golden/golden_dma_e2e/model_${m}_int8/metadata.json
     [ -f "$meta" ] || { echo "SKIP $m"; continue; }
     UTIL_META=$PWD/$meta timeout 3600 make DUT=npu_compute_tb \

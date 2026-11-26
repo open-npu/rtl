@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate DMA E2E golden data for synth_dw (INT8 + INT16).
+Generate DMA E2E golden data for 10-layer synthetic Conv/DW chain (INT8 + INT16).
 
 This golden data exercises the FULL chip data path:
   CPU(CSR) → DMA(Wishbone) → DDR → SRAM → Compute → SRAM → DMA → DDR
@@ -372,8 +372,8 @@ def pack_dw_weights_i16(weight_chw, n_ch, layout=K_MAJOR):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def build_synth_dw(int16_mode=False):
-    """Build synth_dw model and compute golden per-layer data.
+def build_synthetic_chain10(int16_mode=False):
+    """Build 10-layer synthetic Conv/DW chain and compute golden per-layer data.
 
     Args:
         int16_mode: If True, use INT16 weights/activations, else INT8.
@@ -571,7 +571,7 @@ def build_synth_dw(int16_mode=False):
         current = out
         return out_h, out_w, ch
 
-    # ─── Build architecture (synth_dw, 10 layers) ───
+    # ─── Build architecture (synthetic 10-layer Conv/DW chain) ───
     h, w, c = 16, 16, 3
 
     h, w, c = add_conv(current, h, w, c, 8, kernel=3, stride=2, relu6=True)    # L0
@@ -620,7 +620,7 @@ def save_golden(output_dir, int16_mode=False):
     print(f"Generating DMA E2E golden data — {mode_str}")
     print(f"{'='*60}")
 
-    layers, layer_data, input_nhwc = build_synth_dw(int16_mode=int16_mode)
+    layers, layer_data, input_nhwc = build_synthetic_chain10(int16_mode=int16_mode)
 
     os.makedirs(output_dir, exist_ok=True)
 

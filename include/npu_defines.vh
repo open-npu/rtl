@@ -65,7 +65,7 @@
 
 // ─── DW global-pool streaming ───
 // Non-tiled DW Conv whose kernel covers the whole input (global-pool style,
-// e.g. model_x L61: 14x14x512 -> 1x1x512) is streamed in 16-channel groups:
+// e.g. 14x14x512 -> 1x1x512) is streamed in 16-channel groups:
 // per group the controller DMA-loads a [pos][ch_local] act slice plus a
 // 16-channel weight block; the 1x1xC output accumulates in a fixed high
 // region of act SRAM (top 1024 words), decoupled from the slice at SRAM[0].

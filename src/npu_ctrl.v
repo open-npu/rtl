@@ -365,7 +365,7 @@ module npu_ctrl #(
 
     // ─── DW global-pool streaming detect ───
     // Non-tiled DW Conv with kernel == whole input and 1x1 output whose
-    // input tensor overflows act SRAM (e.g. model_x L61 14x14x512→1x1x512:
+    // input tensor overflows act SRAM (e.g. 14x14x512→1x1x512:
     // 25088 words > 12288; weights equally 25088 > 24576 wgt SRAM).
     // Streamed in 16-channel groups: each group DMA-loads a [pos][ch_local]
     // act slice (2D: row = ARRAY_SIZE ch at one spatial position, stride =
@@ -1212,8 +1212,7 @@ module npu_ctrl #(
                             // Fused mid/end with SRAM-resident input: do not
                             // prefetch, but still advance tile_x_seq and keep
                             // db_prefetch_done high. Otherwise compute sits in
-                            // S_TILE_WAIT_DB forever (Icarus model_x L10 ran
-                            // 3 days at 100% CPU on tile(6,2) with no IRQ).
+                            // S_TILE_WAIT_DB forever waiting for an IRQ.
                             if (tile_x_seq + 1 >= cfg_tile_num_w) begin
                                 tile_x_seq <= 16'd0;
                                 tile_y_seq <= tile_y_seq + 16'd1;
@@ -1732,8 +1731,8 @@ module npu_ctrl #(
                     end else if (dma_done) begin
                         // Chain into per-oc param reload ONLY if params overflow the
                         // param SRAM (out_c > ~768). If params fit, skip straight to
-                        // done (keeps per-OC weight-reload layers like model_x L13
-                        // on the original single-load param path — no regression).
+                        // done (keeps per-OC weight-reload layers on the original
+                        // single-load param path — no regression).
                         if (param_needs_reload
                                 && (!wgt_k_slice || wgt_k_start == 16'd0))
                             state <= S_RELOAD_PARAM;

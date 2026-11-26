@@ -6,25 +6,22 @@ Open-NPU 神经网络加速器的可综合 Verilog 硬件实现。
 
 ## 架构
 
-- **64 路 INT8/INT16 MAC 行引擎** — 执行普通卷积和全连接
-- **8 路深度卷积引擎** — 支持最大 7×7 卷积核、硬件 padding 和全局核流式计算
-- **64 路后处理单元组** — per-channel 重量化（bias → 乘 → 移位 → clamp）
-- **计算微序列器** — 自动 tiling、OC 分组、权重/激活流式传输
+- **64 路 INT8/INT16 MAC 行引擎** — 统一承载 K-major 普通卷积、全连接与深度卷积（复用 `wrow` 权重库与 `racc` 累加器）
+- **8 路分时复用后处理单元组** — per-channel 重量化（bias → 乘 → 移位 → zp → clamp → ReLU/ReLU6）
+- **计算微序列器** — 自动 tiling、OC 分组、跨层 Super-Block 融合与权重/激活流式传输
 - **Wishbone CSR 寄存器组** — 配置与状态接口
-- **DMA 控制器** — 外部总线与内部 SRAM 之间的突发传输
+- **DMA 控制器** — 外部总线与片上 172KB 四库 512-bit SRAM 之间的 1D/2D strided 传输
 
 ## 目录结构
 
 ```
 src/            Verilog 源码
-  npu_top.v         顶层集成
-  npu_compute.v     计算微序列器
-  npu_ppu.v         后处理单元
-  npu_ppu_bank.v    64 路后处理单元组
-  npu_dw_conv.v     深度卷积引擎
-  npu_dw_bank.v     8 路深度卷积单元组
-  npu_sram.v        双端口同步 SRAM
-  npu_sram_wide.v   512 位计算端口 SRAM
+  npu_top.v         顶层集成（IFM/OFM/WGT/PARAM 四库 SRAM）
+  npu_compute.v     计算微序列器（Row/DW/Pool/Add/Resize）
+  npu_ppu.v         单路后处理流水线
+  npu_ppu_bank.v    8 路分时复用后处理单元组
+  npu_sram.v        双端口同步 32 位 SRAM（PARAM）
+  npu_sram_wide.v   512 位计算端口 SRAM（IFM / OFM / WGT）
   npu_csr.v         CSR 寄存器组（Wishbone）
   npu_dma.v         DMA 控制器
   npu_ctrl.v        顶层控制器 FSM

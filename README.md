@@ -6,25 +6,22 @@ Hardware implementation of the Open-NPU neural network accelerator in synthesiza
 
 ## Architecture
 
-- **64-lane INT8/INT16 MAC Row** — dense convolution and fully connected layers
-- **8-lane Depthwise Engine** — up to 7×7 kernels, hardware padding, and streamed global kernels
-- **64-lane Post-Processing Bank** — per-channel requantization (bias → multiply → shift → clamp)
-- **Compute Micro-Sequencer** — handles tiling, OC grouping, weight/activation streaming
+- **64-lane INT8/INT16 MAC Row** — K-major dense convolution, fully connected, and unified depthwise execution (sharing `wrow` weight banks and `racc` accumulators)
+- **8-lane Time-Multiplexed Post-Processing Bank** — per-channel requantization (bias → multiply → shift → zp → clamp → ReLU/ReLU6)
+- **Compute Micro-Sequencer** — handles tiling, OC grouping, inverted-residual super-blocks, and weight/activation streaming
 - **Wishbone CSR Register File** — configuration and status interface
-- **DMA Controller** — burst transfers between external bus and internal SRAMs
+- **DMA Controller** — 1D/2D strided transfers between external bus and 172KB 4-bank 512-bit SRAMs
 
 ## Directory Structure
 
 ```
 src/            Verilog source modules
-  npu_top.v         Top-level integration
-  npu_compute.v     Compute micro-sequencer
-  npu_ppu.v         Post-processing unit
-  npu_ppu_bank.v    64-lane post-processing bank
-  npu_dw_conv.v     Depthwise convolution engine
-  npu_dw_bank.v     8-lane depthwise bank
-  npu_sram.v        Dual-port synchronous SRAM
-  npu_sram_wide.v   512-bit compute-port SRAM
+  npu_top.v         Top-level integration (IFM/OFM/WGT/PARAM 4-bank SRAM)
+  npu_compute.v     Compute micro-sequencer (Row/DW/Pool/Add/Resize)
+  npu_ppu.v         Post-processing lane pipeline
+  npu_ppu_bank.v    8-lane post-processing bank
+  npu_sram.v        Dual-port synchronous 32-bit SRAM (PARAM)
+  npu_sram_wide.v   512-bit compute-port SRAM (IFM / OFM / WGT)
   npu_csr.v         CSR register file (Wishbone)
   npu_dma.v         DMA controller
   npu_ctrl.v        Top-level controller FSM

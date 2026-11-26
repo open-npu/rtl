@@ -188,8 +188,8 @@ module npu_dma #(
                         `endif
                         // 2D (row_len!=0): ctrl puts NHWC row stride in cfg_out_stride.
                         // 1D load/store is always contiguous (+4/word). CSR in_stride is
-                        // only the 2D row pitch — applying it here skipped through
-                        // weight/param blobs and zeroed chained conv (model_x L2).
+                        // only the 2D row pitch — applying it here would skip through
+                        // weight/param blobs and corrupt chained conv layers.
                         r_stride   <= (cfg_row_len != 0) ? cfg_out_stride : 32'd0;
                         // 2D mode parameters (latched at start)
                         r_row_len  <= cfg_row_len;

@@ -2,7 +2,7 @@
 """
 Generate DMA E2E golden data for 32×32 Medium-Scale Tiling Test.
 
-Model: synth_dw-style, 6 layers, 32×32 input, real channel widths (32/48).
+Model: Synthetic 6-layer Conv/DW chain, 32×32 input, channel widths (32/48).
 Five variants:
   - int8:              INT8, no tiling (all layers fit in SRAM)
   - int8_tiled:        INT8 with spatial tiling (same model, tiling enabled)

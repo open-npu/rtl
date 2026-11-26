@@ -23,7 +23,7 @@ SPAD_KB    ?= 172
 # Tests that size flattened operand buses read these back from the environment.
 export ARRAY_SIZE
 export SPAD_KB
-ACC_WIDTH  ?= 44     # 40: model_x (C_in≤64); 44: synth_res (C_in≤256, k_depth≤2304); 48: future-proof
+ACC_WIDTH  ?= 44     # 40: narrow-channel; 44: default (k_depth up to 4608+); 48: future-proof
 
 # ─── Paths ───
 RTL_DIR    = $(shell pwd)/../src

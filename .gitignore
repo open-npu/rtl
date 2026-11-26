@@ -1,9 +1,21 @@
-# sim artifacts
+# sim & synth artifacts
 tb/*.log
 tb/results*.xml
 tb/sim_build*/
 tb/core.*
-tb/golden/golden_dma_e2e/*_backup/
-tb/e2e/*_diag.py
 synth/stat_*.txt
 synth/*.log
+
+# Only track public benchmark models (c, e) and synthetic operator unit goldens
+tb/golden/golden_dma_e2e/*
+!tb/golden/golden_dma_e2e/int8/
+!tb/golden/golden_dma_e2e/int16/
+!tb/golden/golden_dma_e2e/pipeline_*/
+!tb/golden/golden_dma_e2e/model_c_int8/
+!tb/golden/golden_dma_e2e/model_c_int16/
+!tb/golden/golden_dma_e2e/model_e_int8/
+!tb/golden/golden_dma_e2e/model_e_int16/
+tb/golden/golden_[a-ce-z]*/
+tb/golden/gen_m*.py
+tb/e2e/debug_archive/
+tb/e2e/*_diag.py

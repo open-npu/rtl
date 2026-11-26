@@ -1,9 +1,9 @@
-"""model_x utilization on the 64-MAC row and 8-lane depthwise bank.
+"""MAC utilization measurement on the 64-lane row and depthwise datapath.
 
 Every conv and depthwise layer is included. The full feature map does not
 fit in SRAM, so each distinct tile geometry is simulated once and counted
 once per spatial tile of that layer (the scheduler reloads each tile).
-The 12 Add layers are not MAC layers.
+Eltwise Add layers are not MAC layers.
 
     useful = mac1d_lanes on the row
            = nonzero DW lanes on dw_in_valid_w
@@ -24,11 +24,14 @@ MAC_N = 64
 DW_N = 8
 META = os.environ.get(
     "UTIL_META",
-    "/data/sam/open-npu/rtl/tb/golden/golden_dma_e2e/model_x/metadata.json",
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "golden", "golden_dma_e2e", "model_e_int8", "metadata.json",
+    ),
 )
 
 
-def model_x():
+def benchmark_shapes():
     """Unique tile geometries. Value is (tile_count, layer_ids)."""
     layers = json.load(open(META))
     groups = OrderedDict()
@@ -65,22 +68,6 @@ def wr_param(dut, addr, data):
     dut.u_sram_param.mem[addr].value = data
 
 
-def dw_useful(dut):
-    valid = int(dut.u_compute.dw_in_valid_w.value)
-    if valid == 0:
-        return 0
-    data = int(dut.u_compute.dw_in_data_w.value)
-    n = 0
-    for i in range(DW_N):
-        if (valid >> i) & 1:
-            lane = (data >> (16 * i)) & 0xFFFF
-            if lane & 0x8000:
-                lane -= 0x10000
-            if lane != 0:
-                n += 1
-    return n
-
-
 async def run_layer(dut, op, in_h, in_w, in_c, out_h, out_w, out_c,
                     k, stride, pad):
     dut.rst_n.value = 0
@@ -91,6 +78,7 @@ async def run_layer(dut, op, in_h, in_w, in_c, out_h, out_w, out_c,
     dut.ppu_bias_en.value = 0
     dut.ppu_zp_en.value = 0
     dut.cfg_int16.value = 0
+    dut.cfg_in_zp.value = 0
     for _ in range(5):
         await RisingEdge(dut.clk)
     dut.rst_n.value = 1
@@ -152,7 +140,7 @@ async def run_layer(dut, op, in_h, in_w, in_c, out_h, out_w, out_c,
 @cocotb.test()
 async def test_array_utilization(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
-    shapes = model_x()
+    shapes = benchmark_shapes()
     total_cyc = 0
     total_useful = 0
     engine = "row"
