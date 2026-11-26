@@ -17,7 +17,7 @@ module npu_compute_single_tile_tb;
     wire [WGT_AW-1:0] wgt_rd_addr;
     wire [PARAM_AW-1:0] param_rd_addr;
     wire ppu_in_valid;
-    wire [`MAC_LANES-1:0] ppu_valid_w;
+    wire [`PPU_LANES-1:0] ppu_valid_w;
     wire act_wr_en;
     wire [`SRAM_B_WIDTH-1:0] act_wr_wide;
     reg saw_tile_done = 0;
@@ -80,18 +80,12 @@ module npu_compute_single_tile_tb;
         .param_rd_en(param_rd_en), .param_rd_addr(param_rd_addr),
         .param_rd_data(32'd0),
         .mac_fire(), .mac_lanes(),
-        .dw_wgt_load(), .dw_wgt_valid(), .dw_wgt_data(),
-        .dw_in_valid(), .dw_in_data(), .dw_acc_clear(),
-        .dw_acc_out({`ACC_WIDTH{1'b0}}), .dw_out_valid(1'b0),
-        .dw_wgt_valid_w(), .dw_wgt_data_w(), .dw_in_valid_w(),
-        .dw_in_data_w(), .dw_acc_w({(`ACC_WIDTH*`ARRAY_SIZE){1'b0}}),
-        .dw_out_valid_w({`ARRAY_SIZE{1'b0}}),
         .ppu_acc_in(), .ppu_in_valid(ppu_in_valid), .ppu_bias(), .ppu_mult_m(),
         .ppu_shift_s(), .ppu_zero_point(), .ppu_out_data({`DATA_WIDTH{1'b0}}),
         .ppu_out_valid(ppu_in_valid), .ppu_acc_w(), .ppu_valid_w(ppu_valid_w),
         .ppu_bias_w(),
         .ppu_mult_w(), .ppu_shift_w(), .ppu_zp_w(),
-        .ppu_out_w({(`DATA_WIDTH*`MAC_LANES){1'b0}}),
+        .ppu_out_w({(`DATA_WIDTH*`PPU_LANES){1'b0}}),
         .ppu_vout_w(ppu_valid_w), .dbg_state()
     );
 
@@ -179,7 +173,7 @@ module npu_compute_single_tile_tb;
         force dut.row_group_ch = 7'd64;
         force dut.ppu_nlane = 9'd4;
         force dut.ppu_npix = 5'd1;
-        force dut.ppu_vout_w = {{(`MAC_LANES-4){1'b0}}, 4'hf};
+        force dut.ppu_vout_w = {{(`PPU_LANES-4){1'b0}}, 4'hf};
         @(posedge clk);
         #1;
         if (!act_wr_en || act_wr_wide[31:0] !== 32'h4433_2211)

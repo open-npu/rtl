@@ -1,6 +1,6 @@
 # Open-NPU Yosys full RTL synthesis check (no npu_compute blackbox)
 # Synthesizes all RTL control & compute datapaths including npu_compute,
-# npu_ppu_bank, npu_dw_bank, npu_dma, npu_csr, npu_ctrl, and npu_top.
+# npu_ppu_bank, npu_dma, npu_csr, npu_ctrl, and npu_top.
 # Top-level SRAM macros (npu_sram / npu_sram_wide) remain blackboxed as
 # foundry memory macros; internal compute row buffers infer $mem_v2.
 
@@ -14,8 +14,6 @@ blackbox npu_sram_wide
 read_verilog -defer -sv -DSYNTHESIS -I../include \
     ../src/npu_ppu.v \
     ../src/npu_ppu_bank.v \
-    ../src/npu_dw_conv.v \
-    ../src/npu_dw_bank.v \
     ../src/npu_csr.v \
     ../src/npu_dma.v \
     ../src/npu_ctrl.v \

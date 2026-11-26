@@ -143,8 +143,6 @@ async def run_layer(dut, op, in_h, in_w, in_c, out_h, out_w, out_c,
         cycles += 1
         if int(dut.u_compute.mac1d_fire.value) == 1:
             useful += int(dut.u_compute.mac1d_lanes.value)
-        if int(dut.u_compute.dw_in_valid_w.value) != 0:
-            useful += dw_useful(dut)
         if dut.done.value == 1:
             break
     assert cycles < limit, "compute never asserted done"

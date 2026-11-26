@@ -80,6 +80,9 @@
 `endif
 `define SRAM_B_WORDS   (`SRAM_B_WIDTH / 32)
 `define MAC_LANES      64
+`ifndef PPU_LANES
+`define PPU_LANES      8
+`endif
 
 // ─── Register map base addresses ───
 `define CSR_BASE       12'h000  // Control & Status (Group 0)

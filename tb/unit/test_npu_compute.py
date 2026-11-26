@@ -23,13 +23,9 @@ async def reset_dut(dut):
     dut.start.value = 0
     dut.ppu_out_valid.value = 0
     dut.ppu_out_data.value = 0
-    dut.dw_out_valid.value = 0
-    dut.dw_acc_out.value = 0
     try:
         dut.ppu_vout_w.value = 0
         dut.ppu_out_w.value = 0
-        dut.dw_out_valid_w.value = 0
-        dut.dw_acc_w.value = 0
     except Exception:
         pass
     dut.db_prefetch_done.value = 1  # No DB_EN in unit tests — always ready

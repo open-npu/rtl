@@ -259,7 +259,7 @@ module npu_top #(
     wire wt_act = st_is_wait & ~wt_wgt & ~wt_db;
     wire wt_store = wt_db & ctrl_store_phase;
     // A MAC-state cycle with no MAC issue: the array is starved.
-    wire mac_idle = st_is_mac & ~mac_fire & ~dw_in_valid;
+    wire mac_idle = st_is_mac & ~mac_fire;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -315,12 +315,9 @@ module npu_top #(
                     perf_compute_cnt <= perf_compute_cnt + 1;
                 if (dma_busy && (compute_active || compute_start))
                     perf_overlap_cnt <= perf_overlap_cnt + 1;
-                // Row: mac_lanes products on a mac_fire cycle.
-                // DW Conv: 1 MAC per dw_in_valid pulse
+                // Row & DW MACs: mac_lanes products on a mac_fire cycle.
                 if (mac_fire)
                     mac_cnt <= mac_cnt + {25'd0, mac_lanes};
-                else if (dw_in_valid)
-                    mac_cnt <= mac_cnt + 1;
             end
             // Histogram runs while the engine is active, so the buckets sum
             // to the compute-active span even when the DMA is the limiter.
@@ -830,46 +827,7 @@ module npu_top #(
                                                      ofm_dma_rdata;
 
     // ════════════════════════════════════════════════════════════════════
-    // DW Convolution Engine (single lane)
-    // ════════════════════════════════════════════════════════════════════
-
-    wire signed [`ACC_WIDTH-1:0]  dw_acc_out;
-    wire                          dw_out_valid;
-    wire                          dw_wgt_load;
-    wire                          dw_wgt_valid;
-    wire signed [`DATA_WIDTH-1:0] dw_wgt_data;
-    wire                          dw_in_valid;
-    wire signed [`DATA_WIDTH-1:0] dw_in_data;
-    wire                          dw_acc_clear;
-
-    wire [ARRAY_SIZE-1:0]          dw_wgt_valid_w, dw_in_valid_w, dw_out_valid_w;
-    wire [`DATA_WIDTH*ARRAY_SIZE-1:0] dw_wgt_data_w, dw_in_data_w;
-    wire [`ACC_WIDTH*ARRAY_SIZE-1:0]  dw_acc_w;
-
-    npu_dw_bank #(
-        .N       (ARRAY_SIZE),
-        .DATA_W  (`DATA_WIDTH),
-        .ACC_W   (`ACC_WIDTH),
-        .MAX_KSZ (16)
-    ) u_dw_bank (
-        .clk          (clk),
-        .rst_n        (engine_rst_n),
-        .kernel_h     (reg_kernel_size[3:0]),
-        .kernel_w     (reg_kernel_size[11:8]),
-        .wgt_load     (dw_wgt_load),
-        .wgt_valid    (dw_wgt_valid_w | {{(ARRAY_SIZE-1){1'b0}}, dw_wgt_valid}),
-        .wgt_data_flat(dw_wgt_data_w | {{(`DATA_WIDTH*(ARRAY_SIZE-1)){1'b0}}, dw_wgt_data}),
-        .in_valid     (dw_in_valid_w | {{(ARRAY_SIZE-1){1'b0}}, dw_in_valid}),
-        .in_data_flat (dw_in_data_w | {{(`DATA_WIDTH*(ARRAY_SIZE-1)){1'b0}}, dw_in_data}),
-        .acc_clear    (dw_acc_clear),
-        .acc_flat     (dw_acc_w),
-        .out_valid    (dw_out_valid_w)
-    );
-    assign dw_acc_out   = dw_acc_w[`ACC_WIDTH-1:0];
-    assign dw_out_valid = dw_out_valid_w[0];
-
-    // ════════════════════════════════════════════════════════════════════
-    // PPU — Post-Processing Unit (single lane)
+    // PPU — Post-Processing Unit (8-lane time-multiplexed bank)
     // ════════════════════════════════════════════════════════════════════
 
     wire signed [`DATA_WIDTH-1:0] ppu_out_data;
@@ -881,15 +839,15 @@ module npu_top #(
     wire [`PARAM_S_BITS-1:0]      ppu_shift_s;
     wire signed [`PARAM_ZP_BITS-1:0] ppu_zero_point;
 
-    wire [`ACC_WIDTH*`MAC_LANES-1:0]  ppu_acc_w, ppu_bias_w;
-    wire [`MAC_LANES-1:0]              ppu_valid_w, ppu_vout_w;
-    wire [15*`MAC_LANES-1:0]           ppu_mult_w;
-    wire [6*`MAC_LANES-1:0]            ppu_shift_w;
-    wire [16*`MAC_LANES-1:0]           ppu_zp_w;
-    wire [`DATA_WIDTH*`MAC_LANES-1:0] ppu_out_w;
+    wire [`ACC_WIDTH*`PPU_LANES-1:0]  ppu_acc_w, ppu_bias_w;
+    wire [`PPU_LANES-1:0]              ppu_valid_w, ppu_vout_w;
+    wire [15*`PPU_LANES-1:0]           ppu_mult_w;
+    wire [6*`PPU_LANES-1:0]            ppu_shift_w;
+    wire [16*`PPU_LANES-1:0]           ppu_zp_w;
+    wire [`DATA_WIDTH*`PPU_LANES-1:0] ppu_out_w;
 
     npu_ppu_bank #(
-        .N       (`MAC_LANES),
+        .N       (`PPU_LANES),
         .ACC_W   (`ACC_WIDTH),
         .DATA_W  (`DATA_WIDTH),
         .BIAS_W  (`BIAS_WIDTH),
@@ -1020,21 +978,6 @@ module npu_top #(
         .param_rd_data  (param_b_rdata),
         .mac_fire       (mac_fire),
         .mac_lanes      (mac_lanes),
-        // DW Conv
-        .dw_wgt_load    (dw_wgt_load),
-        .dw_wgt_valid   (dw_wgt_valid),
-        .dw_wgt_data    (dw_wgt_data),
-        .dw_in_valid    (dw_in_valid),
-        .dw_in_data     (dw_in_data),
-        .dw_acc_clear   (dw_acc_clear),
-        .dw_acc_out     (dw_acc_out),
-        .dw_out_valid   (dw_out_valid),
-        .dw_wgt_valid_w (dw_wgt_valid_w),
-        .dw_wgt_data_w  (dw_wgt_data_w),
-        .dw_in_valid_w  (dw_in_valid_w),
-        .dw_in_data_w   (dw_in_data_w),
-        .dw_acc_w       (dw_acc_w),
-        .dw_out_valid_w (dw_out_valid_w),
         // PPU
         .ppu_acc_in     (ppu_acc_in),
         .ppu_in_valid   (ppu_in_valid),

@@ -129,23 +129,7 @@ module npu_compute #(
     output wire                         mac_fire,
     output wire [6:0]                   mac_lanes,
 
-    // ─── DW Conv (scalar + ARRAY_SIZE-wide) ───
-    output reg                          dw_wgt_load,
-    output reg                          dw_wgt_valid,
-    output reg  signed [DATA_W-1:0]    dw_wgt_data,
-    output reg                          dw_in_valid,
-    output reg  signed [DATA_W-1:0]    dw_in_data,
-    output reg                          dw_acc_clear,
-    input  wire signed [ACC_W-1:0]     dw_acc_out,
-    input  wire                         dw_out_valid,
-    output reg  [ARRAY_SIZE-1:0]       dw_wgt_valid_w,
-    output reg  [DATA_W*ARRAY_SIZE-1:0] dw_wgt_data_w,
-    output reg  [ARRAY_SIZE-1:0]       dw_in_valid_w,
-    output reg  [DATA_W*ARRAY_SIZE-1:0] dw_in_data_w,
-    input  wire [ACC_W*ARRAY_SIZE-1:0] dw_acc_w,
-    input  wire [ARRAY_SIZE-1:0]       dw_out_valid_w,
-
-    // ─── PPU (scalar lane 0 + ARRAY_SIZE-wide) ───
+    // ─── PPU (scalar lane 0 + PPU_LANES-wide time-multiplexed bank) ───
     output reg  signed [ACC_W-1:0]     ppu_acc_in /* verilator public */,
     output reg                          ppu_in_valid,
     output reg  signed [ACC_W-1:0]     ppu_bias,
@@ -154,14 +138,14 @@ module npu_compute #(
     output reg  signed [15:0]          ppu_zero_point,
     input  wire signed [DATA_W-1:0]    ppu_out_data,
     input  wire                         ppu_out_valid,
-    output reg  [ACC_W*`MAC_LANES-1:0] ppu_acc_w,
-    output reg  [`MAC_LANES-1:0]       ppu_valid_w,
-    output reg  [ACC_W*`MAC_LANES-1:0] ppu_bias_w,
-    output reg  [15*`MAC_LANES-1:0]    ppu_mult_w,
-    output reg  [6*`MAC_LANES-1:0]     ppu_shift_w,
-    output reg  [16*`MAC_LANES-1:0]    ppu_zp_w,
-    input  wire [DATA_W*`MAC_LANES-1:0] ppu_out_w,
-    input  wire [`MAC_LANES-1:0]       ppu_vout_w
+    output reg  [ACC_W*`PPU_LANES-1:0] ppu_acc_w,
+    output reg  [`PPU_LANES-1:0]       ppu_valid_w,
+    output reg  [ACC_W*`PPU_LANES-1:0] ppu_bias_w,
+    output reg  [15*`PPU_LANES-1:0]    ppu_mult_w,
+    output reg  [6*`PPU_LANES-1:0]     ppu_shift_w,
+    output reg  [16*`PPU_LANES-1:0]    ppu_zp_w,
+    input  wire [DATA_W*`PPU_LANES-1:0] ppu_out_w,
+    input  wire [`PPU_LANES-1:0]       ppu_vout_w
 );
 
 `ifndef NPU_COMPUTE_BLACKBOX
@@ -349,8 +333,9 @@ module npu_compute #(
     reg        dw_read_issued;
     reg [1:0]  dw_init_phase;          // 0=setup, 1=acc_clear, 2=feeding
     reg [15:0] dw_oh, dw_ow;          // Output pixel coordinates
-    reg [3:0]  dw_fh, dw_fw;          // Filter position (0..6)
-    reg [7:0]  dw_kernel_size;         // kh * kw (cached, up to 16x16=256)
+    reg [4:0]  dw_fh, dw_fw;          // Filter position (0..16)
+    reg [8:0]  dw_kernel_size;         // kh * kw (cached, up to 16x16=256)
+    reg [7:0]  dw_tap_idx;             // Active kernel tap index in S_DW_ACT_STREAM
     reg [1:0]  dw_wgt_bsel_base;       // starting byte offset for weight reads
     // Act-read pipe for the OC-major / stream DW engine. SRAM data is
     // visible two cycles after the issue, so iss is the newer request and
@@ -397,6 +382,7 @@ module npu_compute #(
     wire [31:0] k_depth_cfg = {8'd0, cfg_kernel_h} * {8'd0, cfg_kernel_w}
                             * {16'd0, cfg_in_c};
     localparam ROW_N = `MAC_LANES;
+    localparam PPU_N = `PPU_LANES;
     // ─── 64-lane row engine storage ───
     //
     // Weights arrive K-major (see tools/model_packer.py), so one K index's
@@ -448,6 +434,11 @@ module npu_compute #(
     reg        row_scatter;
     reg [4:0]  scatter_p;
     reg [7:0]  scatter_bi;
+    reg [2:0]  row_push_sub;  // 8-lane sub-beat index pushed to PPU (0..7)
+    reg [2:0]  row_cap_sub;   // 8-lane sub-beat index captured into obuf (0..7)
+    reg [3:0]  row_cap_tgt;   // Total 8-lane sub-beats expected (1..8)
+    reg [2:0]  vec_ppu_sub;   // Shared Pool/Add vector 8-lane feed beat (0..7)
+    reg [2:0]  vec_cap_sub;   // Shared Pool/Add vector 8-lane capture beat (0..7)
 
     // ─── weight streamer (1 K-index per beat, 2-stage pipeline) ───
     reg        wst_on;
@@ -617,8 +608,7 @@ module npu_compute #(
     reg [6:0]              pool_vec_div_lane;
     reg [2:0]              pool_vec_pix_idx;
     reg [2:0]              pool_vec_batch_n;
-    reg signed [ACC_W-1:0] pool_vec_acc [0:`MAC_LANES-1];
-    reg [DATA_W*`MAC_LANES-1:0] pool_vec_out;
+    // Vector Pool reuses racc[0:63] for accumulation and obuf[1023:0] for PPU output.
     // Narrow-channel INT8 max-pool fills the 64-lane vector with adjacent
     // output pixels: 4x16ch or 2x32ch. Each source pixel still uses one wide
     // SRAM read, but comparison, PPU, and writeback are shared by the batch.
@@ -647,7 +637,6 @@ module npu_compute #(
     reg                    add_vec_active;  // Current Add chunk uses the wide path
     reg [`SRAM_B_WIDTH-1:0] add_vec_a;
     reg [`SRAM_B_WIDTH-1:0] add_vec_b;
-    reg [DATA_W*`MAC_LANES-1:0] add_vec_out;
 
     // ─── Resize state ───
     reg [15:0]             rsz_oh, rsz_ow;
@@ -751,6 +740,19 @@ module npu_compute #(
     wire [6:0]  wrow_wr_nch_w = dwl_take_en_w ? dwl_take_ch_w  : wst_f_nch[1];
     wire [1:0]  wrow_wr_sk_w  = dwl_take_en_w ? wst_skip[1:0]  : wst_f_skip[1];
 
+    // OC-major / stream DW reuses wrow_b[0..31][0..63] (8 channels × up to 256 taps),
+    // eliminating the external 8×256×16-bit async-reset npu_dw_bank register array.
+    wire        dw_wgt_we_w   = rst_n && (state == S_DW_WGT_LOAD)
+                             && (dw_init_phase == 2'd2) && dw_read_issued;
+    wire [1:0]  dw_wgt_bs16_w = {dw_cnt[0], 1'b0} + dw_wgt_bsel_base;
+    wire [1:0]  dw_wgt_bs8_w  = dw_cnt[1:0] + dw_wgt_bsel_base;
+    wire signed [DATA_W-1:0] dw_wgt_val_w = cfg_int16
+        ? (dw_wgt_bs16_w[1] ? $signed(wgt_rd_data[31:16]) : $signed(wgt_rd_data[15:0]))
+        : ((dw_wgt_bs8_w == 2'd0) ? {{8{wgt_rd_data[7]}},  wgt_rd_data[7:0]}  :
+           (dw_wgt_bs8_w == 2'd1) ? {{8{wgt_rd_data[15]}}, wgt_rd_data[15:8]} :
+           (dw_wgt_bs8_w == 2'd2) ? {{8{wgt_rd_data[23]}}, wgt_rd_data[23:16]} :
+                                    {{8{wgt_rd_data[31]}}, wgt_rd_data[31:24]});
+
     wire        ga_smp_en_w   = rst_n && ga_f_vld[1];
     wire [15:0] gs_nelt_w     = row_dw ? {5'd0, ga_f_nelt[1]}
                               : (row_slice ? ga_nch : {5'd0, ga_f_nelt[1]});
@@ -774,7 +776,10 @@ module npu_compute #(
     generate
         for (gb = 0; gb < ROW_N; gb = gb + 1) begin : g_row_lanes
             always @(posedge clk) begin
-                if (wrow_we_any_w) begin
+                if (dw_wgt_we_w) begin
+                    if ((gb < 32) && (gb[2:0] == dw_ch_idx[2:0]) && (gb[4:3] == dw_cnt[7:6]))
+                        wrow_b[gb][dw_cnt[5:0]] <= dw_wgt_val_w;
+                end else if (wrow_we_any_w) begin
                     if ((gb[6:0] >= wrow_wr_c0_w) && ((gb[6:0] - wrow_wr_c0_w) < wrow_wr_nch_w)) begin
                         wrow_b[gb][wrow_wr_k_w] <= cfg_int16
                             ? $signed(wgt_rd_data[({1'b0, gb[4:0] - wrow_wr_c0_w[4:0], 1'b0} + {5'd0, wrow_wr_sk_w}) * 8 +: 16])
@@ -1014,16 +1019,6 @@ module npu_compute #(
             ppu_mult_w   <= 0;
             ppu_shift_w  <= 0;
             ppu_zp_w     <= 0;
-            dw_wgt_load  <= 1'b0;
-            dw_wgt_valid <= 1'b0;
-            dw_wgt_data  <= 0;
-            dw_in_valid  <= 1'b0;
-            dw_in_data   <= 0;
-            dw_acc_clear <= 1'b0;
-            dw_wgt_valid_w <= 0;
-            dw_wgt_data_w  <= 0;
-            dw_in_valid_w  <= 0;
-            dw_in_data_w   <= 0;
             // Internal state
             tile_y <= 0; tile_x <= 0; oc_group <= 0;
             single_tile_active <= 1'b0;
@@ -1043,7 +1038,7 @@ module npu_compute #(
             wgt_base <= 0; act_base <= 0; param_base <= 0; out_base <= 0;
             dw_ch_idx <= 0; dw_cnt <= 0; dw_read_issued <= 0; dw_init_phase <= 0;
             dw_oh <= 0; dw_ow <= 0; dw_fh <= 0; dw_fw <= 0;
-            dw_kernel_size <= 0;
+            dw_kernel_size <= 0; dw_tap_idx <= 8'd0;
             dw_wgt_bsel_base <= 0;
             dw_iss_vld <= 1'b0; dw_ret_vld <= 1'b0;
             dw_iss_bsel <= 2'd0; dw_ret_bsel <= 2'd0;
@@ -1092,6 +1087,11 @@ module npu_compute #(
             row_scatter <= 1'b0;
             scatter_p <= 5'd0;
             scatter_bi <= 8'd0;
+            row_push_sub <= 3'd0;
+            row_cap_sub  <= 3'd0;
+            row_cap_tgt  <= 4'd1;
+            vec_ppu_sub  <= 3'd0;
+            vec_cap_sub  <= 3'd0;
             row_ks0 <= 16'd0;
             row_ksend <= 16'd0;
             row_ks_reload <= 1'b0;
@@ -1103,10 +1103,8 @@ module npu_compute #(
             pool_ch <= 0; pool_kh <= 0; pool_kw <= 0; pool_sh <= 0; pool_sw <= 0;
             pool_rd_phase <= 0; pool_wb_phase <= 0;
             pool_wb_addr <= 0; pool_wb_bytesel <= 0; pool_wb_byte <= 0;
-            pool_vec_ch_base <= 0; pool_vec_div_lane <= 0; pool_vec_out <= 0;
+            pool_vec_ch_base <= 0; pool_vec_div_lane <= 0;
             pool_vec_pix_idx <= 0; pool_vec_batch_n <= 1;
-            for (i = 0; i < `MAC_LANES; i = i + 1)
-                pool_vec_acc[i] <= {1'b1, {(ACC_W-1){1'b0}}};
             // Add resets
             add_M_A <= 0; add_M_B <= 0; add_S_A <= 0; add_S_B <= 0;
             add_val_a <= 0; add_val_b <= 0;
@@ -1114,7 +1112,6 @@ module npu_compute #(
             add_rd_phase <= 0; add_param_phase <= 0; add_param_idx <= 0;
             add_wb_phase <= 0; add_wb_addr <= 0; add_wb_bytesel <= 0; add_wb_byte <= 0;
             add_vec_active <= 1'b0; add_vec_a <= 0; add_vec_b <= 0;
-            add_vec_out <= 0;
             // Resize resets
             rsz_oh <= 0; rsz_ow <= 0; rsz_ch <= 0;
             rsz_v00 <= 0; rsz_v01 <= 0; rsz_v10 <= 0; rsz_v11 <= 0;
@@ -1138,12 +1135,7 @@ module npu_compute #(
             mac1d_fire  <= 1'b0;
             param_rd_en <= 1'b0;
             ppu_in_valid <= 1'b0;
-            ppu_valid_w  <= {`MAC_LANES{1'b0}};
-            dw_wgt_valid <= 1'b0;
-            dw_in_valid  <= 1'b0;
-            dw_acc_clear <= 1'b0;
-            dw_wgt_valid_w <= {ARRAY_SIZE{1'b0}};
-            dw_in_valid_w  <= {ARRAY_SIZE{1'b0}};
+            ppu_valid_w  <= {PPU_N{1'b0}};
 
             // Param cache fill: Param SRAM is free during WGT/ACT. Do not
             // overwrite the cache while a background PPU is still feeding.
@@ -1716,6 +1708,9 @@ module npu_compute #(
                         row_drain  <= 1'b0;
                         row_scatter <= 1'b0;
                         scatter_bi <= 8'd0;
+                        row_push_sub <= 3'd0;
+                        row_cap_sub  <= 3'd0;
+                        row_cap_tgt  <= 4'd1;
                         row_last   <= 1'b0;
                         pk         <= 0;
                         group_byte = oc_group * {25'd0, row_group_ch};
@@ -1952,9 +1947,10 @@ module npu_compute #(
                     mac1d_act   <= row_dw ? {DATA_W{1'b0}} : pix_act[0];
                     mac1d_lanes <= popcnt64(nz_bmp);
                     if (row_dw) begin
-                        if (row_ki + 16'd1 >= row_klen)
+                        if (row_ki + 16'd1 >= row_klen) begin
+                            ga_on <= 1'b0;
                             state <= S_ROW_PUSH;
-                        else
+                        end else
                             row_ki <= row_ki + 16'd1;
                     end else if (row_ki + 16'd1 >= (row_kslice ? row_ksend : row_klen)) begin
                         if (row_kslice && row_ksend < row_klen) begin
@@ -1983,75 +1979,86 @@ module npu_compute #(
             end
 
             S_ROW_PUSH: begin
-                if (!row_ppu && !row_drain && param_ready) begin : row_push
+                if ((row_push_sub != 3'd0) || (!row_ppu && !row_drain && param_ready)) begin : row_push
                     integer l;
                     reg [10:0] nlane_p;
-                    nlane_p = {6'd0, row_pv} * {4'd0, row_nch};
-                    for (l = 0; l < ROW_N; l = l + 1) begin
-                        ppu_acc_w[ACC_W*l +: ACC_W]  <= (l[10:0] < nlane_p) ? racc[l] : {ACC_W{1'b0}};
-                        ppu_mult_w[15*l +: 15]       <= (l[10:0] < nlane_p)
-                            ? ((row_pix_sh == 3'd0) ? pc_mult[l]  : pc_mult[lane_c_r[l][4:0]]) : 15'd0;
-                        ppu_shift_w[6*l +: 6]        <= (l[10:0] < nlane_p)
-                            ? ((row_pix_sh == 3'd0) ? pc_shift[l] : pc_shift[lane_c_r[l][4:0]]) : 6'd0;
-                        ppu_zp_w[16*l +: 16]         <= (l[10:0] < nlane_p)
-                            ? ((row_pix_sh == 3'd0) ? pc_zp[l]    : pc_zp[lane_c_r[l][4:0]]) : 16'd0;
-                        ppu_bias_w[ACC_W*l +: ACC_W] <= (l[10:0] < nlane_p)
-                            ? ((row_pix_sh == 3'd0) ? {pc_bhi[l], pc_blo[l]}
-                                                    : {pc_bhi[lane_c_r[l][4:0]], pc_blo[lane_c_r[l][4:0]]})
-                            : {ACC_W{1'b0}};
-                        ppu_valid_w[l]               <= (l[10:0] < nlane_p);
+                    reg [3:0]  nbeats_p;
+                    reg [5:0]  gl_idx, ch_idx;
+                    reg        gl_act;
+                    nlane_p  = {6'd0, row_pv} * {4'd0, row_nch};
+                    nbeats_p = (nlane_p == 11'd0) ? 4'd1 : ((nlane_p + 11'd7) >> 3);
+                    for (l = 0; l < PPU_N; l = l + 1) begin
+                        gl_idx = {row_push_sub, l[2:0]};
+                        gl_act = ({5'd0, gl_idx} < nlane_p);
+                        ch_idx = (row_pix_sh == 3'd0) ? gl_idx : {1'b0, lane_c_r[gl_idx][4:0]};
+                        ppu_acc_w[ACC_W*l +: ACC_W]  <= gl_act ? racc[gl_idx] : {ACC_W{1'b0}};
+                        ppu_mult_w[15*l +: 15]       <= gl_act ? pc_mult[ch_idx] : 15'd0;
+                        ppu_shift_w[6*l +: 6]        <= gl_act ? pc_shift[ch_idx] : 6'd0;
+                        ppu_zp_w[16*l +: 16]         <= gl_act ? pc_zp[ch_idx] : 16'd0;
+                        ppu_bias_w[ACC_W*l +: ACC_W] <= gl_act ? {pc_bhi[ch_idx], pc_blo[ch_idx]} : {ACC_W{1'b0}};
+                        ppu_valid_w[l]               <= gl_act;
                     end
-                    ppu_acc_in     <= racc[0];
-                    ppu_mult_m     <= pc_mult[0];
-                    ppu_shift_s    <= pc_shift[0];
-                    ppu_zero_point <= pc_zp[0];
-                    ppu_bias       <= $signed({pc_bhi[0], pc_blo[0]});
-                    ppu_in_valid <= 1'b1;
+                    if (row_push_sub == 3'd0) begin
+                        ppu_acc_in     <= racc[0];
+                        ppu_mult_m     <= pc_mult[0];
+                        ppu_shift_s    <= pc_shift[0];
+                        ppu_zero_point <= pc_zp[0];
+                        ppu_bias       <= $signed({pc_bhi[0], pc_blo[0]});
+                        ppu_in_valid   <= 1'b1;
 `ifdef DBG_ROW
-                    $display("[ROWPUSH] t=%0t grp=(%0d,%0d) pv=%0d nch=%0d racc0=%0d racc1=%0d",
-                             $time, grp_oh, grp_ow, row_pv, row_nch, racc[0], racc[1]);
+                        $display("[ROWPUSH] t=%0t grp=(%0d,%0d) pv=%0d nch=%0d racc0=%0d racc1=%0d",
+                                 $time, grp_oh, grp_ow, row_pv, row_nch, racc[0], racc[1]);
 `endif
-                    row_ppu <= 1'b1;
-                    ppu_oh  <= row_dw ? sp_oh : grp_oh;
-                    ppu_ow  <= row_dw ? sp_ow : grp_ow;
-                    ppu_nlane <= {4'd0, row_pv} * {2'd0, row_nch};
-                    ppu_npix <= row_pv;
-                    ppu_nch  <= row_nch;
-                    if (row_dw) begin
-                        if (px_remaining > {11'd0, row_pv}) begin
-                            if (sp_ow + {11'd0, row_pv} >= out_tile_w) begin
-                                sp_ow <= 16'd0;
-                                sp_oh <= sp_oh + 16'd1;
-                            end else
-                                sp_ow <= sp_ow + {11'd0, row_pv};
-                            px_remaining <= px_remaining - {11'd0, row_pv};
-                            if (row_pix == 5'd1) begin
-                                // Nothing about the group changes, so stay in
-                                // the MAC instead of paying a setup cycle.
-                                row_ki   <= 16'd0;
-                                ga_t     <= 16'd0;
-                                gs_t     <= 16'd0;
-                                ga_p     <= 5'd0;
-                                ga_left  <= 16'd0;
-                                ga_fh    <= 16'd0;
-                                ga_fw    <= 16'd0;
-                                gs_e     <= 16'd0;
-                                gs_left  <= 16'd0;
-                                ga_f_vld <= 2'd0;
-                                state    <= S_ROW_MAC;
-                            end else
-                                state <= S_ROW_GRP;
-                        end else begin
-                            ga_on    <= 1'b0;
+                        row_ppu     <= 1'b1;
+                        row_cap_sub <= 3'd0;
+                        row_cap_tgt <= nbeats_p;
+                        ppu_oh      <= row_dw ? sp_oh : grp_oh;
+                        ppu_ow      <= row_dw ? sp_ow : grp_ow;
+                        ppu_nlane   <= {4'd0, row_pv} * {2'd0, row_nch};
+                        ppu_npix    <= row_pv;
+                        ppu_nch     <= row_nch;
+                    end
+                    if ({1'b0, row_push_sub} + 4'd1 >= nbeats_p) begin
+                        row_push_sub <= 3'd0;
+                        if (row_dw) begin
+                            if (px_remaining > {11'd0, row_pv}) begin
+                                if (sp_ow + {11'd0, row_pv} >= out_tile_w) begin
+                                    sp_ow <= 16'd0;
+                                    sp_oh <= sp_oh + 16'd1;
+                                end else
+                                    sp_ow <= sp_ow + {11'd0, row_pv};
+                                px_remaining <= px_remaining - {11'd0, row_pv};
+                                if (row_pix == 5'd1) begin
+                                    // Nothing about the group changes, so stay in
+                                    // the MAC instead of paying a setup cycle.
+                                    row_ki   <= 16'd0;
+                                    ga_t     <= 16'd0;
+                                    gs_t     <= 16'd0;
+                                    ga_p     <= 5'd0;
+                                    ga_left  <= 16'd0;
+                                    ga_fh    <= 16'd0;
+                                    ga_fw    <= 16'd0;
+                                    gs_e     <= 16'd0;
+                                    gs_left  <= 16'd0;
+                                    ga_f_vld <= 2'd0;
+                                    ga_on    <= 1'b1;
+                                    state    <= S_ROW_MAC;
+                                end else
+                                    state <= S_ROW_GRP;
+                            end else begin
+                                ga_on    <= 1'b0;
+                                row_last <= 1'b1;
+                                state    <= S_ROW_TAIL;
+                            end
+                        end else if (px_remaining != 16'd0)
+                            state <= S_ROW_GRP;
+                        else begin
+                            wst_on   <= 1'b0;
                             row_last <= 1'b1;
                             state    <= S_ROW_TAIL;
                         end
-                    end else if (px_remaining != 16'd0)
-                        state <= S_ROW_GRP;
-                    else begin
-                        wst_on   <= 1'b0;
-                        row_last <= 1'b1;
-                        state    <= S_ROW_TAIL;
+                    end else begin
+                        row_push_sub <= row_push_sub + 3'd1;
                     end
                 end
             end
@@ -2255,28 +2262,22 @@ module npu_compute #(
             // group is stored as one masked beat instead of a per-channel RMW.
             // ══════════════════════════════════════════════════════════════
             S_DW_WGT_LOAD: begin
-                // Load kh*kw weights for channel oc_group from Weight SRAM
-                dw_wgt_load <= 1'b1;
-
+                // Load kh*kw weights for channel group into wrow_b banks
                 case (dw_init_phase)
                 2'd0: begin
                     // Phase 0: setup
-                    dw_kernel_size <= cfg_kernel_h[3:0] * cfg_kernel_w[3:0];
+                    dw_kernel_size <= {4'd0, cfg_kernel_h[4:0]} * {4'd0, cfg_kernel_w[4:0]};
                     begin : dw_wgt_addr_setup
                         reg [15:0] wgt_elem_start;
                         reg [15:0] wgt_byte_start;
-                        // Stream mode: weights for the resident 16-channel group
-                        // were DMA-loaded as a block at wgt SRAM[0] — index by
-                        // group-local channel. Normal mode: whole tensor resident,
-                        // index by global channel.
                         if (dw_stream)
                             wgt_elem_start = (dw_ch_base + {11'd0, dw_ch_idx[4:0]} - dw_grp_base)
-                                           * {2'd0, cfg_kernel_h[3:0]}
-                                           * {2'd0, cfg_kernel_w[3:0]};
+                                           * {11'd0, cfg_kernel_h[4:0]}
+                                           * {11'd0, cfg_kernel_w[4:0]};
                         else
                             wgt_elem_start = (dw_ch_base + {11'd0, dw_ch_idx[4:0]})
-                                           * {2'd0, cfg_kernel_h[3:0]}
-                                           * {2'd0, cfg_kernel_w[3:0]};
+                                           * {11'd0, cfg_kernel_h[4:0]}
+                                           * {11'd0, cfg_kernel_w[4:0]};
                         wgt_byte_start = cfg_int16 ? (wgt_elem_start << 1) : wgt_elem_start;
                         wgt_word_addr <= {7'd0, wgt_base} + wgt_byte_start[15:2];
                         dw_wgt_bsel_base <= wgt_byte_start[1:0];
@@ -2284,55 +2285,20 @@ module npu_compute #(
                     dw_init_phase <= 2'd1;
                 end
                 2'd1: begin
-                    // Phase 1: send acc_clear, issue first SRAM read
-                    dw_acc_clear <= 1'b1;
+                    // Phase 1: issue first SRAM read
                     wgt_rd_en   <= 1'b1;
                     wgt_rd_addr <= wgt_word_addr;
                     dw_read_issued <= 1'b0;
                     dw_init_phase <= 2'd2;
                 end
                 2'd2: begin
-                    // Phase 2+: weight feeding loop
+                    // Phase 2+: weight feeding loop (writes to wrow_b via g_row_lanes)
                     if (!dw_read_issued) begin
                         dw_read_issued <= 1'b1;
                     end else begin
-                        // SRAM data available — extract element and feed
-                        if (cfg_int16) begin : dw_wgt_extract_int16
-                            reg [1:0] bsel;
-                            bsel = {dw_cnt[0], 1'b0} + dw_wgt_bsel_base;
-                            case (bsel[1])
-                                1'b0: dw_wgt_data <= $signed(wgt_rd_data[15:0]);
-                                1'b1: dw_wgt_data <= $signed(wgt_rd_data[31:16]);
-                            endcase
-                            dw_wgt_data_w[DATA_W*dw_ch_idx[COL_W-1:0] +: DATA_W]
-                                <= (bsel[1] == 1'b0)
-                                    ? $signed(wgt_rd_data[15:0])
-                                    : $signed(wgt_rd_data[31:16]);
-                        end else begin : dw_wgt_extract_int8
-                            reg [1:0] bsel;
-                            bsel = dw_cnt[1:0] + dw_wgt_bsel_base;
-                            case (bsel)
-                                2'd0: dw_wgt_data <= {{8{wgt_rd_data[7]}},  wgt_rd_data[7:0]};
-                                2'd1: dw_wgt_data <= {{8{wgt_rd_data[15]}}, wgt_rd_data[15:8]};
-                                2'd2: dw_wgt_data <= {{8{wgt_rd_data[23]}}, wgt_rd_data[23:16]};
-                                2'd3: dw_wgt_data <= {{8{wgt_rd_data[31]}}, wgt_rd_data[31:24]};
-                            endcase
-                            case (bsel)
-                                2'd0: dw_wgt_data_w[DATA_W*dw_ch_idx[COL_W-1:0] +: DATA_W]
-                                    <= {{8{wgt_rd_data[7]}},  wgt_rd_data[7:0]};
-                                2'd1: dw_wgt_data_w[DATA_W*dw_ch_idx[COL_W-1:0] +: DATA_W]
-                                    <= {{8{wgt_rd_data[15]}}, wgt_rd_data[15:8]};
-                                2'd2: dw_wgt_data_w[DATA_W*dw_ch_idx[COL_W-1:0] +: DATA_W]
-                                    <= {{8{wgt_rd_data[23]}}, wgt_rd_data[23:16]};
-                                default: dw_wgt_data_w[DATA_W*dw_ch_idx[COL_W-1:0] +: DATA_W]
-                                    <= {{8{wgt_rd_data[31]}}, wgt_rd_data[31:24]};
-                            endcase
-                        end
-                        dw_wgt_valid <= (dw_ch_idx == 16'd0);
-                        dw_wgt_valid_w[dw_ch_idx[COL_W-1:0]] <= 1'b1;
-                        dw_cnt <= dw_cnt + 1;
+                        dw_cnt <= dw_cnt + 16'd1;
 
-                        if (dw_cnt + 1 >= dw_kernel_size) begin
+                        if (dw_cnt + 16'd1 >= {7'd0, dw_kernel_size}) begin
                             if (dw_ch_idx + 16'd1 < {11'd0, dw_nch}) begin
                                 dw_ch_idx <= dw_ch_idx + 16'd1;
                                 dw_cnt <= 16'd0;
@@ -2345,7 +2311,6 @@ module npu_compute #(
                         end else begin
                             // Check if need next SRAM word
                             if (cfg_int16) begin
-                                // INT16: 2 elements per word; need next word when bsel[1]==1
                                 if (({dw_cnt[0], 1'b0} + dw_wgt_bsel_base) >= 2'd2) begin
                                     wgt_word_addr <= wgt_word_addr + 1;
                                     wgt_rd_en    <= 1'b1;
@@ -2353,7 +2318,6 @@ module npu_compute #(
                                     dw_read_issued <= 1'b0;
                                 end
                             end else begin
-                                // INT8: 4 elements per word
                                 if ((dw_cnt[1:0] + dw_wgt_bsel_base) == 2'd3) begin
                                     wgt_word_addr <= wgt_word_addr + 1;
                                     wgt_rd_en    <= 1'b1;
@@ -2369,9 +2333,7 @@ module npu_compute #(
             end
 
             S_DW_DRAIN: begin
-                // Transition state: deassert wgt_load, go to param
-                dw_wgt_load <= 1'b0;
-                dw_cnt <= 0;
+                dw_cnt <= 16'd0;
                 param_word_idx <= 0;
                 param_read_issued <= 1'b0;
                 cache_issue <= 9'd0;
@@ -2380,9 +2342,6 @@ module npu_compute #(
 
             S_DW_PARAM: begin
                 // dw_nch channels × 4 words, from this group's first channel.
-                // The wide PPU multiplies by these. A scale left over from
-                // the previous layer (or a single channel at oc_group*4)
-                // requantizes the whole group to zeros.
                 if (!param_read_issued) begin
                     param_rd_en   <= 1'b1;
                     param_rd_addr <= cfg_param_base
@@ -2404,10 +2363,11 @@ module npu_compute #(
 
             S_DW_COMPUTE: begin
                 // Initialize pixel loop
-                dw_oh <= 0;
-                dw_ow <= 0;
-                dw_fh <= 0;
-                dw_fw <= 0;
+                dw_oh <= 16'd0;
+                dw_ow <= 16'd0;
+                dw_fh <= 5'd0;
+                dw_fw <= 5'd0;
+                dw_tap_idx <= 8'd0;
                 dw_read_issued <= 1'b0;
                 dw_kdone <= 1'b0;
                 dw_iss_vld <= 1'b0;
@@ -2418,12 +2378,14 @@ module npu_compute #(
             S_DW_ACT_STREAM: begin
                 // One kernel tap per cycle once the pipe is full. dw_fh/dw_fw
                 // is the next tap to issue; dw_ret_* is the tap whose SRAM
-                // beat is valid this cycle.
+                // beat is valid this cycle. Accumulates directly in racc[0..7]
+                // using weights cached in wrow_b.
                 begin : dw_act_stream_blk
                     reg signed [15:0] ih_s, iw_s;
                     reg               is_pad, is_last, is_first, consumed_last;
                     reg [1:0]         bsel;
-                    reg signed [DATA_W-1:0] zp;
+                    reg signed [DATA_W-1:0] zp, act_ci, wgt_ci;
+                    reg [ARRAY_SIZE-1:0] dw_nz_bmp;
                     integer ci;
                     reg [SRAM_B_W-1:0] sh;
                     reg [ACT_ADDR_W+15:0] elem_off, byte_off;
@@ -2433,22 +2395,24 @@ module npu_compute #(
                     consumed_last = 1'b0;
                     if (dw_ret_vld) begin
                         sh = act_rd_data >> (dw_ret_bsel * 8);
-                        dw_in_valid <= 1'b1;
-                        dw_in_data  <= cfg_int16 ? $signed(sh[15:0])
-                                                : {{8{sh[7]}}, sh[7:0]};
+                        dw_nz_bmp = {ARRAY_SIZE{1'b0}};
                         for (ci = 0; ci < ARRAY_SIZE; ci = ci + 1) begin
-                            if (ci[4:0] < dw_nch) begin
-                                if (cfg_int16)
-                                    dw_in_data_w[DATA_W*ci +: DATA_W]
-                                        <= $signed(sh[16*ci +: 16]);
-                                else
-                                    dw_in_data_w[DATA_W*ci +: DATA_W]
-                                        <= {{8{sh[8*ci+7]}}, sh[8*ci +: 8]};
-                                dw_in_valid_w[ci] <= 1'b1;
-                            end
+                            act_ci = cfg_int16 ? $signed(sh[16*ci +: 16])
+                                               : {{8{sh[8*ci+7]}}, sh[8*ci +: 8]};
+                            case (dw_tap_idx[7:6])
+                                2'd0:    wgt_ci = wrow_b[{3'd0, ci[2:0]}][dw_tap_idx[5:0]];
+                                2'd1:    wgt_ci = wrow_b[{3'd1, ci[2:0]}][dw_tap_idx[5:0]];
+                                2'd2:    wgt_ci = wrow_b[{3'd2, ci[2:0]}][dw_tap_idx[5:0]];
+                                default: wgt_ci = wrow_b[{3'd3, ci[2:0]}][dw_tap_idx[5:0]];
+                            endcase
+                            racc[ci] <= (ci[4:0] < dw_nch)
+                                ? ((dw_ret_clr ? $signed({ACC_W{1'b0}}) : racc[ci]) + act_ci * wgt_ci)
+                                : $signed({ACC_W{1'b0}});
+                            dw_nz_bmp[ci] = (ci[4:0] < dw_nch) && (act_ci != 0);
                         end
-                        if (dw_ret_clr)
-                            dw_acc_clear <= 1'b1;
+                        mac1d_fire  <= 1'b1;
+                        mac1d_lanes <= popcnt64({56'd0, dw_nz_bmp});
+                        dw_tap_idx  <= dw_ret_last ? 8'd0 : (dw_tap_idx + 8'd1);
                         if (dw_ret_last)
                             consumed_last = 1'b1;
                     end
@@ -2471,31 +2435,37 @@ module npu_compute #(
                              + $signed({1'b0, dw_fw}) * $signed({1'b0, cfg_dilation_w});
                         is_pad = (ih_s < 0) || (ih_s >= $signed({1'b0, cfg_in_h}))
                               || (iw_s < 0) || (iw_s >= $signed({1'b0, cfg_in_w}));
-                        is_last = (dw_fw + 4'd1 >= cfg_kernel_w[3:0])
-                               && (dw_fh + 4'd1 >= cfg_kernel_h[3:0]);
-                        is_first = (dw_fh == 4'd0) && (dw_fw == 4'd0);
+                        is_last = (dw_fw + 5'd1 >= cfg_kernel_w[4:0])
+                               && (dw_fh + 5'd1 >= cfg_kernel_h[4:0]);
+                        is_first = (dw_fh == 5'd0) && (dw_fw == 5'd0);
                         // A pad has to follow the reads already in the pipe,
                         // and the MAC accepts one tap per cycle.
                         if (is_pad && !dw_ret_vld && !dw_iss_vld) begin
-                            dw_in_valid <= 1'b1;
-                            dw_in_data  <= zp;
+                            dw_nz_bmp = {ARRAY_SIZE{1'b0}};
                             for (ci = 0; ci < ARRAY_SIZE; ci = ci + 1) begin
-                                if (ci[4:0] < dw_nch) begin
-                                    dw_in_valid_w[ci] <= 1'b1;
-                                    dw_in_data_w[DATA_W*ci +: DATA_W] <= zp;
-                                end
+                                case (dw_tap_idx[7:6])
+                                    2'd0:    wgt_ci = wrow_b[{3'd0, ci[2:0]}][dw_tap_idx[5:0]];
+                                    2'd1:    wgt_ci = wrow_b[{3'd1, ci[2:0]}][dw_tap_idx[5:0]];
+                                    2'd2:    wgt_ci = wrow_b[{3'd2, ci[2:0]}][dw_tap_idx[5:0]];
+                                    default: wgt_ci = wrow_b[{3'd3, ci[2:0]}][dw_tap_idx[5:0]];
+                                endcase
+                                racc[ci] <= (ci[4:0] < dw_nch)
+                                    ? ((is_first ? $signed({ACC_W{1'b0}}) : racc[ci]) + zp * wgt_ci)
+                                    : $signed({ACC_W{1'b0}});
+                                dw_nz_bmp[ci] = (ci[4:0] < dw_nch) && (zp != 0);
                             end
-                            if (is_first)
-                                dw_acc_clear <= 1'b1;
+                            mac1d_fire  <= 1'b1;
+                            mac1d_lanes <= popcnt64({56'd0, dw_nz_bmp});
+                            dw_tap_idx  <= is_last ? 8'd0 : (dw_tap_idx + 8'd1);
                             if (is_last) begin
                                 dw_kdone <= 1'b1;
                                 state <= S_DW_PPU_WAIT;
                                 ppu_wait_cnt <= 0;
-                            end else if (dw_fw + 4'd1 >= cfg_kernel_w[3:0]) begin
-                                dw_fw <= 4'd0;
-                                dw_fh <= dw_fh + 4'd1;
+                            end else if (dw_fw + 5'd1 >= cfg_kernel_w[4:0]) begin
+                                dw_fw <= 5'd0;
+                                dw_fh <= dw_fh + 5'd1;
                             end else
-                                dw_fw <= dw_fw + 4'd1;
+                                dw_fw <= dw_fw + 5'd1;
                         end else if (!is_pad) begin
                             if (dw_stream) begin
                                 elem_off = (ih_s[15:0] * cfg_in_w + iw_s[15:0])
@@ -2508,9 +2478,9 @@ module npu_compute #(
                                 begin : dw_addr_2d_blk
                                     reg [17:0] row_rel, col_rel;
                                     row_rel = {2'd0, dw_oh} * {10'd0, cfg_stride_h}
-                                            + {14'd0, dw_fh} * {10'd0, cfg_dilation_h};
+                                            + {13'd0, dw_fh} * {10'd0, cfg_dilation_h};
                                     col_rel = {2'd0, dw_ow} * {10'd0, cfg_stride_w}
-                                            + {14'd0, dw_fw} * {10'd0, cfg_dilation_w};
+                                            + {13'd0, dw_fw} * {10'd0, cfg_dilation_w};
                                     elem_off = (row_rel[15:0] * tile_in_w + col_rel[15:0])
                                                * cfg_in_c + dw_ch_base;
                                 end
@@ -2523,46 +2493,37 @@ module npu_compute #(
                             dw_iss_bsel <= bsel;
                             dw_iss_last <= is_last;
                             dw_iss_clr  <= is_first;
-                            // No activation is fed on this cycle when the
-                            // pipe was empty, so the clear resets the MAC
-                            // index before the first product arrives.
-                            if (is_first && !dw_ret_vld)
-                                dw_acc_clear <= 1'b1;
                             if (is_last)
                                 dw_kdone <= 1'b1;
-                            else if (dw_fw + 4'd1 >= cfg_kernel_w[3:0]) begin
-                                dw_fw <= 4'd0;
-                                dw_fh <= dw_fh + 4'd1;
+                            else if (dw_fw + 5'd1 >= cfg_kernel_w[4:0]) begin
+                                dw_fw <= 5'd0;
+                                dw_fh <= dw_fh + 5'd1;
                             end else
-                                dw_fw <= dw_fw + 4'd1;
+                                dw_fw <= dw_fw + 5'd1;
                         end
                     end
                 end
             end
 
             S_DW_PPU_WAIT: begin
-                // Wait for dw_out_valid, then feed PPU, wait for PPU output
-                if (ppu_wait_cnt == 0) begin
-                    if (dw_out_valid_w[0] || dw_out_valid) begin : dw_ppu_push_blk
-                        integer l;
-                        ppu_acc_in   <= dw_acc_out;
-                        ppu_in_valid <= 1'b1;
-                        ppu_acc_w    <= {ACC_W*ROW_N{1'b0}};
-                        ppu_mult_w   <= {15*ROW_N{1'b0}};
-                        ppu_shift_w  <= {6*ROW_N{1'b0}};
-                        ppu_zp_w     <= {16*ROW_N{1'b0}};
-                        ppu_bias_w   <= {ACC_W*ROW_N{1'b0}};
-                        ppu_valid_w  <= {ROW_N{1'b0}};
-                        for (l = 0; l < ARRAY_SIZE; l = l + 1) begin
-                            ppu_acc_w[ACC_W*l +: ACC_W]  <= (l[4:0] < dw_nch) ? dw_acc_w[ACC_W*l +: ACC_W] : {ACC_W{1'b0}};
-                            ppu_mult_w[15*l +: 15]       <= (l[4:0] < dw_nch) ? pc_mult[l]                 : 15'd0;
-                            ppu_shift_w[6*l +: 6]        <= (l[4:0] < dw_nch) ? pc_shift[l]                : 6'd0;
-                            ppu_zp_w[16*l +: 16]         <= (l[4:0] < dw_nch) ? pc_zp[l]                   : 16'd0;
-                            ppu_bias_w[ACC_W*l +: ACC_W] <= (l[4:0] < dw_nch) ? {pc_bhi[l], pc_blo[l]}     : {ACC_W{1'b0}};
-                            ppu_valid_w[l]               <= (l[4:0] < dw_nch);
-                        end
-                        ppu_wait_cnt <= 1;
+                // Feed racc[0..7] into 8-lane PPU, then write back PPU output
+                if (ppu_wait_cnt == 0) begin : dw_ppu_push_blk
+                    integer l;
+                    ppu_acc_in     <= racc[0];
+                    ppu_mult_m     <= pc_mult[0];
+                    ppu_shift_s    <= pc_shift[0];
+                    ppu_zero_point <= pc_zp[0];
+                    ppu_bias       <= $signed({pc_bhi[0], pc_blo[0]});
+                    ppu_in_valid   <= 1'b1;
+                    for (l = 0; l < PPU_N; l = l + 1) begin
+                        ppu_acc_w[ACC_W*l +: ACC_W]  <= (l[4:0] < dw_nch) ? racc[l]                    : {ACC_W{1'b0}};
+                        ppu_mult_w[15*l +: 15]       <= (l[4:0] < dw_nch) ? pc_mult[l]                 : 15'd0;
+                        ppu_shift_w[6*l +: 6]        <= (l[4:0] < dw_nch) ? pc_shift[l]                : 6'd0;
+                        ppu_zp_w[16*l +: 16]         <= (l[4:0] < dw_nch) ? pc_zp[l]                   : 16'd0;
+                        ppu_bias_w[ACC_W*l +: ACC_W] <= (l[4:0] < dw_nch) ? {pc_bhi[l], pc_blo[l]}     : {ACC_W{1'b0}};
+                        ppu_valid_w[l]               <= (l[4:0] < dw_nch);
                     end
+                    ppu_wait_cnt <= 1;
                 end else begin
                     if (ppu_vout_w[0] || ppu_out_valid) begin
                         // The ARRAY_SIZE channels of this pixel are contiguous
@@ -2591,8 +2552,9 @@ module npu_compute #(
                         dw_kdone   <= 1'b0;
                         dw_iss_vld <= 1'b0;
                         dw_ret_vld <= 1'b0;
-                        dw_fh <= 4'd0;
-                        dw_fw <= 4'd0;
+                        dw_fh <= 5'd0;
+                        dw_fw <= 5'd0;
+                        dw_tap_idx <= 8'd0;
                         if (dw_ow + 16'd1 >= out_tile_w) begin
                             dw_ow <= 16'd0;
                             if (dw_oh + 16'd1 >= out_tile_h)
@@ -2690,7 +2652,7 @@ module npu_compute #(
                         pool_rd_phase <= 0;
                         pool_count <= 0;
                         for (i = 0; i < `MAC_LANES; i = i + 1)
-                            pool_vec_acc[i] <= pool_mode ? {ACC_W{1'b0}} : {1'b1, {(ACC_W-1){1'b0}}};
+                            racc[i] <= pool_mode ? $signed({ACC_W{1'b0}}) : $signed({1'b1, {(ACC_W-1){1'b0}}});
                         state <= S_POOL_VEC_READ;
                     end
                 end
@@ -2719,8 +2681,11 @@ module npu_compute #(
                             if (pool_mode && pool_count > 0) begin
                                 pool_vec_div_lane <= 0;
                                 state <= S_POOL_VEC_DIV;
-                            end else
+                            end else begin
+                                vec_ppu_sub <= 3'd0;
+                                vec_cap_sub <= 3'd0;
                                 state <= S_POOL_VEC_PPU;
+                            end
                         end else
                             pool_fh <= pool_fh + 1;
                     end else begin
@@ -2771,13 +2736,13 @@ module npu_compute #(
                          : l[5:0];
                     pv8  = $signed({{(ACC_W-8){act_rd_data[{psrc, 3'b000} + 7]}}, act_rd_data[{psrc, 3'b000} +: 8]});
                     pv16 = (l < 32)
-                         ? $signed({{(ACC_W-16){act_rd_data[16*(l % 32) + 15]}}, act_rd_data[16*(l % 32) +: 16]})
+                         ? $signed({{(ACC_W-16){act_rd_data[16*l[4:0] + 15]}}, act_rd_data[16*l[4:0] +: 16]})
                          : $signed({ACC_W{1'b0}});
                     pval = (!pool_vec_multi && cfg_int16) ? pv16 : pv8;
-                    pool_vec_acc[l] <= pen
-                        ? (pool_mode ? (pool_vec_acc[l] + pval)
-                                     : ((pval > pool_vec_acc[l]) ? pval : pool_vec_acc[l]))
-                        : pool_vec_acc[l];
+                    racc[l] <= pen
+                        ? (pool_mode ? (racc[l] + pval)
+                                     : ((pval > racc[l]) ? pval : racc[l]))
+                        : racc[l];
                 end
                 pool_count <= pool_count + 1;
                 if ({4'd0, pool_fw} + 1 >= pool_kw) begin
@@ -2792,8 +2757,11 @@ module npu_compute #(
                         end else if (pool_mode) begin
                             pool_vec_div_lane <= 0;
                             state <= S_POOL_VEC_DIV;
-                        end else
+                        end else begin
+                            vec_ppu_sub <= 3'd0;
+                            vec_cap_sub <= 3'd0;
                             state <= S_POOL_VEC_PPU;
+                        end
                     end else begin
                         pool_fh <= pool_fh + 1;
                         state <= S_POOL_VEC_READ;
@@ -2811,22 +2779,23 @@ module npu_compute #(
                 reg signed [ACC_W-1:0] half_count;
                 reg signed [71:0] prod;
                 if (pool_count == 17'd1) begin
-                    pool_vec_acc[pool_vec_div_lane]
-                        <= pool_vec_acc[pool_vec_div_lane];
+                    racc[pool_vec_div_lane[5:0]] <= racc[pool_vec_div_lane[5:0]];
                 end else begin
                     half_count = pool_count >> 1;
-                    if (pool_vec_acc[pool_vec_div_lane] >= 0)
-                        rounded = pool_vec_acc[pool_vec_div_lane] + half_count;
+                    if (racc[pool_vec_div_lane[5:0]] >= 0)
+                        rounded = racc[pool_vec_div_lane[5:0]] + half_count;
                     else
-                        rounded = pool_vec_acc[pool_vec_div_lane] - half_count;
+                        rounded = racc[pool_vec_div_lane[5:0]] - half_count;
                     prod = rounded * $signed(recip_pool(pool_count[6:0]));
                     if (pool_count == 17'd2)
-                        pool_vec_acc[pool_vec_div_lane] <= prod >>> 31;
+                        racc[pool_vec_div_lane[5:0]] <= prod >>> 31;
                     else
-                        pool_vec_acc[pool_vec_div_lane] <= prod >>> 32;
+                        racc[pool_vec_div_lane[5:0]] <= prod >>> 32;
                 end
                 if (pool_vec_div_lane + 1
                     >= (cfg_int16 ? 7'd32 : 7'd64)) begin
+                    vec_ppu_sub <= 3'd0;
+                    vec_cap_sub <= 3'd0;
                     state <= S_POOL_VEC_PPU;
                 end else begin
                     pool_vec_div_lane <= pool_vec_div_lane + 1;
@@ -2835,34 +2804,59 @@ module npu_compute #(
 
             S_POOL_VEC_PPU: begin : pool_vec_ppu_blk
                 integer l;
-                reg pv_act;
-                for (l = 0; l < `MAC_LANES; l = l + 1) begin
-                    pv_act = pool_vec_multi
-                           ? ({10'd0, l[5:0]} < ({13'd0, pool_vec_batch_n} * cfg_out_c))
-                           : (!cfg_int16 || (l < 32));
-                    ppu_acc_w[ACC_W*l +: ACC_W]  <= pv_act ? pool_vec_acc[l] : {ACC_W{1'b0}};
-                    ppu_mult_w[15*l +: 15]       <= pv_act
-                        ? ((pool_vec_multi && cfg_out_c == 16'd16) ? pc_mult[l[3:0]]
-                           : ((pool_vec_multi && cfg_out_c == 16'd32) ? pc_mult[l[4:0]] : pc_mult[l])) : 15'd0;
-                    ppu_shift_w[6*l +: 6]        <= pv_act
-                        ? ((pool_vec_multi && cfg_out_c == 16'd16) ? pc_shift[l[3:0]]
-                           : ((pool_vec_multi && cfg_out_c == 16'd32) ? pc_shift[l[4:0]] : pc_shift[l])) : 6'd0;
-                    ppu_zp_w[16*l +: 16]         <= pv_act
-                        ? ((pool_vec_multi && cfg_out_c == 16'd16) ? pc_zp[l[3:0]]
-                           : ((pool_vec_multi && cfg_out_c == 16'd32) ? pc_zp[l[4:0]] : pc_zp[l])) : 16'd0;
-                    ppu_bias_w[ACC_W*l +: ACC_W] <= pv_act
-                        ? ((pool_vec_multi && cfg_out_c == 16'd16) ? {pc_bhi[l[3:0]], pc_blo[l[3:0]]}
-                           : ((pool_vec_multi && cfg_out_c == 16'd32) ? {pc_bhi[l[4:0]], pc_blo[l[4:0]]}
-                              : {pc_bhi[l], pc_blo[l]})) : {ACC_W{1'b0}};
+                reg [15:0] pv_tot, pv_nbeats16;
+                reg [3:0]  pv_nbeats;
+                reg [5:0]  gl_idx, pch_idx;
+                reg        pv_act;
+                pv_tot      = pool_vec_multi ? ({13'd0, pool_vec_batch_n} * cfg_out_c)
+                                             : (cfg_int16 ? 16'd32 : 16'd64);
+                pv_nbeats16 = (pv_tot + 16'd7) >> 3;
+                pv_nbeats   = (pv_nbeats16 == 16'd0) ? 4'd1 : pv_nbeats16[3:0];
+                for (l = 0; l < PPU_N; l = l + 1) begin
+                    gl_idx  = {vec_ppu_sub, l[2:0]};
+                    pv_act  = ({10'd0, gl_idx} < pv_tot);
+                    pch_idx = (pool_vec_multi && cfg_out_c == 16'd16) ? {2'd0, gl_idx[3:0]}
+                            : ((pool_vec_multi && cfg_out_c == 16'd32) ? {1'b0, gl_idx[4:0]} : gl_idx);
+                    ppu_acc_w[ACC_W*l +: ACC_W]  <= pv_act ? racc[gl_idx] : {ACC_W{1'b0}};
+                    ppu_mult_w[15*l +: 15]       <= pv_act ? pc_mult[pch_idx] : 15'd0;
+                    ppu_shift_w[6*l +: 6]        <= pv_act ? pc_shift[pch_idx] : 6'd0;
+                    ppu_zp_w[16*l +: 16]         <= pv_act ? pc_zp[pch_idx] : 16'd0;
+                    ppu_bias_w[ACC_W*l +: ACC_W] <= pv_act ? {pc_bhi[pch_idx], pc_blo[pch_idx]} : {ACC_W{1'b0}};
                     ppu_valid_w[l]               <= pv_act;
                 end
-                state <= S_POOL_VEC_WAIT;
+                if (ppu_vout_w[0]) begin
+                    if (vec_cap_sub == 3'd0)
+                        obuf <= {896'd0, ppu_out_w};
+                    else
+                        obuf[{vec_cap_sub, 7'd0} +: 128] <= ppu_out_w;
+                    vec_cap_sub <= vec_cap_sub + 3'd1;
+                end
+                if ({1'b0, vec_ppu_sub} + 4'd1 >= pv_nbeats) begin
+                    vec_ppu_sub <= 3'd0;
+                    state <= S_POOL_VEC_WAIT;
+                end else begin
+                    vec_ppu_sub <= vec_ppu_sub + 3'd1;
+                end
             end
 
-            S_POOL_VEC_WAIT: begin
+            S_POOL_VEC_WAIT: begin : pool_vec_wait_blk
+                reg [15:0] pv_tot, pv_nbeats16;
+                reg [3:0]  pv_nbeats;
+                pv_tot      = pool_vec_multi ? ({13'd0, pool_vec_batch_n} * cfg_out_c)
+                                             : (cfg_int16 ? 16'd32 : 16'd64);
+                pv_nbeats16 = (pv_tot + 16'd7) >> 3;
+                pv_nbeats   = (pv_nbeats16 == 16'd0) ? 4'd1 : pv_nbeats16[3:0];
                 if (ppu_vout_w[0]) begin
-                    pool_vec_out <= ppu_out_w;
-                    state <= S_POOL_VEC_WB;
+                    if (vec_cap_sub == 3'd0)
+                        obuf <= {896'd0, ppu_out_w};
+                    else
+                        obuf[{vec_cap_sub, 7'd0} +: 128] <= ppu_out_w;
+                    if ({1'b0, vec_cap_sub} + 4'd1 >= pv_nbeats) begin
+                        vec_cap_sub <= 3'd0;
+                        state <= S_POOL_VEC_WB;
+                    end else begin
+                        vec_cap_sub <= vec_cap_sub + 3'd1;
+                    end
                 end
             end
 
@@ -2873,10 +2867,9 @@ module npu_compute #(
                 elem_off = (pool_oh * out_tile_w + pool_ow) * cfg_out_c
                            + pool_vec_ch_base;
                 byte_off = cfg_int16 ? (elem_off << 1) : elem_off;
-                for (l = 0; l < 32; l = l + 1)
-                    w16[16*l +: 16] = pool_vec_out[DATA_W*l +: DATA_W];
+                w16 = obuf[511:0];
                 for (l = 0; l < 64; l = l + 1)
-                    w8[8*l +: 8] = pool_vec_out[DATA_W*l +: 8];
+                    w8[8*l +: 8] = obuf[DATA_W*l +: 8];
                 act_wr_en   <= 1'b1;
                 act_wr_addr <= out_base + byte_off[ACT_ADDR_W+1:2];
                 act_wr_wide <= cfg_int16 ? w16 : w8;
@@ -2899,7 +2892,7 @@ module npu_compute #(
                 pool_rd_phase <= 0;
                 pool_count <= 0;
                 for (i = 0; i < `MAC_LANES; i = i + 1)
-                    pool_vec_acc[i] <= pool_mode ? {ACC_W{1'b0}} : {1'b1, {(ACC_W-1){1'b0}}};
+                    racc[i] <= pool_mode ? $signed({ACC_W{1'b0}}) : $signed({1'b1, {(ACC_W-1){1'b0}}});
                 if (pool_ow + pix_step >= out_tile_w) begin
                     pool_ow <= 0;
                     pool_vec_batch_n <=
@@ -3336,36 +3329,64 @@ module npu_compute #(
                 end else begin
                     add_vec_b <= act_rd_data;
                     add_rd_phase <= 0;
+                    vec_ppu_sub <= 3'd0;
+                    vec_cap_sub <= 3'd0;
                     state <= S_ADD_VEC_COMPUTE;
                 end
             end
 
             S_ADD_VEC_COMPUTE: begin : add_vec_compute_blk
                 integer l;
+                reg [3:0]              av_nbeats;
+                reg [5:0]              gl_idx;
                 reg signed [ACC_W-1:0] va, vb, pa, pb, ra, rb, rnd_a, rnd_b;
+                av_nbeats = cfg_int16 ? 4'd4 : 4'd8;
                 rnd_a = $signed({{(ACC_W-1){1'b0}}, 1'b1} << (add_S_A - 1));
                 rnd_b = $signed({{(ACC_W-1){1'b0}}, 1'b1} << (add_S_B - 1));
-                for (l = 0; l < `MAC_LANES; l = l + 1) begin
-                    va = (cfg_int16 && (l < 32))
-                       ? $signed({{(ACC_W-16){add_vec_a[16*(l % 32) + 15]}}, add_vec_a[16*(l % 32) +: 16]})
-                       : $signed({{(ACC_W-8){add_vec_a[8*l + 7]}},           add_vec_a[8*l +: 8]});
-                    vb = (cfg_int16 && (l < 32))
-                       ? $signed({{(ACC_W-16){add_vec_b[16*(l % 32) + 15]}}, add_vec_b[16*(l % 32) +: 16]})
-                       : $signed({{(ACC_W-8){add_vec_b[8*l + 7]}},           add_vec_b[8*l +: 8]});
+                for (l = 0; l < PPU_N; l = l + 1) begin
+                    gl_idx = {vec_ppu_sub, l[2:0]};
+                    va = cfg_int16
+                       ? $signed({{(ACC_W-16){add_vec_a[16*gl_idx[4:0] + 15]}}, add_vec_a[16*gl_idx[4:0] +: 16]})
+                       : $signed({{(ACC_W-8){add_vec_a[8*gl_idx + 7]}},         add_vec_a[8*gl_idx +: 8]});
+                    vb = cfg_int16
+                       ? $signed({{(ACC_W-16){add_vec_b[16*gl_idx[4:0] + 15]}}, add_vec_b[16*gl_idx[4:0] +: 16]})
+                       : $signed({{(ACC_W-8){add_vec_b[8*gl_idx + 7]}},         add_vec_b[8*gl_idx +: 8]});
                     pa = va * $signed({1'b0, add_M_A});
                     pb = vb * $signed({1'b0, add_M_B});
                     ra = (add_S_A > 0) ? ((pa + rnd_a) >>> add_S_A) : pa;
                     rb = (add_S_B > 0) ? ((pb + rnd_b) >>> add_S_B) : pb;
-                    ppu_acc_w[ACC_W*l +: ACC_W] <= (cfg_int16 && (l >= 32)) ? {ACC_W{1'b0}} : (ra + rb);
-                    ppu_valid_w[l]              <= (!cfg_int16 || (l < 32));
+                    ppu_acc_w[ACC_W*l +: ACC_W] <= ra + rb;
+                    ppu_valid_w[l]              <= 1'b1;
                 end
-                state <= S_ADD_VEC_WAIT;
+                if (ppu_vout_w[0]) begin
+                    if (vec_cap_sub == 3'd0)
+                        obuf <= {896'd0, ppu_out_w};
+                    else
+                        obuf[{vec_cap_sub, 7'd0} +: 128] <= ppu_out_w;
+                    vec_cap_sub <= vec_cap_sub + 3'd1;
+                end
+                if ({1'b0, vec_ppu_sub} + 4'd1 >= av_nbeats) begin
+                    vec_ppu_sub <= 3'd0;
+                    state <= S_ADD_VEC_WAIT;
+                end else begin
+                    vec_ppu_sub <= vec_ppu_sub + 3'd1;
+                end
             end
 
-            S_ADD_VEC_WAIT: begin
+            S_ADD_VEC_WAIT: begin : add_vec_wait_blk
+                reg [3:0] av_nbeats;
+                av_nbeats = cfg_int16 ? 4'd4 : 4'd8;
                 if (ppu_vout_w[0]) begin
-                    add_vec_out <= ppu_out_w;
-                    state <= S_ADD_VEC_WB;
+                    if (vec_cap_sub == 3'd0)
+                        obuf <= {896'd0, ppu_out_w};
+                    else
+                        obuf[{vec_cap_sub, 7'd0} +: 128] <= ppu_out_w;
+                    if ({1'b0, vec_cap_sub} + 4'd1 >= av_nbeats) begin
+                        vec_cap_sub <= 3'd0;
+                        state <= S_ADD_VEC_WB;
+                    end else begin
+                        vec_cap_sub <= vec_cap_sub + 3'd1;
+                    end
                 end
             end
 
@@ -3375,10 +3396,9 @@ module npu_compute #(
                 reg [511:0] w16, w8;
                 byte_off = cfg_int16 ? ({17'd0, add_tile_elem_cnt} << 1)
                                      : {17'd0, add_tile_elem_cnt};
-                for (l = 0; l < 32; l = l + 1)
-                    w16[16*l +: 16] = add_vec_out[DATA_W*l +: DATA_W];
+                w16 = obuf[511:0];
                 for (l = 0; l < 64; l = l + 1)
-                    w8[8*l +: 8] = add_vec_out[DATA_W*l +: 8];
+                    w8[8*l +: 8] = obuf[DATA_W*l +: 8];
                 act_wr_en   <= 1'b1;
                 act_wr_addr <= act_base + byte_off[ACT_ADDR_W+1:2];
                 act_wr_wide <= cfg_int16 ? w16 : w8;
@@ -4114,57 +4134,76 @@ module npu_compute #(
 
             endcase
 
-            // 64-lane PPU result, one output beat. Word-aligned groups take
-            // the wide port; a narrow channel count is packed across pixels.
+            // 8-lane PPU result, streamed over 1..8 beats into obuf.
+            // Word-aligned groups take the wide port; narrow groups pack across pixels.
             if (row_ppu && !row_drain && (ppu_vout_w[0] || ppu_out_valid)) begin : row_cap
                 integer cl;
+                reg [5:0]               gl_c, ch_c;
                 reg signed [DATA_W-1:0] cl_v;
-                reg [1023:0] cb16;
-                reg [511:0]  cb8, cwide;
-                reg [1023:0] cobuf;
-                reg [8:0]    cnbytes;
-                reg [31:0]   celem, cbbase;
-                for (cl = 0; cl < ROW_N; cl = cl + 1) begin
+                reg [127:0]             chunk16;
+                reg [63:0]              chunk8;
+                reg [511:0]             cwide;
+                reg [1023:0]            cobuf;
+                reg [8:0]               cnbytes;
+                reg [31:0]              celem, cbbase;
+                for (cl = 0; cl < PPU_N; cl = cl + 1) begin
+                    gl_c = {row_cap_sub, cl[2:0]};
+                    ch_c = (row_pix_sh == 3'd0) ? gl_c : {1'b0, lane_c_r[gl_c][4:0]};
                     cl_v = halo_output_pad
-                        ? $signed(pc_zp[cl])
+                        ? $signed(pc_zp[ch_c])
                         : (ppu_vout_w[cl] ? ppu_out_w[DATA_W*cl +: DATA_W]
                            : ((cl == 0 && ppu_out_valid) ? ppu_out_data : {DATA_W{1'b0}}));
-                    cb16[16*cl +: 16] = (cl[8:0] < ppu_nlane) ? cl_v      : 16'd0;
-                    cb8[8*cl +: 8]    = (cl[8:0] < ppu_nlane) ? cl_v[7:0] : 8'd0;
+                    chunk16[16*cl +: 16] = ({3'd0, gl_c} < ppu_nlane) ? cl_v      : 16'd0;
+                    chunk8[8*cl +: 8]    = ({3'd0, gl_c} < ppu_nlane) ? cl_v[7:0] : 8'd0;
                 end
-                cobuf   = cfg_int16 ? cb16 : {512'd0, cb8};
-                cwide   = cfg_int16 ? cb16[511:0] : cb8;
-                cnbytes = cfg_int16 ? {ppu_nlane[7:0], 1'b0} : ppu_nlane;
-                celem   = ({16'd0, ppu_oh} * {16'd0, out_tile_w} + {16'd0, ppu_ow}) * {16'd0, cfg_out_c}
-                        + {16'd0, oc_group} * {25'd0, row_group_ch};
-                cbbase  = cfg_int16 ? (celem << 1) : celem;
-                if (ppu_npix > 5'd1 || cfg_out_c > {9'd0, row_group_ch}) begin
-                    obuf <= cobuf;
-                    ob_n <= cnbytes[7:0];
-                    scatter_p <= 5'd0;
-                    scatter_bi <= 8'd0;
-                    row_scatter <= 1'b1;
-                    row_drain <= 1'b1;
-                end else if (cbbase[1:0] == 2'b00 && cnbytes[1:0] == 2'b00
-                        && cnbytes != 0 && cnbytes <= 9'd64) begin
-                    act_wr_en   <= 1'b1;
-                    act_wr_addr <= out_base + cbbase[ACT_ADDR_W+1:2];
-                    act_wr_wide <= cwide;
-                    act_wr_data <= cwide[31:0];
-                    if (cnbytes >= 9'd64)
-                        act_wr_mask <= 64'hFFFF_FFFF_FFFF_FFFF;
+                if ({1'b0, row_cap_sub} + 4'd1 < row_cap_tgt) begin
+                    if (row_cap_sub == 3'd0)
+                        obuf <= cfg_int16 ? {896'd0, chunk16} : {960'd0, chunk8};
+                    else if (cfg_int16)
+                        obuf[{row_cap_sub, 7'd0} +: 128] <= chunk16;
                     else
-                        act_wr_mask <= (64'h1 << cnbytes) - 64'h1;
-                    pk      <= 32'd0;
-                    pk_pos  <= 2'd0;
-                    pk_addr <= out_base + cbbase[ACT_ADDR_W+1:2]
-                             + {{(ACT_ADDR_W-7){1'b0}}, cnbytes[8:2]};
-                    row_ppu <= 1'b0;
+                        obuf[{1'b0, row_cap_sub, 6'd0} +: 64] <= chunk8;
+                    row_cap_sub <= row_cap_sub + 3'd1;
                 end else begin
-                    obuf <= cobuf;
-                    ob_n <= cnbytes[7:0];
-                    ob_i <= 8'd0;
-                    row_drain <= 1'b1;
+                    cobuf = (row_cap_sub == 3'd0) ? 1024'd0 : obuf;
+                    if (cfg_int16)
+                        cobuf[{row_cap_sub, 7'd0} +: 128] = chunk16;
+                    else
+                        cobuf[{1'b0, row_cap_sub, 6'd0} +: 64] = chunk8;
+                    cwide       = cobuf[511:0];
+                    row_cap_sub <= 3'd0;
+                    cnbytes     = cfg_int16 ? {ppu_nlane[7:0], 1'b0} : ppu_nlane;
+                    celem       = ({16'd0, ppu_oh} * {16'd0, out_tile_w} + {16'd0, ppu_ow}) * {16'd0, cfg_out_c}
+                                + {16'd0, oc_group} * {25'd0, row_group_ch};
+                    cbbase      = cfg_int16 ? (celem << 1) : celem;
+                    if (ppu_npix > 5'd1 || cfg_out_c > {9'd0, row_group_ch}) begin
+                        obuf <= cobuf;
+                        ob_n <= cnbytes[7:0];
+                        scatter_p <= 5'd0;
+                        scatter_bi <= 8'd0;
+                        row_scatter <= 1'b1;
+                        row_drain <= 1'b1;
+                    end else if (cbbase[1:0] == 2'b00 && cnbytes[1:0] == 2'b00
+                            && cnbytes != 0 && cnbytes <= 9'd64) begin
+                        act_wr_en   <= 1'b1;
+                        act_wr_addr <= out_base + cbbase[ACT_ADDR_W+1:2];
+                        act_wr_wide <= cwide;
+                        act_wr_data <= cwide[31:0];
+                        if (cnbytes >= 9'd64)
+                            act_wr_mask <= 64'hFFFF_FFFF_FFFF_FFFF;
+                        else
+                            act_wr_mask <= (64'h1 << cnbytes) - 64'h1;
+                        pk      <= 32'd0;
+                        pk_pos  <= 2'd0;
+                        pk_addr <= out_base + cbbase[ACT_ADDR_W+1:2]
+                                 + {{(ACT_ADDR_W-7){1'b0}}, cnbytes[8:2]};
+                        row_ppu <= 1'b0;
+                    end else begin
+                        obuf <= cobuf;
+                        ob_n <= cnbytes[7:0];
+                        ob_i <= 8'd0;
+                        row_drain <= 1'b1;
+                    end
                 end
             end else if (row_drain && row_scatter) begin : row_scatter_pack
                 reg [31:0]   spix, selem, sbbase, sbaddr;
