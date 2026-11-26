@@ -61,8 +61,24 @@ async def init_dut(dut):
     dut.tile_out_w_actual.value = 0
     dut.oc_group_done.value = 0
     dut.oc_group_idx.value = 0
+    dut.wgt_k_start.value = 0
     dut.tile_done.value = 0
     dut.cfg_act_bank_offset.value = 6144
+    dut.cfg_ofm_bank_offset.value = 6144
+    dut.cfg_wgt_layout.value = 1
+    dut.cfg_wgt_sram_base.value = 0
+    dut.cfg_param_sram_base.value = 0
+    dut.cfg_param_preloaded.value = 0
+    dut.cfg_param_bank.value = 0
+    dut.cfg_next_param_en.value = 0
+    dut.cfg_next_param_addr.value = 0
+    dut.cfg_next_param_words.value = 0
+    dut.cfg_next_param_bank.value = 0
+    dut.cfg_dilation_h.value = 1
+    dut.cfg_dilation_w.value = 1
+    dut.ctrl_super_req.value = 0
+    dut.ctrl_super_slot.value = 0
+    dut.ctrl_super_slot_valid.value = 0
 
     for _ in range(5):
         await RisingEdge(dut.clk)

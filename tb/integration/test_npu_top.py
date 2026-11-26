@@ -84,10 +84,11 @@ class WbMasterMem:
             try:
                 cyc = int(self.dut.wb_mst_cyc_o.value)
                 stb = int(self.dut.wb_mst_stb_o.value)
+                ack_prev = int(self.dut.wb_mst_ack_i.value)
             except ValueError:
                 self.dut.wb_mst_ack_i.value = 0
                 continue
-            if cyc and stb:
+            if cyc and stb and not ack_prev:
                 try:
                     addr = int(self.dut.wb_mst_adr_o.value)
                 except ValueError:
@@ -165,8 +166,8 @@ async def test_csr_hw_config_read(dut):
     spad_kb = int(dut.SPAD_KB.value)
     import math
     dw_ch_log2 = int(math.log2(array_sz))
-    expected = ((1 << 25) | (1 << 24) | (spad_kb << 16)
-                | (dw_ch_log2 << 12) | (1 << 8) | array_sz)
+    expected = ((0 << 25) | (1 << 24) | (spad_kb << 16)
+                | (dw_ch_log2 << 12) | (1 << 8) | 64)
     assert hw_cfg == expected, f"Expected HW_CONFIG=0x{expected:08X}, got 0x{hw_cfg:08X}"
 
 
@@ -199,7 +200,8 @@ async def test_irq_generation(dut):
     mem = WbMasterMem(dut, dut.clk)
     cocotb.start_soon(mem.run())
 
-    # Configure zero-length DMA (all sizes = 0)
+    # Configure zero-length DMA (all sizes = 0) with a valid K-major Conv shape
+    await configure_slow_layer(wb)
     await wb.write(0x128, 0)  # DMA_IN_SIZE = 0
     await wb.write(0x12C, 0)  # DMA_WGT_SIZE = 0
     await wb.write(0x188, 0)  # POST_PARAM_COUNT = 0
@@ -230,6 +232,7 @@ async def configure_slow_layer(wb):
     be used to hold the controller in its compute phase.
     """
     await wb.write(0x040, 0x0000)        # LAYER_MODE: conv2d, int8
+    await wb.write(0x14C, 0x0001)        # WGT_LAYOUT: K-major row engine
     await wb.write(0x044, 0x0008_0008)   # IN 8x8
     await wb.write(0x048, 16)            # IN_C
     await wb.write(0x04C, 0x0008_0008)   # OUT 8x8
@@ -296,6 +299,7 @@ async def test_abort_during_operation(dut):
     mem = WbMasterMem(dut, dut.clk, ext_mem)
     cocotb.start_soon(mem.run())
 
+    await configure_slow_layer(wb)
     await wb.write(0x108, wgt_base)    # DMA_WGT_ADDR
     await wb.write(0x12C, 400)         # DMA_WGT_SIZE = 400 bytes → 100 words
     await wb.write(0x100, 0x3000_0000) # DMA_IN_ADDR
@@ -457,7 +461,7 @@ async def _run_conv1x1_layer(dut, wb, mem, ext_mem, out_base):
     """
     ARRAY_SIZE = int(dut.ARRAY_SIZE.value)
 
-    # Build test data: all weights = 1, act = [1..ARRAY_SIZE]
+    # Build test data (tight K-major [K, nch] layout): all weights = 1
     wgt_bytes = [1] * (ARRAY_SIZE * ARRAY_SIZE)
     act_bytes = [(i + 1) for i in range(ARRAY_SIZE)]
 
@@ -485,6 +489,7 @@ async def _run_conv1x1_layer(dut, wb, mem, ext_mem, out_base):
 
     # Configure CSR
     await wb.write(0x040, 0x00000000)  # LAYER_MODE: Conv2D
+    await wb.write(0x14C, 0x00000001)  # WGT_LAYOUT: K-major row engine
     await wb.write(0x044, (1 << 16) | 1)
     await wb.write(0x048, ARRAY_SIZE)
     await wb.write(0x04C, (1 << 16) | 1)
@@ -500,7 +505,7 @@ async def _run_conv1x1_layer(dut, wb, mem, ext_mem, out_base):
     await wb.write(0x104, out_base)
     await wb.write(0x10C, param_base)
 
-    wgt_size = ARRAY_SIZE * ARRAY_SIZE
+    wgt_size = len(wgt_bytes)
     act_size = ARRAY_SIZE
     out_size = ARRAY_SIZE
     await wb.write(0x12C, wgt_size)
@@ -688,10 +693,7 @@ async def test_e2e_conv1x1_golden(dut):
     ARRAY_SIZE = int(dut.ARRAY_SIZE.value)
 
     # ─── Build test data ───
-    # Weights: identity-like: w[col][row] = 1 for all (uniform weight=1)
-    # k_depth = 1*1*ARRAY_SIZE = ARRAY_SIZE
-    # Weight layout in SRAM: column-major, each column = ARRAY_SIZE bytes
-    # All weights = 1 → each output channel = sum of all input activations
+    # Weights: identity-like: w[k][oc] = 1 in tight K-major [K, nch] layout
     wgt_bytes = [1] * (ARRAY_SIZE * ARRAY_SIZE)
 
     # Activations: one pixel, ARRAY_SIZE channels, values = [1, 2, 3, ..., ARRAY_SIZE]
@@ -737,6 +739,7 @@ async def test_e2e_conv1x1_golden(dut):
 
     # ─── Configure CSR registers ───
     await wb.write(0x040, 0x00000000)  # LAYER_MODE: op_type=0 (Conv2D)
+    await wb.write(0x14C, 0x00000001)  # WGT_LAYOUT: K-major row engine
     await wb.write(0x044, (1 << 16) | 1)  # IN_DIM_HW: in_h=1, in_w=1
     await wb.write(0x048, ARRAY_SIZE)  # IN_DIM_C
     await wb.write(0x04C, (1 << 16) | 1)  # OUT_DIM_HW: out_h=1, out_w=1
@@ -754,7 +757,7 @@ async def test_e2e_conv1x1_golden(dut):
     await wb.write(0x10C, param_base)  # DMA_PARAM_ADDR
 
     # DMA sizes
-    wgt_size = ARRAY_SIZE * ARRAY_SIZE  # bytes
+    wgt_size = len(wgt_bytes)          # bytes
     act_size = ARRAY_SIZE               # bytes
     out_size = ARRAY_SIZE               # bytes
     await wb.write(0x12C, wgt_size)    # DMA_WGT_SIZE

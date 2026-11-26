@@ -55,8 +55,8 @@ async def test_hw_config_register(dut):
     """Read HW_CONFIG — verify array size, INT16 support, etc."""
     wb = await init_dut(dut)
     val = await wb.read(0x018)
-    # ARRAY_SIZE is parameterized — read expected from compile-time define
-    expected_array_sz = int(dut.ARRAY_SZ.value)
+    # HW_CONFIG[7:0] reports MAC_LANES (64-lane row engine)
+    expected_array_sz = 64
     array_sz = val & 0xFF
     assert array_sz == expected_array_sz, \
         f"ARRAY_SIZE: got {array_sz}, expected {expected_array_sz}"
@@ -87,7 +87,7 @@ async def test_ro_ignore_write(dut):
     # Try to write HW_CONFIG
     await wb.write(0x018, 0xFFFFFFFF)
     val = await wb.read(0x018)
-    expected_array_sz = int(dut.ARRAY_SZ.value)
+    expected_array_sz = 64
     assert (val & 0xFF) == expected_array_sz, "HW_CONFIG changed after write"
 
 
