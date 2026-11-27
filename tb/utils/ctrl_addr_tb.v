@@ -31,9 +31,13 @@ module ctrl_addr_tb;
     npu_ctrl u_ctrl (
         .clk(clk), .rst_n(rst_n),
         .ctrl_start(1'b0), .ctrl_abort(1'b0), .ctrl_soft_rst(1'b0),
+        .ctrl_super_req(1'b0), .ctrl_super_has_add(1'b0),
+        .ctrl_super_stream_param(1'b0), .ctrl_super_slot(2'd0),
+        .ctrl_super_slot_valid(1'b0),
         .hw_busy(), .hw_done(), .hw_error(), .hw_error_code(), .hw_curr_layer(),
         .dma_start(), .dma_dir(), .dma_ext_addr(), .dma_sram_addr(),
         .dma_xfer_len(), .dma_busy(1'b0), .dma_done(1'b0),
+        .st_dma_en(1'b0), .st_dma_busy(1'b0), .st_dma_done(1'b0),
         .compute_start(), .compute_done(1'b0), .oc_group_done(1'b0),
         .oc_group_idx(16'd0), .wgt_reload_done(), .dma_sram_sel(),
         .act_role_swap(),

@@ -75,7 +75,9 @@ module npu_csr #(
     output wire                 ctrl_abort,     // ABORT pulse
     output wire                 ctrl_soft_rst,  // Soft reset pulse
     output wire                 ctrl_auto_next, // AUTO_NEXT mode
-    output wire                 ctrl_super_req, // Phase-1 super-block request (unsupported until block FSM lands)
+    output wire                 ctrl_super_req, // Super-block request
+    output wire                 ctrl_super_has_add, // 4-slot super-block includes trailing Eltwise Add
+    output wire                 ctrl_super_stream_param, // Stream per-stage params into PARAM[0]
     output wire [1:0]           ctrl_super_slot,
     output wire                 ctrl_super_slot_valid,
 
@@ -201,11 +203,9 @@ module npu_csr #(
     wire super_start_accept = valid_access && !wb_ack_o && wb_we_i
                             && (addr == 12'h000) && wb_dat_i[0]
                             && r_super_ctrl[0];
-    // 0x400-0x4FF: selected descriptor window (44 implemented words).
-    // Slots are ordinary flops in this first prototype so START can freeze a
-    // complete descriptor atomically and synthesis does not depend on RAM
-    // read-during-write behavior.
-    reg [DATA_W-1:0] r_super_desc [0:2][0:43];
+    // 0x400-0x4FF: selected descriptor window (44 implemented words, 4 slots).
+    // Slots 0..2 hold Conv1x1 -> DW3x3 -> Conv1x1; slot 3 holds optional residual Add.
+    reg [DATA_W-1:0] r_super_desc [0:3][0:43];
 
     // ─── Group 3: Post-Processing Configuration ───
     reg [DATA_W-1:0] r_post_ctrl;     // 0x180
@@ -270,11 +270,13 @@ module npu_csr #(
     assign ctrl_soft_rst  = r_ctrl[2];
     assign ctrl_auto_next = r_ctrl[3];
     assign ctrl_super_req = r_super_ctrl[0];
+    assign ctrl_super_has_add = r_super_ctrl[3];
+    assign ctrl_super_stream_param = r_super_ctrl[4];
     assign ctrl_super_slot = (r_super_frozen && hw_super_slot_en)
                            ? hw_super_slot
                            : (r_super_frozen ? r_super_active_slot
                                              : r_super_ctrl[2:1]);
-    assign ctrl_super_slot_valid = (ctrl_super_slot < 2'd3);
+    assign ctrl_super_slot_valid = r_super_ctrl[3] ? 1'b1 : (ctrl_super_slot < 2'd3);
     assign reg_layer_count = r_layer_count[7:0];
 
     // ─── Register outputs ───
@@ -386,7 +388,7 @@ module npu_csr #(
             r_post_clamp    <= 32'd0;
             r_post_act_cfg  <= 32'd0;
             r_post_add_stride <= 32'd0;
-            for (super_i = 0; super_i < 3; super_i = super_i + 1)
+            for (super_i = 0; super_i < 4; super_i = super_i + 1)
                 for (super_j = 0; super_j < 44; super_j = super_j + 1)
                     r_super_desc[super_i][super_j] <= 32'd0;
         end else begin
@@ -482,11 +484,11 @@ module npu_csr #(
                         12'h198: r_dma_add_b_addr   <= wb_dat_i; // dual-map
                         12'h19C: r_post_add_stride  <= wb_dat_i;
 
-                        // Super descriptor window.  Slot 3 is reserved and
-                        // ignores writes.  A frozen START descriptor is
-                        // immutable until DONE/ERROR/SOFT_RST.
+                        // Super descriptor window (slots 0..2 always writable;
+                        // slot 3 writable when bit 3 enables residual Add).
                         12'b0100_????_????:
-                            if (!r_super_frozen && r_super_ctrl[9:8] < 2'd3
+                            if (!r_super_frozen
+                                && (r_super_ctrl[3] || r_super_ctrl[9:8] < 2'd3)
                                 && addr[7:2] < 6'd44)
                                 r_super_desc[r_super_ctrl[9:8]][addr[7:2]]
                                     <= wb_dat_i;
@@ -592,7 +594,7 @@ module npu_csr #(
                         12'h19C: wb_dat_o <= r_post_add_stride;
 
                         12'b0100_????_????:
-                            if (r_super_ctrl[9:8] < 2'd3
+                            if ((r_super_ctrl[3] || r_super_ctrl[9:8] < 2'd3)
                                 && addr[7:2] < 6'd44)
                                 wb_dat_o <= r_super_desc[r_super_ctrl[9:8]]
                                                        [addr[7:2]];

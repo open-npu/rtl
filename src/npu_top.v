@@ -62,7 +62,8 @@ module npu_top #(
 
     // --- CSR ↔ Controller ---
     wire        ctrl_start, ctrl_abort, ctrl_soft_rst, ctrl_auto_next;
-    wire        ctrl_super_req, ctrl_super_slot_valid;
+    wire        ctrl_super_req, ctrl_super_has_add, ctrl_super_stream_param;
+    wire        ctrl_super_slot_valid;
     wire [1:0]  ctrl_super_slot;
     wire        super_slot_en;
     wire [1:0]  super_slot_select;
@@ -128,6 +129,12 @@ module npu_top #(
     wire [31:0] dma_ext_addr;
     wire [15:0] dma_sram_addr, dma_xfer_len;
     wire        dma_busy, dma_done;
+    wire        st_dma_start, st_dma_active;
+    wire [31:0] st_dma_ext_addr, st_dma_out_stride;
+    wire [15:0] st_dma_sram_addr, st_dma_xfer_len;
+    wire [15:0] st_dma_row_len, st_dma_row_count, st_dma_src_row_len;
+    wire        rd_dma_busy, rd_dma_done;
+    wire        wr_dma_busy, wr_dma_done;
 
     // --- Controller ↔ Compute ---
     wire        compute_start, compute_done;
@@ -145,6 +152,7 @@ module npu_top #(
     wire        act_role_swap;
     wire        next_param_ready;
     wire [15:0] compute_param_base;
+    wire [15:0] compute_wgt_base;
 
     // --- DMA ↔ SRAM MUX ---
     wire        dma_sram_en, dma_sram_we;
@@ -407,6 +415,8 @@ module npu_top #(
         .ctrl_soft_rst  (ctrl_soft_rst),
         .ctrl_auto_next (ctrl_auto_next),
         .ctrl_super_req (ctrl_super_req),
+        .ctrl_super_has_add(ctrl_super_has_add),
+        .ctrl_super_stream_param(ctrl_super_stream_param),
         .ctrl_super_slot(ctrl_super_slot),
         .ctrl_super_slot_valid(ctrl_super_slot_valid),
         .reg_layer_count(reg_layer_count),
@@ -479,6 +489,8 @@ module npu_top #(
         .ctrl_abort     (ctrl_abort),
         .ctrl_soft_rst  (ctrl_soft_rst),
         .ctrl_super_req (ctrl_super_req),
+        .ctrl_super_has_add(ctrl_super_has_add),
+        .ctrl_super_stream_param(ctrl_super_stream_param),
         .ctrl_super_slot(ctrl_super_slot),
         .ctrl_super_slot_valid(ctrl_super_slot_valid),
         .super_slot_en   (super_slot_en),
@@ -494,8 +506,21 @@ module npu_top #(
         .dma_ext_addr   (dma_ext_addr),
         .dma_sram_addr  (dma_sram_addr),
         .dma_xfer_len   (dma_xfer_len),
-        .dma_busy       (dma_busy),
+        .dma_busy       (rd_dma_busy),
         .dma_done       (dma_done),
+        // Dedicated Store DMA control
+        .st_dma_en          (1'b1),
+        .st_dma_start       (st_dma_start),
+        .st_dma_ext_addr    (st_dma_ext_addr),
+        .st_dma_sram_addr   (st_dma_sram_addr),
+        .st_dma_xfer_len    (st_dma_xfer_len),
+        .st_dma_row_len     (st_dma_row_len),
+        .st_dma_row_count   (st_dma_row_count),
+        .st_dma_src_row_len (st_dma_src_row_len),
+        .st_dma_out_stride  (st_dma_out_stride),
+        .st_dma_busy        (wr_dma_busy),
+        .st_dma_done        (wr_dma_done),
+        .st_dma_active      (st_dma_active),
         // Compute control
         .compute_start  (compute_start),
         .compute_single_tile_en(compute_single_tile_en),
@@ -545,6 +570,7 @@ module npu_top #(
         .cfg_next_param_bank(reg_param_bank_ctrl[2]),
         .next_param_ready   (next_param_ready),
         .compute_param_base (compute_param_base),
+        .compute_wgt_base   (compute_wgt_base),
         // Per-tile store (2D DMA for NHWC)
         .cfg_dma_store_mode    (reg_dma_store_mode),
         .cfg_dma_tile_out_size (reg_dma_tile_out_size),
@@ -587,20 +613,36 @@ module npu_top #(
     );
 
     // ════════════════════════════════════════════════════════════════════
-    // DMA Engine — Wishbone Master + SRAM Interface
+    // Decoupled Read/Write DMA Engines + Burst-Atomic Wishbone Arbiter
     // ════════════════════════════════════════════════════════════════════
+
+    wire        rd_wb_cyc, rd_wb_stb, rd_wb_we;
+    wire [31:0] rd_wb_adr, rd_wb_dat;
+    wire [3:0]  rd_wb_sel;
+    wire [2:0]  rd_wb_cti;
+    wire        rd_wb_ack;
+
+    wire        wr_wb_cyc, wr_wb_stb, wr_wb_we;
+    wire [31:0] wr_wb_adr, wr_wb_dat;
+    wire [3:0]  wr_wb_sel;
+    wire [2:0]  wr_wb_cti;
+    wire        wr_wb_ack;
+
+    wire        wr_use_bg = st_dma_active || st_dma_start;
+    assign      dma_busy  = rd_dma_busy || wr_dma_busy;
+    assign      dma_done  = rd_dma_done || (!st_dma_active && wr_dma_done);
 
     npu_dma #(
         .ADDR_W      (32),
         .DATA_W      (32),
         .SRAM_ADDR_W (16)
-    ) u_dma (
+    ) u_dma_rd (
         .clk            (clk),
         .rst_n          (engine_rst_n),
-        // Control
-        .start          (dma_start),
+        // Load channel (DDR → SRAM Port A)
+        .start          (dma_start && !dma_dir),
         .abort          (ctrl_abort),
-        .dir            (dma_dir),
+        .dir            (1'b0),
         .ext_addr       (dma_ext_addr),
         .sram_addr      (dma_sram_addr),
         .xfer_len       (dma_xfer_len),
@@ -610,31 +652,112 @@ module npu_top #(
         .cfg_row_len    (dma_row_len),
         .cfg_row_count  (dma_row_count),
         .cfg_src_row_len(dma_src_row_len),
-        // Status
-        .busy           (dma_busy),
-        .done_pulse     (dma_done),
-        .xfer_count     (),  // unused at top level
-        // Wishbone master
-        .wb_cyc_o       (wb_mst_cyc_o),
-        .wb_stb_o       (wb_mst_stb_o),
-        .wb_we_o        (wb_mst_we_o),
-        .wb_adr_o       (wb_mst_adr_o),
-        .wb_dat_o       (wb_mst_dat_o),
-        .wb_sel_o       (wb_mst_sel_o),
-        .wb_cti_o       (wb_mst_cti_o),
-        .wb_ack_i       (wb_mst_ack_i),
+        .busy           (rd_dma_busy),
+        .done_pulse     (rd_dma_done),
+        .xfer_count     (),
+        // Wishbone master (read channel)
+        .wb_cyc_o       (rd_wb_cyc),
+        .wb_stb_o       (rd_wb_stb),
+        .wb_we_o        (rd_wb_we),
+        .wb_adr_o       (rd_wb_adr),
+        .wb_dat_o       (rd_wb_dat),
+        .wb_sel_o       (rd_wb_sel),
+        .wb_cti_o       (rd_wb_cti),
+        .wb_ack_i       (rd_wb_ack),
         .wb_dat_i       (wb_mst_dat_i),
-        // SRAM interface (muxed by controller phase)
+        // SRAM Port A write interface
         .sram_en        (dma_sram_en),
         .sram_we        (dma_sram_we),
         .sram_addr_o    (dma_sram_addr_o),
         .sram_wdata     (dma_sram_wdata),
+        .sram_rdata     (dma_sram_rdata),
+        .sram_wide_en   (),
+        .sram_wide_addr (),
+        .sram_rdata_wide({`SRAM_B_WIDTH{1'b0}}),
+        .sram_wide_wait (1'b0)
+    );
+
+    npu_dma #(
+        .ADDR_W      (32),
+        .DATA_W      (32),
+        .SRAM_ADDR_W (16)
+    ) u_dma_wr (
+        .clk            (clk),
+        .rst_n          (engine_rst_n),
+        // Store channel (OFM Wide Port B → DDR)
+        .start          (st_dma_start || (!st_dma_active && dma_start && dma_dir)),
+        .abort          (ctrl_abort),
+        .dir            (1'b1),
+        .ext_addr       (wr_use_bg ? st_dma_ext_addr    : dma_ext_addr),
+        .sram_addr      (wr_use_bg ? st_dma_sram_addr   : dma_sram_addr),
+        .xfer_len       (wr_use_bg ? st_dma_xfer_len    : dma_xfer_len),
+        .burst_cfg      (reg_dma_ctrl[5:4]),
+        .cfg_in_stride  (32'd0),
+        .cfg_out_stride (wr_use_bg ? st_dma_out_stride  : dma_out_stride),
+        .cfg_row_len    (wr_use_bg ? st_dma_row_len     : dma_row_len),
+        .cfg_row_count  (wr_use_bg ? st_dma_row_count   : dma_row_count),
+        .cfg_src_row_len(wr_use_bg ? st_dma_src_row_len : dma_src_row_len),
+        .busy           (wr_dma_busy),
+        .done_pulse     (wr_dma_done),
+        .xfer_count     (),
+        // Wishbone master (write channel)
+        .wb_cyc_o       (wr_wb_cyc),
+        .wb_stb_o       (wr_wb_stb),
+        .wb_we_o        (wr_wb_we),
+        .wb_adr_o       (wr_wb_adr),
+        .wb_dat_o       (wr_wb_dat),
+        .wb_sel_o       (wr_wb_sel),
+        .wb_cti_o       (wr_wb_cti),
+        .wb_ack_i       (wr_wb_ack),
+        .wb_dat_i       (wb_mst_dat_i),
+        // SRAM Wide Port B read interface
+        .sram_en        (),
+        .sram_we        (),
+        .sram_addr_o    (),
+        .sram_wdata     (),
         .sram_rdata     (dma_sram_rdata),
         .sram_wide_en   (dma_sram_wide_en),
         .sram_wide_addr (dma_sram_wide_addr),
         .sram_rdata_wide(dma_sram_rdata_wide),
         .sram_wide_wait (compute_uses_ofm_b)
     );
+
+    // Zero-latency, burst-atomic round-robin Wishbone B4 arbiter
+    reg  wb_locked;
+    reg  wb_owner_wr;
+    reg  wb_rr_last_wr;
+    wire cur_owner_active = wb_locked && (wb_owner_wr ? wr_wb_cyc : rd_wb_cyc);
+    wire grant_wr = cur_owner_active ? wb_owner_wr
+                  : (rd_wb_cyc && wr_wb_cyc) ? ~wb_rr_last_wr
+                  : wr_wb_cyc;
+    wire any_wb_req = rd_wb_cyc || wr_wb_cyc;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wb_locked     <= 1'b0;
+            wb_owner_wr   <= 1'b0;
+            wb_rr_last_wr <= 1'b0;
+        end else if (ctrl_soft_rst || ctrl_abort) begin
+            wb_locked     <= 1'b0;
+            wb_owner_wr   <= 1'b0;
+            wb_rr_last_wr <= 1'b0;
+        end else begin
+            wb_locked   <= any_wb_req;
+            wb_owner_wr <= grant_wr;
+            if (any_wb_req)
+                wb_rr_last_wr <= grant_wr;
+        end
+    end
+
+    assign wb_mst_cyc_o = grant_wr ? wr_wb_cyc : rd_wb_cyc;
+    assign wb_mst_stb_o = grant_wr ? wr_wb_stb : rd_wb_stb;
+    assign wb_mst_we_o  = grant_wr ? wr_wb_we  : rd_wb_we;
+    assign wb_mst_adr_o = grant_wr ? wr_wb_adr : rd_wb_adr;
+    assign wb_mst_dat_o = grant_wr ? wr_wb_dat : rd_wb_dat;
+    assign wb_mst_sel_o = grant_wr ? wr_wb_sel : rd_wb_sel;
+    assign wb_mst_cti_o = grant_wr ? wr_wb_cti : rd_wb_cti;
+    assign rd_wb_ack    = !grant_wr && wb_mst_ack_i;
+    assign wr_wb_ack    =  grant_wr && wb_mst_ack_i;
 
     // ════════════════════════════════════════════════════════════════════
     // SRAM Banks
@@ -792,8 +915,8 @@ module npu_top #(
             dma_bank_sel <= 2'd1;  // default: activation
         else if (ctrl_soft_rst || ctrl_abort)
             dma_bank_sel <= 2'd1;
-        else if (dma_start)
-            dma_bank_sel <= dma_sram_sel;  // latch at start, takes effect next cycle
+        else if (dma_start && !dma_dir)
+            dma_bank_sel <= dma_sram_sel;  // latch at load start, takes effect next cycle
     end
 
     // Logical IFM/OFM Port A (DMA). act_role_swap maps them onto phys0/phys1.
@@ -952,7 +1075,7 @@ module npu_top #(
         .cfg_act_base   (effective_act_base),
         .cfg_out_base   (reg_sram_base[ACT_ADDR_W+16-1:16]),
         .cfg_ofm_base   (effective_ofm_base),
-        .cfg_wgt_base   (reg_wgt_sram_base[WGT_ADDR_W-1:0]),
+        .cfg_wgt_base   (compute_wgt_base[WGT_ADDR_W-1:0]),
         .cfg_pool_cfg   (reg_pool_cfg),
         .cfg_resize_cfg (reg_resize_cfg),
         .cfg_concat_cfg (reg_concat_cfg),

@@ -77,8 +77,13 @@ async def init_dut(dut):
     dut.cfg_dilation_h.value = 1
     dut.cfg_dilation_w.value = 1
     dut.ctrl_super_req.value = 0
+    dut.ctrl_super_has_add.value = 0
+    dut.ctrl_super_stream_param.value = 0
     dut.ctrl_super_slot.value = 0
     dut.ctrl_super_slot_valid.value = 0
+    dut.st_dma_en.value = 0
+    dut.st_dma_busy.value = 0
+    dut.st_dma_done.value = 0
 
     for _ in range(5):
         await RisingEdge(dut.clk)

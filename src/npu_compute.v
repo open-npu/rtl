@@ -525,22 +525,24 @@ module npu_compute #(
     // Pick the widest power-of-two output-channel group whose complete K
     // vector fits the 80KB weight SRAM. Narrow groups use the otherwise idle
     // row lanes for more output pixels.
+    wire        wgt_half_cap = cfg_wgt_per_oc[30] && !cfg_wgt_per_oc[31];
+    wire [31:0] wgt_cap_bytes = wgt_half_cap ? (`WEIGHT_BUF_SIZE >> 1) : `WEIGHT_BUF_SIZE;
     wire [31:0] row_one_oc_bytes = k_depth_cfg << (cfg_int16 ? 1 : 0);
     wire [6:0]  row_dense_grp =
-        ((row_one_oc_bytes << 6) <= `WEIGHT_BUF_SIZE) ? 7'd64 :
-        ((row_one_oc_bytes << 5) <= `WEIGHT_BUF_SIZE) ? 7'd32 :
-        ((row_one_oc_bytes << 4) <= `WEIGHT_BUF_SIZE) ? 7'd16 :
-        ((row_one_oc_bytes << 3) <= `WEIGHT_BUF_SIZE) ? 7'd8  :
-        ((row_one_oc_bytes << 2) <= `WEIGHT_BUF_SIZE) ? 7'd4  :
-        ((row_one_oc_bytes << 1) <= `WEIGHT_BUF_SIZE) ? 7'd2  :
-        ( row_one_oc_bytes       <= `WEIGHT_BUF_SIZE) ? 7'd1  : 7'd0;
+        ((row_one_oc_bytes << 6) <= wgt_cap_bytes) ? 7'd64 :
+        ((row_one_oc_bytes << 5) <= wgt_cap_bytes) ? 7'd32 :
+        ((row_one_oc_bytes << 4) <= wgt_cap_bytes) ? 7'd16 :
+        ((row_one_oc_bytes << 3) <= wgt_cap_bytes) ? 7'd8  :
+        ((row_one_oc_bytes << 2) <= wgt_cap_bytes) ? 7'd4  :
+        ((row_one_oc_bytes << 1) <= wgt_cap_bytes) ? 7'd2  :
+        ( row_one_oc_bytes       <= wgt_cap_bytes) ? 7'd1  : 7'd0;
     wire [2:0]  row_dense_sh =
-        ((row_one_oc_bytes << 6) <= `WEIGHT_BUF_SIZE) ? 3'd6 :
-        ((row_one_oc_bytes << 5) <= `WEIGHT_BUF_SIZE) ? 3'd5 :
-        ((row_one_oc_bytes << 4) <= `WEIGHT_BUF_SIZE) ? 3'd4 :
-        ((row_one_oc_bytes << 3) <= `WEIGHT_BUF_SIZE) ? 3'd3 :
-        ((row_one_oc_bytes << 2) <= `WEIGHT_BUF_SIZE) ? 3'd2 :
-        ((row_one_oc_bytes << 1) <= `WEIGHT_BUF_SIZE) ? 3'd1 : 3'd0;
+        ((row_one_oc_bytes << 6) <= wgt_cap_bytes) ? 3'd6 :
+        ((row_one_oc_bytes << 5) <= wgt_cap_bytes) ? 3'd5 :
+        ((row_one_oc_bytes << 4) <= wgt_cap_bytes) ? 3'd4 :
+        ((row_one_oc_bytes << 3) <= wgt_cap_bytes) ? 3'd3 :
+        ((row_one_oc_bytes << 2) <= wgt_cap_bytes) ? 3'd2 :
+        ((row_one_oc_bytes << 1) <= wgt_cap_bytes) ? 3'd1 : 3'd0;
     wire        row_kslice = cfg_wgt_per_oc[31] && cfg_wgt_layout
                            && (cfg_op_type == 8'd0 || cfg_op_type == 8'd2);
     wire [6:0]  row_group_ch = (cfg_op_type == 8'd1 || row_kslice)
@@ -1548,13 +1550,13 @@ module npu_compute #(
                 end else begin
                     // In the normal tile-major schedule, SRAM still contains
                     // the previous tile's final group and group 0 must be
-                    // restored. Group-major keeps one group resident across
-                    // tiles; group 0 was loaded before compute_start.
+                    // restored on subsequent tiles. Group 0 for tile(0,0) was
+                    // already loaded in S_LOAD_WGT before compute_start.
                     if (!group_major_active
+                        && (tile_y != 16'd0 || tile_x != 16'd0)
                         && ((cfg_wgt_per_oc != 0)
                             || (use_row
-                                && (({17'd0, cfg_out_c} * 16'd4) > `PARAM_DEPTH_W)
-                                && (tile_y != 16'd0 || tile_x != 16'd0)))) begin
+                                && (({17'd0, cfg_out_c} * 16'd4) > `PARAM_DEPTH_W)))) begin
                         oc_group_done <= 1'b1;  // Request reload of oc_group 0
                         state <= S_WAIT_WGT_RELOAD;
                     end else begin
@@ -3291,11 +3293,12 @@ module npu_compute #(
                         add_M_B <= param_rd_data[14:0];
                         add_S_B <= param_rd_data[21:16];
                         add_rd_phase <= 0;
-                        if ((cfg_tile_h == 17'd0
+                        if ((cfg_tile_h == 17'd0 && !single_tile_active
                              && {16'd0, add_total_elems}
                                 >= (cfg_int16 ? 32'd32 : 32'd64))
-                            || (cfg_tile_h != 17'd0
-                                && ({16'd0, cfg_tile_h} * {16'd0, cfg_tile_w}
+                            || ((cfg_tile_h != 17'd0 || single_tile_active)
+                                && ({16'd0, (single_tile_active ? out_tile_h : cfg_tile_h)}
+                                    * {16'd0, (single_tile_active ? out_tile_w : cfg_tile_w)}
                                     * {16'd0, cfg_out_c})
                                    >= (cfg_int16 ? 32'd32 : 32'd64))) begin
                             add_vec_active <= 1'b1;
@@ -3602,7 +3605,8 @@ module npu_compute #(
                                  * {17'd0, (single_tile_active
                                            ? single_tile_w_actual : cfg_tile_w)}
                                  * {17'd0, (is_concat ? cfg_in_c : cfg_out_c)};
-                if (cfg_tile_h == 17'd0 || elems_per_tile == 0) begin
+                if ((cfg_tile_h == 17'd0 && !single_tile_active)
+                    || elems_per_tile == 0) begin
                     // Non-tiled: original logic
                     if ({17'd0, add_elem_cnt} + step >= {17'd0, add_total_elems}) begin
                         state <= S_DONE;
