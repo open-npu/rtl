@@ -11,6 +11,7 @@ from utils.csim_ref import ppu_reference
 
 # ─── Constants ───
 MODE_CONV_REQ    = 0b00
+MODE_ADD         = 0b01
 MODE_RELU_ONLY   = 0b10
 MODE_PASSTHROUGH = 0b11
 
@@ -302,3 +303,32 @@ async def test_rounding(dut):
     result = await push_and_wait(dut, acc=7, bias=0, M=1, S=2, zp=0,
                                  bias_en=False, zp_en=False)
     assert result == expected, f"Expected {expected}, got {result}"
+
+
+@cocotb.test()
+async def test_int16_non_conv_saturation(dut):
+    """Verify INT16 saturation in non-CONV modes when |acc_in| exceeds 17-bit range."""
+    await reset_dut(dut)
+    dut.int16_mode.value = 1
+    dut.clamp_max.value = 32767
+
+    async def push16(acc, mode, relu_en):
+        dut.mode.value = mode
+        dut.relu_en.value = int(relu_en)
+        dut.bias_en.value = 0
+        dut.zp_en.value = 0
+        dut.acc_in.value = to_signed(acc, len(dut.acc_in))
+        dut.in_valid.value = 1
+        await RisingEdge(dut.clk)
+        dut.in_valid.value = 0
+        await ClockCycles(dut.clk, PIPELINE_LATENCY)
+        return from_signed(dut.out_data.value, 16)
+
+    for mode in (MODE_ADD, MODE_RELU_ONLY, MODE_PASSTHROUGH):
+        # Negative values below -65536 must saturate (not wrap positive)
+        assert await push16(-70000, mode, relu_en=True) == 0
+        assert await push16(-70000, mode, relu_en=False) == -32768
+        # Positive values above +65535 must saturate to +32767
+        assert await push16(70000, mode, relu_en=False) == 32767
+        assert await push16(70000, mode, relu_en=True) == 32767
+

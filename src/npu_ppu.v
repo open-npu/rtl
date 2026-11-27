@@ -250,17 +250,18 @@ module npu_ppu #(
                     shifted_full = {PROD_W{s2_product[PROD_W-1]}};
                 else
                     shifted_full = s2_product;
-                // Saturate to 17-bit signed range to avoid truncation overflow
-                // 17-bit signed: [-65536, +65535]
-                if (shifted_full > 17'sd65535)
-                    shifted_v = 17'sd65535;
-                else if (shifted_full < -18'sd65536)
-                    shifted_v = 17'sh10000;
-                else
-                    shifted_v = shifted_full[ZP_W:0];
             end else begin
-                shifted_v = s2_product[ZP_W:0];
+                shifted_full = s2_product;
             end
+            // Saturate to 17-bit signed range [-65536, +65535] across all PPU modes
+            // so wide INT16 sums/accumulators (e.g. MODE_ADD / MODE_RELU_ONLY) never
+            // wrap sign before Stage 4 type clamping.
+            if (shifted_full > 17'sd65535)
+                shifted_v = 17'sd65535;
+            else if (shifted_full < -18'sd65536)
+                shifted_v = 17'sh10000;
+            else
+                shifted_v = shifted_full[ZP_W:0];
 
             s3_valid   <= s2_valid;
             s3_mode    <= s2_mode;
