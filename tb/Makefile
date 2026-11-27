@@ -20,10 +20,15 @@ TOPLEVEL_LANG ?= verilog
 # ─── Hardware parameters (override to test different configs) ───
 ARRAY_SIZE ?= 8
 SPAD_KB    ?= 172
+DMA_BUS_WIDTH ?= 32
+DMA_BUS_PROTO ?= 0
 # Tests that size flattened operand buses read these back from the environment.
 export ARRAY_SIZE
 export SPAD_KB
+export DMA_BUS_WIDTH
+export DMA_BUS_PROTO
 ACC_WIDTH  ?= 44     # 40: narrow-channel; 44: default (k_depth up to 4608+); 48: future-proof
+DMA_PROTO_FLAG = $(if $(filter 1 axi4,$(DMA_BUS_PROTO)),-DDMA_AXI4 -DDMA_BUS_PROTO=1,-DDMA_BUS_PROTO=0)
 
 # ─── Paths ───
 RTL_DIR    = $(shell pwd)/../src
@@ -56,6 +61,7 @@ VERILOG_SOURCES = $(RTL_DIR)/npu_ppu.v \
                   $(RTL_DIR)/npu_sram.v \
                   $(RTL_DIR)/npu_sram_wide.v \
                   $(RTL_DIR)/npu_dma.v \
+                  $(RTL_DIR)/npu_wb_to_axi4.v \
                   $(RTL_DIR)/npu_ctrl.v \
                   $(RTL_DIR)/npu_compute.v \
                   $(RTL_DIR)/npu_top.v
@@ -79,6 +85,7 @@ endif
 # ─── Compile flags ───
 ifeq ($(SIM),verilator)
 COMPILE_ARGS = +incdir+$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH) \
+               -DDMA_BUS_WIDTH=$(DMA_BUS_WIDTH) $(DMA_PROTO_FLAG) \
                -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT
 ifdef DEBUG
 COMPILE_ARGS += +define+DBG_ROW
@@ -90,7 +97,8 @@ ifdef FAST_SIM
 COMPILE_ARGS += +define+SYNTHESIS
 endif
 else
-COMPILE_ARGS = -g2012 -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH)
+COMPILE_ARGS = -g2012 -I$(INC_DIR) -DARRAY_SIZE=$(ARRAY_SIZE) -DSPAD_KB=$(SPAD_KB) -DACC_WIDTH=$(ACC_WIDTH) \
+               -DDMA_BUS_WIDTH=$(DMA_BUS_WIDTH) $(DMA_PROTO_FLAG)
 ifdef DBG_ROW
 COMPILE_ARGS += -DDBG_ROW
 endif

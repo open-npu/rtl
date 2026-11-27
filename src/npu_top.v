@@ -20,18 +20,19 @@
 `include "npu_defines.vh"
 
 module npu_top #(
-    parameter ARRAY_SIZE = `ARRAY_SIZE,
-    parameter SPAD_KB    = `SPAD_KB,          // total KB reported in HW_CONFIG
+    parameter ARRAY_SIZE  = `ARRAY_SIZE,
+    parameter SPAD_KB     = `SPAD_KB,          // total KB reported in HW_CONFIG
     // IFM 32KB, OFM 48KB, weight 80KB, param 12KB. See npu_defines.vh.
     parameter IFM_DEPTH   = `IFM_DEPTH,
     parameter OFM_DEPTH   = `OFM_DEPTH,
     parameter WGT_DEPTH   = `WGT_DEPTH_W,
-    parameter PARAM_DEPTH = `PARAM_DEPTH_W
+    parameter PARAM_DEPTH = `PARAM_DEPTH_W,
+    parameter DMA_DATA_W  = `DMA_BUS_WIDTH
 )(
     input  wire         clk,
     input  wire         rst_n,
 
-    // ─── Wishbone Slave Interface (CPU → CSR) ───
+    // ─── Wishbone Slave Interface (CPU → CSR, always 32-bit) ───
     input  wire         wb_slv_cyc_i,
     input  wire         wb_slv_stb_i,
     input  wire         wb_slv_we_i,
@@ -41,20 +42,56 @@ module npu_top #(
     output wire [31:0]  wb_slv_dat_o,
     output wire         wb_slv_ack_o,
 
-    // ─── Wishbone Master Interface (DMA → External Memory) ───
-    output wire         wb_mst_cyc_o,
-    output wire         wb_mst_stb_o,
-    output wire         wb_mst_we_o,
-    output wire [31:0]  wb_mst_adr_o,
-    output wire [31:0]  wb_mst_dat_o,
-    output wire [3:0]   wb_mst_sel_o,
-    output wire [2:0]   wb_mst_cti_o,
-    input  wire         wb_mst_ack_i,
-    input  wire [31:0]  wb_mst_dat_i,
+`ifdef DMA_AXI4
+    // ─── AXI4 Burst Master Interface (DMA → External Memory, 32/64/128-bit) ───
+    output wire [31:0]               m_axi_awaddr,
+    output wire [7:0]                m_axi_awlen,
+    output wire [2:0]                m_axi_awsize,
+    output wire [1:0]                m_axi_awburst,
+    output wire                      m_axi_awvalid,
+    input  wire                      m_axi_awready,
+
+    output wire [DMA_DATA_W-1:0]     m_axi_wdata,
+    output wire [(DMA_DATA_W/8)-1:0] m_axi_wstrb,
+    output wire                      m_axi_wlast,
+    output wire                      m_axi_wvalid,
+    input  wire                      m_axi_wready,
+
+    input  wire [1:0]                m_axi_bresp,
+    input  wire                      m_axi_bvalid,
+    output wire                      m_axi_bready,
+
+    output wire [31:0]               m_axi_araddr,
+    output wire [7:0]                m_axi_arlen,
+    output wire [2:0]                m_axi_arsize,
+    output wire [1:0]                m_axi_arburst,
+    output wire                      m_axi_arvalid,
+    input  wire                      m_axi_arready,
+
+    input  wire [DMA_DATA_W-1:0]     m_axi_rdata,
+    input  wire [1:0]                m_axi_rresp,
+    input  wire                      m_axi_rlast,
+    input  wire                      m_axi_rvalid,
+    output wire                      m_axi_rready,
+`else
+    // ─── Wishbone Master Interface (DMA → External Memory, 32/64/128-bit) ───
+    output wire                      wb_mst_cyc_o,
+    output wire                      wb_mst_stb_o,
+    output wire                      wb_mst_we_o,
+    output wire [31:0]               wb_mst_adr_o,
+    output wire [DMA_DATA_W-1:0]     wb_mst_dat_o,
+    output wire [(DMA_DATA_W/8)-1:0] wb_mst_sel_o,
+    output wire [2:0]                wb_mst_cti_o,
+    input  wire                      wb_mst_ack_i,
+    input  wire [DMA_DATA_W-1:0]     wb_mst_dat_i,
+`endif
 
     // ─── Interrupt Output ───
     output wire         irq_o
 );
+
+    localparam DMA_WORDS = DMA_DATA_W / 32;
+    localparam DMA_SEL_W = DMA_DATA_W / 8;
 
     // ════════════════════════════════════════════════════════════════════
     // Internal wires
@@ -155,13 +192,15 @@ module npu_top #(
     wire [15:0] compute_wgt_base;
 
     // --- DMA ↔ SRAM MUX ---
-    wire        dma_sram_en, dma_sram_we;
-    wire [15:0] dma_sram_addr_o;
-    wire [31:0] dma_sram_wdata, dma_sram_rdata;
-    wire        dma_sram_wide_en;
-    wire [15:0] dma_sram_wide_addr;
+    wire                   dma_sram_en;
+    wire [DMA_WORDS-1:0]   dma_sram_we;
+    wire [15:0]            dma_sram_addr_o;
+    wire [DMA_DATA_W-1:0]  dma_sram_wdata;
+    wire [31:0]            dma_sram_rdata;
+    wire                   dma_sram_wide_en;
+    wire [15:0]            dma_sram_wide_addr;
     wire [`SRAM_B_WIDTH-1:0] dma_sram_rdata_wide;
-    wire        compute_uses_ofm_b;
+    wire                   compute_uses_ofm_b;
 
     // --- Performance counters ---
     reg  [31:0] perf_cycle_cnt;
@@ -365,9 +404,11 @@ module npu_top #(
     // ════════════════════════════════════════════════════════════════════
 
     npu_csr #(
-        .ARRAY_SZ   (ARRAY_SIZE),
-        .SPAD_KB_P  (SPAD_KB),
-        .PARAM_DEPTH_P(PARAM_DEPTH)
+        .ARRAY_SZ     (ARRAY_SIZE),
+        .SPAD_KB_P    (SPAD_KB),
+        .PARAM_DEPTH_P(PARAM_DEPTH),
+        .DMA_BUS_W_P  (DMA_DATA_W),
+        .DMA_PROTO_P  (`DMA_BUS_PROTO)
     ) u_csr (
         .clk            (clk),
         .rst_n          (rst_n),
@@ -616,17 +657,29 @@ module npu_top #(
     // Decoupled Read/Write DMA Engines + Burst-Atomic Wishbone Arbiter
     // ════════════════════════════════════════════════════════════════════
 
-    wire        rd_wb_cyc, rd_wb_stb, rd_wb_we;
-    wire [31:0] rd_wb_adr, rd_wb_dat;
-    wire [3:0]  rd_wb_sel;
-    wire [2:0]  rd_wb_cti;
-    wire        rd_wb_ack;
+    wire                  rd_wb_cyc, rd_wb_stb, rd_wb_we;
+    wire [31:0]           rd_wb_adr;
+    wire [DMA_DATA_W-1:0] rd_wb_dat;
+    wire [DMA_SEL_W-1:0]  rd_wb_sel;
+    wire [2:0]            rd_wb_cti;
+    wire [4:0]            rd_wb_burst_beats;
+    wire                  rd_wb_ack;
 
-    wire        wr_wb_cyc, wr_wb_stb, wr_wb_we;
-    wire [31:0] wr_wb_adr, wr_wb_dat;
-    wire [3:0]  wr_wb_sel;
-    wire [2:0]  wr_wb_cti;
-    wire        wr_wb_ack;
+    wire                  wr_wb_cyc, wr_wb_stb, wr_wb_we;
+    wire [31:0]           wr_wb_adr;
+    wire [DMA_DATA_W-1:0] wr_wb_dat;
+    wire [DMA_SEL_W-1:0]  wr_wb_sel;
+    wire [2:0]            wr_wb_cti;
+    wire [4:0]            wr_wb_burst_beats;
+    wire                  wr_wb_ack;
+
+    wire                  arb_wb_cyc, arb_wb_stb, arb_wb_we;
+    wire [31:0]           arb_wb_adr;
+    wire [DMA_DATA_W-1:0] arb_wb_dat_o, arb_wb_dat_i;
+    wire [DMA_SEL_W-1:0]  arb_wb_sel;
+    wire [2:0]            arb_wb_cti;
+    wire [4:0]            arb_wb_burst_beats;
+    wire                  arb_wb_ack;
 
     wire        wr_use_bg = st_dma_active || st_dma_start;
     assign      dma_busy  = rd_dma_busy || wr_dma_busy;
@@ -634,7 +687,7 @@ module npu_top #(
 
     npu_dma #(
         .ADDR_W      (32),
-        .DATA_W      (32),
+        .DATA_W      (DMA_DATA_W),
         .SRAM_ADDR_W (16)
     ) u_dma_rd (
         .clk            (clk),
@@ -663,8 +716,9 @@ module npu_top #(
         .wb_dat_o       (rd_wb_dat),
         .wb_sel_o       (rd_wb_sel),
         .wb_cti_o       (rd_wb_cti),
+        .wb_burst_beats_o(rd_wb_burst_beats),
         .wb_ack_i       (rd_wb_ack),
-        .wb_dat_i       (wb_mst_dat_i),
+        .wb_dat_i       (arb_wb_dat_i),
         // SRAM Port A write interface
         .sram_en        (dma_sram_en),
         .sram_we        (dma_sram_we),
@@ -679,7 +733,7 @@ module npu_top #(
 
     npu_dma #(
         .ADDR_W      (32),
-        .DATA_W      (32),
+        .DATA_W      (DMA_DATA_W),
         .SRAM_ADDR_W (16)
     ) u_dma_wr (
         .clk            (clk),
@@ -708,8 +762,9 @@ module npu_top #(
         .wb_dat_o       (wr_wb_dat),
         .wb_sel_o       (wr_wb_sel),
         .wb_cti_o       (wr_wb_cti),
+        .wb_burst_beats_o(wr_wb_burst_beats),
         .wb_ack_i       (wr_wb_ack),
-        .wb_dat_i       (wb_mst_dat_i),
+        .wb_dat_i       (arb_wb_dat_i),
         // SRAM Wide Port B read interface
         .sram_en        (),
         .sram_we        (),
@@ -749,15 +804,72 @@ module npu_top #(
         end
     end
 
-    assign wb_mst_cyc_o = grant_wr ? wr_wb_cyc : rd_wb_cyc;
-    assign wb_mst_stb_o = grant_wr ? wr_wb_stb : rd_wb_stb;
-    assign wb_mst_we_o  = grant_wr ? wr_wb_we  : rd_wb_we;
-    assign wb_mst_adr_o = grant_wr ? wr_wb_adr : rd_wb_adr;
-    assign wb_mst_dat_o = grant_wr ? wr_wb_dat : rd_wb_dat;
-    assign wb_mst_sel_o = grant_wr ? wr_wb_sel : rd_wb_sel;
-    assign wb_mst_cti_o = grant_wr ? wr_wb_cti : rd_wb_cti;
-    assign rd_wb_ack    = !grant_wr && wb_mst_ack_i;
-    assign wr_wb_ack    =  grant_wr && wb_mst_ack_i;
+    assign arb_wb_cyc         = grant_wr ? wr_wb_cyc         : rd_wb_cyc;
+    assign arb_wb_stb         = grant_wr ? wr_wb_stb         : rd_wb_stb;
+    assign arb_wb_we          = grant_wr ? wr_wb_we          : rd_wb_we;
+    assign arb_wb_adr         = grant_wr ? wr_wb_adr         : rd_wb_adr;
+    assign arb_wb_dat_o       = grant_wr ? wr_wb_dat         : rd_wb_dat;
+    assign arb_wb_sel         = grant_wr ? wr_wb_sel         : rd_wb_sel;
+    assign arb_wb_cti         = grant_wr ? wr_wb_cti         : rd_wb_cti;
+    assign arb_wb_burst_beats = grant_wr ? wr_wb_burst_beats : rd_wb_burst_beats;
+    assign rd_wb_ack          = !grant_wr && arb_wb_ack;
+    assign wr_wb_ack          =  grant_wr && arb_wb_ack;
+
+`ifdef DMA_AXI4
+    npu_wb_to_axi4 #(
+        .ADDR_W (32),
+        .DATA_W (DMA_DATA_W)
+    ) u_axi4_bridge (
+        .clk              (clk),
+        .rst_n            (engine_rst_n),
+        .wb_cyc_i         (arb_wb_cyc),
+        .wb_stb_i         (arb_wb_stb),
+        .wb_we_i          (arb_wb_we),
+        .wb_adr_i         (arb_wb_adr),
+        .wb_dat_i         (arb_wb_dat_o),
+        .wb_sel_i         (arb_wb_sel),
+        .wb_cti_i         (arb_wb_cti),
+        .wb_burst_beats_i (arb_wb_burst_beats),
+        .wb_ack_o         (arb_wb_ack),
+        .wb_dat_o         (arb_wb_dat_i),
+        .m_axi_awaddr     (m_axi_awaddr),
+        .m_axi_awlen      (m_axi_awlen),
+        .m_axi_awsize     (m_axi_awsize),
+        .m_axi_awburst    (m_axi_awburst),
+        .m_axi_awvalid    (m_axi_awvalid),
+        .m_axi_awready    (m_axi_awready),
+        .m_axi_wdata      (m_axi_wdata),
+        .m_axi_wstrb      (m_axi_wstrb),
+        .m_axi_wlast      (m_axi_wlast),
+        .m_axi_wvalid     (m_axi_wvalid),
+        .m_axi_wready     (m_axi_wready),
+        .m_axi_bresp      (m_axi_bresp),
+        .m_axi_bvalid     (m_axi_bvalid),
+        .m_axi_bready     (m_axi_bready),
+        .m_axi_araddr     (m_axi_araddr),
+        .m_axi_arlen      (m_axi_arlen),
+        .m_axi_arsize     (m_axi_arsize),
+        .m_axi_arburst    (m_axi_arburst),
+        .m_axi_arvalid    (m_axi_arvalid),
+        .m_axi_arready    (m_axi_arready),
+        .m_axi_rdata      (m_axi_rdata),
+        .m_axi_rresp      (m_axi_rresp),
+        .m_axi_rlast      (m_axi_rlast),
+        .m_axi_rvalid     (m_axi_rvalid),
+        .m_axi_rready     (m_axi_rready)
+    );
+`else
+    wire _unused_burst_beats = &{1'b0, arb_wb_burst_beats};
+    assign wb_mst_cyc_o = arb_wb_cyc;
+    assign wb_mst_stb_o = arb_wb_stb;
+    assign wb_mst_we_o  = arb_wb_we;
+    assign wb_mst_adr_o = arb_wb_adr;
+    assign wb_mst_dat_o = arb_wb_dat_o;
+    assign wb_mst_sel_o = arb_wb_sel;
+    assign wb_mst_cti_o = arb_wb_cti;
+    assign arb_wb_ack   = wb_mst_ack_i;
+    assign arb_wb_dat_i = wb_mst_dat_i;
+`endif
 
     // ════════════════════════════════════════════════════════════════════
     // SRAM Banks
@@ -775,22 +887,27 @@ module npu_top #(
     // Port B: IFM 256-bit read; OFM 256-bit RMW read + 32-bit write
     // act_role_swap swaps the two physical banks so a fused next layer
     // reads the previous OFM without a memcpy.
-    wire                    act_a_en, act_a_we;
-    wire [ACT_ADDR_W-1:0]  act_a_addr;
-    wire [31:0]             act_a_wdata, act_a_rdata;
-    wire                    ofm_a_en, ofm_a_we;
-    wire [ACT_ADDR_W-1:0]  ofm_a_addr;
-    wire [31:0]             ofm_a_wdata, ofm_a_rdata;
+    wire                    act_a_en;
+    wire [DMA_WORDS-1:0]    act_a_we;
+    wire [ACT_ADDR_W-1:0]   act_a_addr;
+    wire [DMA_DATA_W-1:0]   act_a_wdata;
+    wire [31:0]             act_a_rdata;
+    wire                    ofm_a_en;
+    wire [DMA_WORDS-1:0]    ofm_a_we;
+    wire [ACT_ADDR_W-1:0]   ofm_a_addr;
+    wire [DMA_DATA_W-1:0]   ofm_a_wdata;
+    wire [31:0]             ofm_a_rdata;
     wire                    act_b_en;
-    wire [ACT_ADDR_W-1:0]  act_b_addr;
+    wire [ACT_ADDR_W-1:0]   act_b_addr;
     wire [`SRAM_B_WIDTH-1:0] act_b_rdata;
     wire                    ofm_b_en;
-    wire [ACT_ADDR_W-1:0]  ofm_b_addr;
+    wire [ACT_ADDR_W-1:0]   ofm_b_addr;
     wire [`SRAM_B_WIDTH-1:0] ofm_b_rdata;
     wire                    act_phys0_b_we, ofm_phys1_b_we;
 
     npu_sram_wide #(
-        .DEPTH  (IFM_DEPTH)
+        .DEPTH    (IFM_DEPTH),
+        .PORT_A_W (DMA_DATA_W)
     ) u_sram_act (
         .clk    (clk),
         .a_en   (act_a_en),
@@ -808,7 +925,8 @@ module npu_top #(
     );
 
     npu_sram_wide #(
-        .DEPTH  (OFM_DEPTH)
+        .DEPTH    (OFM_DEPTH),
+        .PORT_A_W (DMA_DATA_W)
     ) u_sram_ofm (
         .clk    (clk),
         .a_en   (ofm_a_en),
@@ -826,17 +944,20 @@ module npu_top #(
     );
 
     // --- Weight SRAM ---
-    // Port A: 32-bit DMA access (load weights)
-    // Port B: 256-bit compute read
-    wire                    wgt_a_en, wgt_a_we;
-    wire [WGT_ADDR_W-1:0]  wgt_a_addr;
-    wire [31:0]             wgt_a_wdata, wgt_a_rdata;
+    // Port A: 32/64/128-bit DMA access (load weights)
+    // Port B: 512-bit compute read
+    wire                    wgt_a_en;
+    wire [DMA_WORDS-1:0]    wgt_a_we;
+    wire [WGT_ADDR_W-1:0]   wgt_a_addr;
+    wire [DMA_DATA_W-1:0]   wgt_a_wdata;
+    wire [31:0]             wgt_a_rdata;
     wire                    wgt_b_en;
-    wire [WGT_ADDR_W-1:0]  wgt_b_addr;
+    wire [WGT_ADDR_W-1:0]   wgt_b_addr;
     wire [`SRAM_B_WIDTH-1:0] wgt_b_rdata;
 
     npu_sram_wide #(
-        .DEPTH  (WGT_DEPTH)
+        .DEPTH    (WGT_DEPTH),
+        .PORT_A_W (DMA_DATA_W)
     ) u_sram_wgt (
         .clk    (clk),
         .a_en   (wgt_a_en),
@@ -856,16 +977,19 @@ module npu_top #(
     // --- Parameter SRAM ---
     // Port A: DMA access (load per-channel params)
     // Port B: PPU reads during post-processing
-    wire                      param_a_en, param_a_we;
+    wire                      param_a_en;
+    wire [DMA_WORDS-1:0]      param_a_we;
     wire [PARAM_ADDR_W-1:0]   param_a_addr;
-    wire [31:0]               param_a_wdata, param_a_rdata;
+    wire [DMA_DATA_W-1:0]     param_a_wdata;
+    wire [31:0]               param_a_rdata;
     wire                      param_b_en;
     wire [PARAM_ADDR_W-1:0]   param_b_addr;
     wire [31:0]               param_b_rdata;
 
     npu_sram #(
-        .DATA_W (32),
-        .DEPTH  (PARAM_DEPTH)
+        .DATA_W   (32),
+        .DEPTH    (PARAM_DEPTH),
+        .PORT_A_W (DMA_DATA_W)
     ) u_sram_param (
         .clk    (clk),
         .a_en   (param_a_en),

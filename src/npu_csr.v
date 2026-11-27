@@ -23,9 +23,11 @@ module npu_csr #(
     parameter VERSION_MINOR = 8'd0,
     parameter VERSION_PATCH = 8'd0,
     // Hardware config
-    parameter HAS_INT16 = 1,
-    parameter HAS_LUT   = 0,
-    parameter HAS_IPU   = 0
+    parameter HAS_INT16     = 1,
+    parameter HAS_LUT       = 0,
+    parameter HAS_IPU       = 0,
+    parameter DMA_BUS_W_P   = `DMA_BUS_WIDTH,
+    parameter DMA_PROTO_P   = `DMA_BUS_PROTO
 )(
     input  wire                 clk,
     input  wire                 rst_n,
@@ -234,12 +236,16 @@ module npu_csr #(
     endfunction
 
     wire [3:0] dw_ch_log2 = clog2_val(ARRAY_SZ[7:0]);
+    wire [1:0] dma_bw_enc = (DMA_BUS_W_P == 128) ? 2'd2 :
+                            (DMA_BUS_W_P == 64)  ? 2'd1 : 2'd0;
     wire [DATA_W-1:0] hw_config = {
-        5'd0,                            // [31:27] reserved
+        2'd0,                            // [31:30] reserved
+        DMA_PROTO_P[0],                  // [29]    0=Wishbone-B4, 1=AXI4
+        dma_bw_enc,                      // [28:27] 0=32b, 1=64b, 2=128b
         HAS_IPU[0],                      // [26]
         HAS_LUT[0],                      // [25]
         HAS_INT16[0],                    // [24]
-        SPAD_KB_P[7:0],                  // [23:16] SPAD_SIZE_4KB (units of 4KB)
+        SPAD_KB_P[7:0],                  // [23:16] SPAD_SIZE_KB
         dw_ch_log2,                      // [15:12]
         4'd1,                            // [11:8] one 64-lane MAC row
         8'd64                            // [7:0] dense MAC lanes (legacy ARRAY_SIZE field)

@@ -72,9 +72,26 @@
 `define DW_STREAM_OUT_BASE (`OFM_DEPTH - 1024)
 
 // ─── Bus configuration ───
-`define WB_DATA_WIDTH  32     // Wishbone data bus width
+// CSR slave bus stays 32-bit (CPU register access).
+`define WB_DATA_WIDTH  32     // Wishbone CSR slave data bus width
 `define WB_ADDR_WIDTH  32     // Wishbone address bus width
-`define WB_SEL_WIDTH   4      // Wishbone byte select width
+`define WB_SEL_WIDTH   4      // Wishbone CSR slave byte select width
+
+// External DMA master bus configuration (configurable via -D flags):
+//   DMA_BUS_WIDTH : 32 (default), 64, or 128 bits
+//   DMA_BUS_PROTO : 0 = Wishbone-B4 Master (default), 1 = AXI4 Burst Master
+`ifdef DMA_AXI4
+`undef  DMA_BUS_PROTO
+`define DMA_BUS_PROTO  1
+`endif
+`ifndef DMA_BUS_WIDTH
+`define DMA_BUS_WIDTH  32
+`endif
+`ifndef DMA_BUS_PROTO
+`define DMA_BUS_PROTO  0
+`endif
+`define DMA_SEL_WIDTH  (`DMA_BUS_WIDTH / 8)
+`define DMA_BUS_WORDS  (`DMA_BUS_WIDTH / 32)
 `ifndef SRAM_B_WIDTH
 `define SRAM_B_WIDTH   512    // Compute port: 64 bytes, one INT8 lane-group
 `endif

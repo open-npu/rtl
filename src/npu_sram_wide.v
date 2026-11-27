@@ -19,18 +19,19 @@
 `include "npu_defines.vh"
 
 module npu_sram_wide #(
-    parameter DEPTH  = 1024,
-    parameter ADDR_W = $clog2(DEPTH),
-    parameter BEAT_W = `SRAM_B_WIDTH
+    parameter DEPTH    = 1024,
+    parameter ADDR_W   = $clog2(DEPTH),
+    parameter BEAT_W   = `SRAM_B_WIDTH,
+    parameter PORT_A_W = 32
 )(
-    input  wire                 clk,
+    input  wire                     clk,
 
-    // ─── Port A (32-bit read/write) ───
-    input  wire                 a_en,
-    input  wire                 a_we,
-    input  wire [ADDR_W-1:0]   a_addr,
-    input  wire [31:0]          a_wdata,
-    output reg  [31:0]          a_rdata,
+    // ─── Port A (DMA 32/64/128-bit write, 32-bit read) ───
+    input  wire                     a_en,
+    input  wire [(PORT_A_W/32)-1:0] a_we,
+    input  wire [ADDR_W-1:0]        a_addr,
+    input  wire [PORT_A_W-1:0]      a_wdata,
+    output reg  [31:0]              a_rdata,
 
     // ─── Port B (32-bit or byte-masked wide write, BEAT_W-bit read) ───
     input  wire                 b_en,
@@ -42,6 +43,8 @@ module npu_sram_wide #(
     output reg  [BEAT_W-1:0]   b_rdata
 );
 
+    localparam PORT_A_WORDS = PORT_A_W / 32;
+
     reg [31:0] mem [0:DEPTH-1];
 
     integer ii;
@@ -52,13 +55,30 @@ module npu_sram_wide #(
             mem[ii] = 32'd0;
     end
 
-    always @(posedge clk) begin
-        if (a_en) begin
-            if (a_we)
-                mem[a_addr] <= a_wdata;
-            a_rdata <= mem[a_addr];
+    generate
+        if (PORT_A_WORDS == 1) begin : gen_porta_narrow
+            always @(posedge clk) begin
+                if (a_en) begin
+                    if (a_we[0])
+                        mem[a_addr] <= a_wdata;
+                    a_rdata <= mem[a_addr];
+                end
+            end
+        end else begin : gen_porta_wide
+            integer aw;
+            always @(posedge clk) begin
+                if (a_en) begin
+                    for (aw = 0; aw < PORT_A_WORDS; aw = aw + 1)
+                        if (a_we[aw])
+                            mem[a_addr + aw] <= a_wdata[32*aw +: 32];
+                end
+            end
+            always @(posedge clk) begin
+                if (a_en)
+                    a_rdata <= mem[a_addr];
+            end
         end
-    end
+    endgenerate
 
     // Write is a separate process from the wide read so simulators do not
     // treat the whole array as a single variable being read and written
